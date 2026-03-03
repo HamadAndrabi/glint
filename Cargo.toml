@@ -1,0 +1,29 @@
+[package]
+name = "ferrite"
+version = "0.1.0"
+edition = "2021"
+description = "A production-grade LLM inference engine built from scratch in Rust"
+license = "MIT"
+
+[dependencies]
+# Memory-mapped file I/O — lets us map the GGUF file directly into virtual memory
+# instead of reading it all into the heap. The OS handles paging data in/out.
+memmap2 = "0.9"
+
+# f16 (half-precision float) support — GGUF uses f16 for quantization scale factors.
+# Rust doesn't have a native f16 type, so this crate provides one.
+half = "2.4"
+
+# Convenient little-endian/big-endian integer and float reading from byte slices.
+byteorder = "1.5"
+
+# CLI argument parser — derive macros make it declarative and type-safe.
+clap = { version = "4", features = ["derive"] }
+
+# Ergonomic error types — lets us define custom error enums with Display/Error impls
+# using a simple derive macro instead of manual boilerplate.
+thiserror = "2"
+
+[dev-dependencies]
+# Creates temporary files/directories for tests that auto-clean on drop.
+tempfile = "3"
