@@ -125,13 +125,17 @@ fn dequantize_q4_0(data: &[u8], n_elements: usize) -> Vec<f32> {
 }
 
 /// Load a tensor from a GGUF model as f32, dequantizing if needed.
+///
+/// GGUF dimensions are column-major (first dim = fastest-varying),
+/// so we reverse them to match our row-major Tensor layout.
 pub fn load_tensor_f32(model: &GgufModel, name: &str) -> Tensor {
     let info = model
         .get_tensor_info(name)
         .unwrap_or_else(|| panic!("Tensor '{}' not found in model", name));
 
     let n_elements = info.n_elements() as usize;
-    let shape: Vec<usize> = info.dimensions.iter().map(|&d| d as usize).collect();
+    // Reverse dimensions: GGUF is column-major, we are row-major
+    let shape: Vec<usize> = info.dimensions.iter().rev().map(|&d| d as usize).collect();
 
     let raw_data = model
         .tensor_data(name)

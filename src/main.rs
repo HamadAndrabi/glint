@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 use ferrite::model::config::ModelConfig;
 use ferrite::model::gguf::GgufModel;
+use ferrite::transformer::{TransformerWeights, generate_greedy};
 
 #[derive(Parser)]
 #[command(name = "ferrite")]
@@ -30,6 +31,21 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         show_tensors: bool,
     },
+
+    /// Generate tokens from a GGUF model.
+    Generate {
+        /// Path to the .gguf model file.
+        #[arg(short, long)]
+        file: PathBuf,
+
+        /// Prompt as comma-separated token IDs (e.g. "1,15043,29892").
+        #[arg(short, long)]
+        tokens: String,
+
+        /// Maximum number of new tokens to generate.
+        #[arg(short, long, default_value_t = 20)]
+        max_tokens: usize,
+    },
 }
 
 fn main() {
@@ -42,6 +58,13 @@ fn main() {
             show_tensors,
         } => {
             inspect_model(&file, show_metadata, show_tensors);
+        }
+        Commands::Generate {
+            file,
+            tokens,
+            max_tokens,
+        } => {
+            generate_tokens(&file, &tokens, max_tokens);
         }
     }
 }
@@ -137,6 +160,38 @@ fn inspect_model(path: &PathBuf, show_metadata: bool, show_tensors: bool) {
             bytes as f64 / (1024.0 * 1024.0),
         );
     }
+}
+
+fn generate_tokens(path: &PathBuf, tokens_str: &str, max_tokens: usize) {
+    let model = match GgufModel::load(path) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("Error loading GGUF file: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let config = ModelConfig::from_metadata(&model.metadata)
+        .expect("Failed to extract model configuration");
+    println!("Model: {} ({})", config.architecture, path.display());
+    println!("{config}");
+
+    let prompt_tokens: Vec<u32> = tokens_str
+        .split(',')
+        .map(|s| s.trim().parse().expect("Invalid token ID"))
+        .collect();
+    println!("Prompt tokens: {:?}", prompt_tokens);
+    println!();
+
+    eprintln!("Loading weights...");
+    let weights = TransformerWeights::load(&model, &config);
+
+    eprintln!("Generating...");
+    let output = generate_greedy(&weights, &config, &prompt_tokens, max_tokens);
+
+    println!("\n═══ Output Tokens ═══");
+    println!("{:?}", output);
+    println!("\nGenerated {} new tokens", output.len() - prompt_tokens.len());
 }
 
 fn format_number(n: u64) -> String {
