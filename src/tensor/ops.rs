@@ -1,0 +1,313 @@
+//! Tensor math operations — naive f32 implementations.
+//!
+//! All operations are correctness-first. SIMD/threading optimizations come in Phase 2.
+
+use super::tensor::Tensor;
+
+/// Matrix multiplication: `[M, K] × [K, N] → [M, N]`.
+pub fn matmul(a: &Tensor, b: &Tensor) -> Tensor {
+    assert_eq!(a.ndim(), 2, "matmul requires 2D tensors");
+    assert_eq!(b.ndim(), 2, "matmul requires 2D tensors");
+    let m = a.shape()[0];
+    let k = a.shape()[1];
+    assert_eq!(k, b.shape()[0], "Inner dimensions must match: {} vs {}", k, b.shape()[0]);
+    let n = b.shape()[1];
+
+    let mut out = Tensor::zeros(&[m, n]);
+    let out_data = out.data_mut();
+    let a_data = a.data();
+    let b_data = b.data();
+
+    for i in 0..m {
+        for j in 0..n {
+            let mut sum = 0.0f32;
+            for p in 0..k {
+                sum += a_data[i * k + p] * b_data[p * n + j];
+            }
+            out_data[i * n + j] = sum;
+        }
+    }
+    out
+}
+
+/// Matrix-vector multiplication: `[M, K] × [K] → [M]`.
+pub fn matvec(mat: &Tensor, vec: &Tensor) -> Tensor {
+    assert_eq!(mat.ndim(), 2);
+    assert_eq!(vec.ndim(), 1);
+    let m = mat.shape()[0];
+    let k = mat.shape()[1];
+    assert_eq!(k, vec.shape()[0]);
+
+    let mut out = Tensor::zeros(&[m]);
+    let out_data = out.data_mut();
+    let mat_data = mat.data();
+    let vec_data = vec.data();
+
+    for i in 0..m {
+        let mut sum = 0.0f32;
+        for j in 0..k {
+            sum += mat_data[i * k + j] * vec_data[j];
+        }
+        out_data[i] = sum;
+    }
+    out
+}
+
+/// Element-wise addition. Shapes must match.
+pub fn add(a: &Tensor, b: &Tensor) -> Tensor {
+    assert_eq!(a.shape(), b.shape(), "Shapes must match for add");
+    let data: Vec<f32> = a.data().iter().zip(b.data()).map(|(x, y)| x + y).collect();
+    Tensor::from_vec(data, a.shape())
+}
+
+/// Element-wise multiplication. Shapes must match.
+pub fn mul(a: &Tensor, b: &Tensor) -> Tensor {
+    assert_eq!(a.shape(), b.shape(), "Shapes must match for mul");
+    let data: Vec<f32> = a.data().iter().zip(b.data()).map(|(x, y)| x * y).collect();
+    Tensor::from_vec(data, a.shape())
+}
+
+/// RMSNorm: `x / sqrt(mean(x²) + eps) * weight`.
+///
+/// Normalizes the input vector by its root-mean-square, then scales by a
+/// learned weight vector. Used in LLaMA instead of LayerNorm.
+pub fn rms_norm(x: &Tensor, weight: &Tensor, eps: f32) -> Tensor {
+    assert_eq!(x.ndim(), 1);
+    assert_eq!(weight.ndim(), 1);
+    assert_eq!(x.shape()[0], weight.shape()[0]);
+
+    let x_data = x.data();
+    let w_data = weight.data();
+    let n = x_data.len();
+
+    // mean(x²)
+    let mean_sq: f32 = x_data.iter().map(|v| v * v).sum::<f32>() / n as f32;
+    let rsqrt = 1.0 / (mean_sq + eps).sqrt();
+
+    let data: Vec<f32> = x_data
+        .iter()
+        .zip(w_data)
+        .map(|(&x, &w)| x * rsqrt * w)
+        .collect();
+    Tensor::from_vec(data, x.shape())
+}
+
+/// SiLU activation: `x * sigmoid(x)`.
+///
+/// Also called "swish". Used in LLaMA's feed-forward network (SwiGLU variant).
+pub fn silu(x: &Tensor) -> Tensor {
+    let data: Vec<f32> = x
+        .data()
+        .iter()
+        .map(|&v| v * (1.0 / (1.0 + (-v).exp())))
+        .collect();
+    Tensor::from_vec(data, x.shape())
+}
+
+/// Softmax along a 1D tensor: `exp(x - max(x)) / sum(exp(x - max(x)))`.
+///
+/// The `max(x)` subtraction prevents overflow in exp().
+pub fn softmax(x: &Tensor) -> Tensor {
+    assert_eq!(x.ndim(), 1);
+    let x_data = x.data();
+
+    let max_val = x_data.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let exps: Vec<f32> = x_data.iter().map(|&v| (v - max_val).exp()).collect();
+    let sum: f32 = exps.iter().sum();
+    let data: Vec<f32> = exps.iter().map(|&v| v / sum).collect();
+    Tensor::from_vec(data, x.shape())
+}
+
+/// Rotary Positional Embeddings (RoPE) — apply in-place to q and k vectors.
+///
+/// Rotates pairs of dimensions by position-dependent angles. This encodes
+/// positional information directly into the attention computation without
+/// needing additive position embeddings.
+///
+/// For each pair `(x0, x1)` at dimension index `i`:
+///   freq = 1 / (base ^ (2i / dim))
+///   angle = pos * freq
+///   x0' = x0 * cos(angle) - x1 * sin(angle)
+///   x1' = x0 * sin(angle) + x1 * cos(angle)
+pub fn rope(x: &Tensor, pos: usize, head_dim: usize, freq_base: f32) -> Tensor {
+    assert_eq!(x.ndim(), 1);
+    let data = x.data();
+    let mut out = vec![0.0f32; data.len()];
+
+    for i in (0..head_dim).step_by(2) {
+        let freq = 1.0 / freq_base.powf(i as f32 / head_dim as f32);
+        let angle = pos as f32 * freq;
+        let cos_val = angle.cos();
+        let sin_val = angle.sin();
+
+        // Apply rotation to each head's pair at position i
+        let mut offset = 0;
+        while offset + head_dim <= data.len() {
+            let x0 = data[offset + i];
+            let x1 = data[offset + i + 1];
+            out[offset + i] = x0 * cos_val - x1 * sin_val;
+            out[offset + i + 1] = x0 * sin_val + x1 * cos_val;
+            offset += head_dim;
+        }
+    }
+    Tensor::from_vec(out, x.shape())
+}
+
+/// Embedding lookup: select rows from a weight matrix by token IDs.
+///
+/// weight: `[vocab_size, embed_dim]`, token_ids: list of token indices.
+/// Returns `[n_tokens, embed_dim]`.
+pub fn embedding(weight: &Tensor, token_ids: &[u32]) -> Tensor {
+    assert_eq!(weight.ndim(), 2);
+    let embed_dim = weight.shape()[1];
+    let n_tokens = token_ids.len();
+
+    let mut data = Vec::with_capacity(n_tokens * embed_dim);
+    let w_data = weight.data();
+
+    for &id in token_ids {
+        let start = id as usize * embed_dim;
+        data.extend_from_slice(&w_data[start..start + embed_dim]);
+    }
+    Tensor::from_vec(data, &[n_tokens, embed_dim])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn approx_eq(a: &[f32], b: &[f32], tol: f32) {
+        assert_eq!(a.len(), b.len(), "Length mismatch: {} vs {}", a.len(), b.len());
+        for (i, (&x, &y)) in a.iter().zip(b).enumerate() {
+            assert!(
+                (x - y).abs() < tol,
+                "Mismatch at index {}: {} vs {} (diff {})",
+                i, x, y, (x - y).abs()
+            );
+        }
+    }
+
+    #[test]
+    fn test_matmul_identity() {
+        // Multiplying by identity should return the original
+        let a = Tensor::from_vec(vec![1.0, 2.0, 3.0, 4.0], &[2, 2]);
+        let identity = Tensor::from_vec(vec![1.0, 0.0, 0.0, 1.0], &[2, 2]);
+        let result = matmul(&a, &identity);
+        approx_eq(result.data(), a.data(), 1e-6);
+    }
+
+    #[test]
+    fn test_matmul_known() {
+        // [[1,2],[3,4]] × [[5,6],[7,8]] = [[19,22],[43,50]]
+        let a = Tensor::from_vec(vec![1.0, 2.0, 3.0, 4.0], &[2, 2]);
+        let b = Tensor::from_vec(vec![5.0, 6.0, 7.0, 8.0], &[2, 2]);
+        let c = matmul(&a, &b);
+        approx_eq(c.data(), &[19.0, 22.0, 43.0, 50.0], 1e-6);
+    }
+
+    #[test]
+    fn test_matmul_non_square() {
+        // [1,2,3] × [[1],[2],[3]] = [14]  (1×3 × 3×1 = 1×1)
+        let a = Tensor::from_vec(vec![1.0, 2.0, 3.0], &[1, 3]);
+        let b = Tensor::from_vec(vec![1.0, 2.0, 3.0], &[3, 1]);
+        let c = matmul(&a, &b);
+        assert_eq!(c.shape(), &[1, 1]);
+        approx_eq(c.data(), &[14.0], 1e-6);
+    }
+
+    #[test]
+    fn test_matvec() {
+        let mat = Tensor::from_vec(vec![1.0, 2.0, 3.0, 4.0], &[2, 2]);
+        let v = Tensor::from_vec(vec![1.0, 1.0], &[2]);
+        let result = matvec(&mat, &v);
+        approx_eq(result.data(), &[3.0, 7.0], 1e-6);
+    }
+
+    #[test]
+    fn test_add() {
+        let a = Tensor::from_vec(vec![1.0, 2.0, 3.0], &[3]);
+        let b = Tensor::from_vec(vec![4.0, 5.0, 6.0], &[3]);
+        let c = add(&a, &b);
+        approx_eq(c.data(), &[5.0, 7.0, 9.0], 1e-6);
+    }
+
+    #[test]
+    fn test_rms_norm() {
+        // x = [1, 2, 3], weight = [1, 1, 1], eps = 0
+        // mean(x²) = (1+4+9)/3 = 14/3
+        // rsqrt = 1/sqrt(14/3) ≈ 0.46291
+        // result ≈ [0.46291, 0.92582, 1.38873]
+        let x = Tensor::from_vec(vec![1.0, 2.0, 3.0], &[3]);
+        let w = Tensor::from_vec(vec![1.0, 1.0, 1.0], &[3]);
+        let result = rms_norm(&x, &w, 0.0);
+        let expected_rsqrt = 1.0 / (14.0f32 / 3.0).sqrt();
+        approx_eq(
+            result.data(),
+            &[1.0 * expected_rsqrt, 2.0 * expected_rsqrt, 3.0 * expected_rsqrt],
+            1e-5,
+        );
+    }
+
+    #[test]
+    fn test_silu() {
+        // silu(0) = 0 * sigmoid(0) = 0 * 0.5 = 0
+        // silu(1) = 1 * sigmoid(1) ≈ 0.7310586
+        let x = Tensor::from_vec(vec![0.0, 1.0, -1.0], &[3]);
+        let result = silu(&x);
+        let expected = vec![
+            0.0,
+            1.0 / (1.0 + (-1.0f32).exp()),
+            -1.0 / (1.0 + 1.0f32.exp()),
+        ];
+        approx_eq(result.data(), &expected, 1e-6);
+    }
+
+    #[test]
+    fn test_softmax() {
+        let x = Tensor::from_vec(vec![1.0, 2.0, 3.0], &[3]);
+        let result = softmax(&x);
+
+        // Should sum to 1
+        let sum: f32 = result.data().iter().sum();
+        assert!((sum - 1.0).abs() < 1e-6);
+
+        // Last element should be largest
+        assert!(result.data()[2] > result.data()[1]);
+        assert!(result.data()[1] > result.data()[0]);
+    }
+
+    #[test]
+    fn test_softmax_numerical_stability() {
+        // Large values — should not overflow thanks to max subtraction
+        let x = Tensor::from_vec(vec![1000.0, 1001.0, 1002.0], &[3]);
+        let result = softmax(&x);
+        let sum: f32 = result.data().iter().sum();
+        assert!((sum - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_rope_basic() {
+        // At position 0, all angles are 0, so cos=1, sin=0 → no change
+        let x = Tensor::from_vec(vec![1.0, 2.0, 3.0, 4.0], &[4]);
+        let result = rope(&x, 0, 4, 10000.0);
+        approx_eq(result.data(), x.data(), 1e-6);
+    }
+
+    #[test]
+    fn test_embedding() {
+        // 4-token vocab, 3-dim embeddings
+        let weight = Tensor::from_vec(
+            vec![
+                0.1, 0.2, 0.3, // token 0
+                0.4, 0.5, 0.6, // token 1
+                0.7, 0.8, 0.9, // token 2
+                1.0, 1.1, 1.2, // token 3
+            ],
+            &[4, 3],
+        );
+        let result = embedding(&weight, &[2, 0]);
+        assert_eq!(result.shape(), &[2, 3]);
+        approx_eq(&result.data()[0..3], &[0.7, 0.8, 0.9], 1e-6);
+        approx_eq(&result.data()[3..6], &[0.1, 0.2, 0.3], 1e-6);
+    }
+}
