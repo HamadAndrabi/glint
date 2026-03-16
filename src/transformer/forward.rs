@@ -1,5 +1,6 @@
 //! Decoder-only transformer forward pass (LLaMA-style).
 
+use crate::cache::KvCache;
 use crate::model::config::ModelConfig;
 use crate::tensor::{self, Tensor};
 use super::weights::{LayerWeights, TransformerWeights};
@@ -190,9 +191,266 @@ pub fn generate_greedy(
     tokens
 }
 
+// ── KV-cached forward pass (Phase 2.1) ─────────────────────────────────────
+
+/// Forward pass for a single token at a given position, using the KV cache.
+///
+/// Reads K/V for positions 0..pos from the cache, computes K/V for the
+/// current token and writes them to the cache, then returns logits.
+///
+/// For prefill: call in a loop for pos = 0, 1, ..., prompt_len - 1.
+/// For decode: call once per generated token.
+pub fn forward_one(
+    weights: &TransformerWeights,
+    config: &ModelConfig,
+    token_id: u32,
+    pos: usize,
+    cache: &mut KvCache,
+) -> Tensor {
+    let embed_dim = config.embedding_length as usize;
+
+    // 1. Embed one token
+    let x = tensor::embedding(&weights.token_embedding, &[token_id]);
+    let mut hidden = Tensor::from_slice(&x.data()[..embed_dim], &[embed_dim]);
+
+    // 2. Transformer layers
+    for (layer_idx, layer) in weights.layers.iter().enumerate() {
+        // --- Attention block ---
+        let normed = tensor::rms_norm(&hidden, &layer.attn_norm, config.rms_norm_eps);
+        let attn_out = attention_cached(&normed, layer, config, pos, layer_idx, cache);
+        let after_attn = tensor::add(&hidden, &attn_out);
+
+        // --- FFN block ---
+        let normed_ffn = tensor::rms_norm(&after_attn, &layer.ffn_norm, config.rms_norm_eps);
+        let ffn_out = feed_forward(&normed_ffn, layer);
+        hidden = tensor::add(&after_attn, &ffn_out);
+    }
+
+    // All layers have written this position — advance the cache
+    cache.advance();
+
+    // 3. Final norm + LM head
+    let normed = tensor::rms_norm(&hidden, &weights.output_norm, config.rms_norm_eps);
+    tensor::matvec(&weights.output, &normed)
+}
+
+/// Multi-head self-attention for one position, reading past K/V from cache.
+fn attention_cached(
+    x: &Tensor,
+    layer: &LayerWeights,
+    config: &ModelConfig,
+    pos: usize,
+    layer_idx: usize,
+    cache: &mut KvCache,
+) -> Tensor {
+    let embed_dim = config.embedding_length as usize;
+    let n_heads = config.head_count as usize;
+    let n_kv_heads = config.head_count_kv as usize;
+    let head_dim = config.head_dim() as usize;
+    let kv_group_size = n_heads / n_kv_heads;
+
+    // Q/K/V projections for current token only
+    let q_all = tensor::matvec(&layer.attn_q, x);
+    let k_cur = tensor::matvec(&layer.attn_k, x);
+    let v_cur = tensor::matvec(&layer.attn_v, x);
+
+    // Apply RoPE to Q and K
+    let freq_base = config.rope_freq_base.unwrap_or(10000.0);
+    let q_all = tensor::rope(&q_all, pos, head_dim, freq_base);
+    let k_cur = tensor::rope(&k_cur, pos, head_dim, freq_base);
+
+    // Write current K/V into cache (before reading, so pos is included in the loop)
+    cache.write(layer_idx, pos, k_cur.data(), v_cur.data());
+
+    let seq_len = pos + 1; // attend to positions 0..=pos
+    let scale = 1.0 / (head_dim as f32).sqrt();
+
+    let mut attn_output = vec![0.0f32; embed_dim];
+
+    for h in 0..n_heads {
+        let kv_h = h / kv_group_size;
+        let q_offset = h * head_dim;
+        let q_head = &q_all.data()[q_offset..q_offset + head_dim];
+
+        // Score against all cached K vectors (including current)
+        let mut scores = vec![0.0f32; seq_len];
+        for s in 0..seq_len {
+            let k_row = cache.k_at(layer_idx, s);
+            let k_head = &k_row[kv_h * head_dim..(kv_h + 1) * head_dim];
+            let mut dot = 0.0f32;
+            for d in 0..head_dim {
+                dot += q_head[d] * k_head[d];
+            }
+            scores[s] = dot * scale;
+        }
+
+        // Softmax over scores
+        let scores_tensor = Tensor::from_vec(scores, &[seq_len]);
+        let attn_weights = tensor::softmax(&scores_tensor);
+
+        // Weighted sum of cached V vectors
+        for s in 0..seq_len {
+            let w = attn_weights.get_flat(s);
+            let v_row = cache.v_at(layer_idx, s);
+            let v_head = &v_row[kv_h * head_dim..(kv_h + 1) * head_dim];
+            for d in 0..head_dim {
+                attn_output[q_offset + d] += w * v_head[d];
+            }
+        }
+    }
+
+    let attn_vec = Tensor::from_vec(attn_output, &[embed_dim]);
+    tensor::matvec(&layer.attn_output, &attn_vec)
+}
+
+/// Greedy decoding with KV cache.
+///
+/// Two phases:
+/// 1. **Prefill** — process each prompt token, populating the cache.
+/// 2. **Decode** — generate new tokens one at a time using cached K/V.
+pub fn generate_greedy_cached(
+    weights: &TransformerWeights,
+    config: &ModelConfig,
+    prompt_tokens: &[u32],
+    max_new_tokens: usize,
+) -> Vec<u32> {
+    let max_seq_len = config.context_length as usize;
+    let n_layers = config.block_count as usize;
+    let n_kv_heads = config.head_count_kv as usize;
+    let head_dim = config.head_dim() as usize;
+
+    let mut cache = KvCache::new(n_layers, max_seq_len, n_kv_heads, head_dim);
+    let mut tokens = prompt_tokens.to_vec();
+
+    // Phase 1: Prefill — process all prompt tokens
+    eprintln!("Prefill: {} tokens", prompt_tokens.len());
+    let mut last_logits = Tensor::zeros(&[1]); // placeholder
+    for (i, &token_id) in prompt_tokens.iter().enumerate() {
+        eprint!("\r  Prefill token {}/{}...", i + 1, prompt_tokens.len());
+        last_logits = forward_one(weights, config, token_id, i, &mut cache);
+    }
+    eprintln!();
+
+    // Phase 2: Decode — generate new tokens
+    for step in 0..max_new_tokens {
+        // Argmax over logits
+        let next_token = last_logits
+            .data()
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+            .map(|(idx, _)| idx as u32)
+            .unwrap();
+
+        eprintln!("  Decode step {}/{}: token {next_token}", step + 1, max_new_tokens);
+        tokens.push(next_token);
+
+        if next_token == 2 {
+            break;
+        }
+
+        let pos = tokens.len() - 1;
+        last_logits = forward_one(weights, config, next_token, pos, &mut cache);
+    }
+
+    tokens
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cache::KvCache;
+
+    fn make_tiny_weights() -> (TransformerWeights, ModelConfig) {
+        // Tiny model: embed_dim=4, 1 layer, 2 heads, 1 kv head, head_dim=2
+        let config = ModelConfig {
+            architecture: "test".to_string(),
+            context_length: 32,
+            embedding_length: 4,
+            block_count: 1,
+            head_count: 2,
+            head_count_kv: 1,
+            vocab_size: 8,
+            feed_forward_length: Some(8),
+            rms_norm_eps: 1e-5,
+            rope_freq_base: Some(10000.0),
+        };
+        let weights = TransformerWeights {
+            token_embedding: Tensor::from_vec(
+                (0..32).map(|i| (i as f32) * 0.1).collect(),
+                &[8, 4],
+            ),
+            layers: vec![LayerWeights {
+                attn_norm: Tensor::from_vec(vec![1.0, 1.0, 1.0, 1.0], &[4]),
+                ffn_norm: Tensor::from_vec(vec![1.0, 1.0, 1.0, 1.0], &[4]),
+                attn_q: Tensor::from_vec(
+                    (0..16).map(|i| (i as f32) * 0.05 - 0.4).collect(),
+                    &[4, 4],
+                ),
+                attn_k: Tensor::from_vec(
+                    (0..8).map(|i| (i as f32) * 0.1 - 0.3).collect(),
+                    &[2, 4],
+                ),
+                attn_v: Tensor::from_vec(
+                    (0..8).map(|i| (i as f32) * 0.07 - 0.2).collect(),
+                    &[2, 4],
+                ),
+                attn_output: Tensor::from_vec(
+                    (0..16).map(|i| (i as f32) * 0.03 - 0.2).collect(),
+                    &[4, 4],
+                ),
+                ffn_gate: Tensor::from_vec(
+                    (0..32).map(|i| (i as f32) * 0.02 - 0.3).collect(),
+                    &[8, 4],
+                ),
+                ffn_up: Tensor::from_vec(
+                    (0..32).map(|i| (i as f32) * 0.015 - 0.2).collect(),
+                    &[8, 4],
+                ),
+                ffn_down: Tensor::from_vec(
+                    (0..32).map(|i| (i as f32) * 0.025 - 0.4).collect(),
+                    &[4, 8],
+                ),
+            }],
+            output_norm: Tensor::from_vec(vec![1.0, 1.0, 1.0, 1.0], &[4]),
+            output: Tensor::from_vec(
+                (0..32).map(|i| (i as f32) * 0.1 - 1.6).collect(),
+                &[8, 4],
+            ),
+        };
+        (weights, config)
+    }
+
+    #[test]
+    fn test_cached_matches_uncached() {
+        let (weights, config) = make_tiny_weights();
+        let token_ids: Vec<u32> = vec![1, 3, 5];
+
+        // Uncached: full forward pass
+        let logits_uncached = forward(&weights, &config, &token_ids);
+
+        // Cached: process one token at a time
+        let mut cache = KvCache::new(
+            config.block_count as usize,
+            config.context_length as usize,
+            config.head_count_kv as usize,
+            config.head_dim() as usize,
+        );
+        let mut logits_cached = Tensor::zeros(&[1]);
+        for (pos, &tok) in token_ids.iter().enumerate() {
+            logits_cached = forward_one(&weights, &config, tok, pos, &mut cache);
+        }
+
+        // Compare final logits
+        assert_eq!(logits_uncached.shape(), logits_cached.shape());
+        for (i, (&a, &b)) in logits_uncached.data().iter().zip(logits_cached.data()).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-4,
+                "Logit mismatch at index {i}: uncached={a}, cached={b}, diff={}",
+                (a - b).abs()
+            );
+        }
+    }
 
     #[test]
     fn test_feed_forward_shape() {

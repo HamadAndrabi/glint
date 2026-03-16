@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use ferrite::model::config::ModelConfig;
 use ferrite::model::gguf::GgufModel;
 use ferrite::model::tokenizer::Tokenizer;
-use ferrite::transformer::{TransformerWeights, generate_greedy};
+use ferrite::transformer::{TransformerWeights, generate_greedy_cached};
 
 #[derive(Parser)]
 #[command(name = "ferrite")]
@@ -212,7 +212,7 @@ fn run_model(path: &PathBuf, prompt: &str, max_tokens: usize) {
     let weights = TransformerWeights::load(&model, &config);
 
     eprintln!("Generating...\n");
-    let output = generate_greedy(&weights, &config, &prompt_tokens, max_tokens);
+    let output = generate_greedy_cached(&weights, &config, &prompt_tokens, max_tokens);
 
     // Decode and print the generated tokens (only the new ones)
     let generated = &output[prompt_tokens.len()..];
@@ -247,7 +247,7 @@ fn generate_tokens(path: &PathBuf, tokens_str: &str, max_tokens: usize) {
     let weights = TransformerWeights::load(&model, &config);
 
     eprintln!("Generating...");
-    let output = generate_greedy(&weights, &config, &prompt_tokens, max_tokens);
+    let output = generate_greedy_cached(&weights, &config, &prompt_tokens, max_tokens);
 
     println!("\n═══ Output Tokens ═══");
     println!("{:?}", output);
