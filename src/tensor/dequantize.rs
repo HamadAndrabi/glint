@@ -219,3 +219,21 @@ mod tests {
         }
     }
 }
+
+/// Test helpers for building quantized blocks in unit tests.
+/// Exported so `quantized.rs` tests can reuse them.
+#[cfg(test)]
+pub mod dequantize_test_helpers {
+    use half::f16;
+
+    /// Build one Q8_0 block: [f16 scale (2 bytes)] + [32 × i8 values].
+    pub fn make_q8_0_block(scale: f32, quants: Vec<i8>) -> Vec<u8> {
+        assert_eq!(quants.len(), 32);
+        let mut block = Vec::with_capacity(34);
+        block.extend_from_slice(&f16::from_f32(scale).to_le_bytes());
+        for q in quants {
+            block.push(q as u8);
+        }
+        block
+    }
+}

@@ -16,20 +16,10 @@ pub fn forward(
 ) -> Tensor {
     let n_tokens = token_ids.len();
 
-    // 1. Token embedding: [n_tokens, embed_dim]
-    let embedded = tensor::embedding(&weights.token_embedding, token_ids);
-
-    // Process one token at a time (last position is what we want logits for)
-    // For the naive version, we only compute logits for the last token
-    // but still need all positions for attention context.
-    let embed_dim = config.embedding_length as usize;
-
-    // Start with the full embedded sequence, but we'll only track per-position hidden states
-    let mut hidden_states: Vec<Tensor> = (0..n_tokens)
-        .map(|t| {
-            let start = t * embed_dim;
-            Tensor::from_slice(&embedded.data()[start..start + embed_dim], &[embed_dim])
-        })
+    // 1. Token embeddings: look up each token row from the quantized embedding table
+    let mut hidden_states: Vec<Tensor> = token_ids
+        .iter()
+        .map(|&id| weights.token_embedding.row_as_f32(id as usize))
         .collect();
 
     // 2. Transformer layers
@@ -59,7 +49,7 @@ pub fn forward(
     let normed = tensor::rms_norm(last_hidden, &weights.output_norm, config.rms_norm_eps);
 
     // 4. Project to vocabulary: [vocab_size, embed_dim] × [embed_dim] → [vocab_size]
-    tensor::matvec(&weights.output, &normed)
+    weights.output.matvec(normed.data())
 }
 
 /// Multi-head self-attention for one position, attending to all positions ≤ pos.
@@ -77,9 +67,9 @@ fn attention(
     let kv_group_size = n_heads / n_kv_heads; // how many Q heads share one KV head
 
     // Q/K/V projections: weight [out_dim, embed_dim] × x [embed_dim] → [out_dim]
-    let q_all = tensor::matvec(&layer.attn_q, x);
-    let k_cur = tensor::matvec(&layer.attn_k, x);
-    let v_cur = tensor::matvec(&layer.attn_v, x);
+    let q_all = layer.attn_q.matvec(x.data());
+    let k_cur = layer.attn_k.matvec(x.data());
+    let v_cur = layer.attn_v.matvec(x.data());
 
     // Apply RoPE to Q and K for current position
     let freq_base = config.rope_freq_base.unwrap_or(10000.0);
@@ -93,8 +83,8 @@ fn attention(
 
     for p in 0..pos {
         let normed_p = tensor::rms_norm(&all_hidden[p], &layer.attn_norm, config.rms_norm_eps);
-        let k_p = tensor::matvec(&layer.attn_k, &normed_p);
-        let v_p = tensor::matvec(&layer.attn_v, &normed_p);
+        let k_p = layer.attn_k.matvec(normed_p.data());
+        let v_p = layer.attn_v.matvec(normed_p.data());
         k_cache.push(tensor::rope(&k_p, p, head_dim, freq_base));
         v_cache.push(v_p);
     }
@@ -143,18 +133,18 @@ fn attention(
 
     // Output projection
     let attn_vec = Tensor::from_vec(attn_output, &[embed_dim]);
-    tensor::matvec(&layer.attn_output, &attn_vec)
+    layer.attn_output.matvec(attn_vec.data())
 }
 
 /// SwiGLU feed-forward network.
 ///
 /// output = down_proj(silu(gate_proj(x)) * up_proj(x))
 fn feed_forward(x: &Tensor, layer: &LayerWeights) -> Tensor {
-    let gate = tensor::matvec(&layer.ffn_gate, x);
-    let up = tensor::matvec(&layer.ffn_up, x);
+    let gate = layer.ffn_gate.matvec(x.data());
+    let up = layer.ffn_up.matvec(x.data());
     let activated = tensor::silu(&gate);
     let hidden = tensor::mul(&activated, &up);
-    tensor::matvec(&layer.ffn_down, &hidden)
+    layer.ffn_down.matvec(hidden.data())
 }
 
 /// Greedy decoding: iteratively pick the highest-probability next token.
@@ -207,11 +197,8 @@ pub fn forward_one(
     pos: usize,
     cache: &mut KvCache,
 ) -> Tensor {
-    let embed_dim = config.embedding_length as usize;
-
-    // 1. Embed one token
-    let x = tensor::embedding(&weights.token_embedding, &[token_id]);
-    let mut hidden = Tensor::from_slice(&x.data()[..embed_dim], &[embed_dim]);
+    // 1. Embed one token — dequantize its row from the quantized embedding table
+    let mut hidden = weights.token_embedding.row_as_f32(token_id as usize);
 
     // 2. Transformer layers
     for (layer_idx, layer) in weights.layers.iter().enumerate() {
@@ -231,7 +218,7 @@ pub fn forward_one(
 
     // 3. Final norm + LM head
     let normed = tensor::rms_norm(&hidden, &weights.output_norm, config.rms_norm_eps);
-    tensor::matvec(&weights.output, &normed)
+    weights.output.matvec(normed.data())
 }
 
 /// Multi-head self-attention for one position, reading past K/V from cache.
@@ -250,9 +237,9 @@ fn attention_cached(
     let kv_group_size = n_heads / n_kv_heads;
 
     // Q/K/V projections for current token only
-    let q_all = tensor::matvec(&layer.attn_q, x);
-    let k_cur = tensor::matvec(&layer.attn_k, x);
-    let v_cur = tensor::matvec(&layer.attn_v, x);
+    let q_all = layer.attn_q.matvec(x.data());
+    let k_cur = layer.attn_k.matvec(x.data());
+    let v_cur = layer.attn_v.matvec(x.data());
 
     // Apply RoPE to Q and K
     let freq_base = config.rope_freq_base.unwrap_or(10000.0);
@@ -300,7 +287,7 @@ fn attention_cached(
     }
 
     let attn_vec = Tensor::from_vec(attn_output, &[embed_dim]);
-    tensor::matvec(&layer.attn_output, &attn_vec)
+    layer.attn_output.matvec(attn_vec.data())
 }
 
 /// Greedy decoding with KV cache.
@@ -360,6 +347,7 @@ pub fn generate_greedy_cached(
 mod tests {
     use super::*;
     use crate::cache::KvCache;
+    use crate::tensor::QuantizedTensor;
 
     fn make_tiny_weights() -> (TransformerWeights, ModelConfig) {
         // Tiny model: embed_dim=4, 1 layer, 2 heads, 1 kv head, head_dim=2
@@ -375,47 +363,48 @@ mod tests {
             rms_norm_eps: 1e-5,
             rope_freq_base: Some(10000.0),
         };
+        // Use QuantizedTensor::from_f32 which encodes as F32 bytes — exact round-trip.
         let weights = TransformerWeights {
-            token_embedding: Tensor::from_vec(
-                (0..32).map(|i| (i as f32) * 0.1).collect(),
-                &[8, 4],
+            token_embedding: QuantizedTensor::from_f32(
+                &(0..32).map(|i| (i as f32) * 0.1).collect::<Vec<_>>(),
+                8, 4,
             ),
             layers: vec![LayerWeights {
                 attn_norm: Tensor::from_vec(vec![1.0, 1.0, 1.0, 1.0], &[4]),
-                ffn_norm: Tensor::from_vec(vec![1.0, 1.0, 1.0, 1.0], &[4]),
-                attn_q: Tensor::from_vec(
-                    (0..16).map(|i| (i as f32) * 0.05 - 0.4).collect(),
-                    &[4, 4],
+                ffn_norm:  Tensor::from_vec(vec![1.0, 1.0, 1.0, 1.0], &[4]),
+                attn_q: QuantizedTensor::from_f32(
+                    &(0..16).map(|i| (i as f32) * 0.05 - 0.4).collect::<Vec<_>>(),
+                    4, 4,
                 ),
-                attn_k: Tensor::from_vec(
-                    (0..8).map(|i| (i as f32) * 0.1 - 0.3).collect(),
-                    &[2, 4],
+                attn_k: QuantizedTensor::from_f32(
+                    &(0..8).map(|i| (i as f32) * 0.1 - 0.3).collect::<Vec<_>>(),
+                    2, 4,
                 ),
-                attn_v: Tensor::from_vec(
-                    (0..8).map(|i| (i as f32) * 0.07 - 0.2).collect(),
-                    &[2, 4],
+                attn_v: QuantizedTensor::from_f32(
+                    &(0..8).map(|i| (i as f32) * 0.07 - 0.2).collect::<Vec<_>>(),
+                    2, 4,
                 ),
-                attn_output: Tensor::from_vec(
-                    (0..16).map(|i| (i as f32) * 0.03 - 0.2).collect(),
-                    &[4, 4],
+                attn_output: QuantizedTensor::from_f32(
+                    &(0..16).map(|i| (i as f32) * 0.03 - 0.2).collect::<Vec<_>>(),
+                    4, 4,
                 ),
-                ffn_gate: Tensor::from_vec(
-                    (0..32).map(|i| (i as f32) * 0.02 - 0.3).collect(),
-                    &[8, 4],
+                ffn_gate: QuantizedTensor::from_f32(
+                    &(0..32).map(|i| (i as f32) * 0.02 - 0.3).collect::<Vec<_>>(),
+                    8, 4,
                 ),
-                ffn_up: Tensor::from_vec(
-                    (0..32).map(|i| (i as f32) * 0.015 - 0.2).collect(),
-                    &[8, 4],
+                ffn_up: QuantizedTensor::from_f32(
+                    &(0..32).map(|i| (i as f32) * 0.015 - 0.2).collect::<Vec<_>>(),
+                    8, 4,
                 ),
-                ffn_down: Tensor::from_vec(
-                    (0..32).map(|i| (i as f32) * 0.025 - 0.4).collect(),
-                    &[4, 8],
+                ffn_down: QuantizedTensor::from_f32(
+                    &(0..32).map(|i| (i as f32) * 0.025 - 0.4).collect::<Vec<_>>(),
+                    4, 8,
                 ),
             }],
             output_norm: Tensor::from_vec(vec![1.0, 1.0, 1.0, 1.0], &[4]),
-            output: Tensor::from_vec(
-                (0..32).map(|i| (i as f32) * 0.1 - 1.6).collect(),
-                &[8, 4],
+            output: QuantizedTensor::from_f32(
+                &(0..32).map(|i| (i as f32) * 0.1 - 1.6).collect::<Vec<_>>(),
+                8, 4,
             ),
         };
         (weights, config)
@@ -457,14 +446,14 @@ mod tests {
         // Minimal FFN: embed_dim=4, ffn_hidden=8
         let layer = LayerWeights {
             attn_norm: Tensor::zeros(&[4]),
-            ffn_norm: Tensor::zeros(&[4]),
-            attn_q: Tensor::zeros(&[4, 4]),
-            attn_k: Tensor::zeros(&[4, 4]),
-            attn_v: Tensor::zeros(&[4, 4]),
-            attn_output: Tensor::zeros(&[4, 4]),
-            ffn_gate: Tensor::zeros(&[8, 4]),
-            ffn_up: Tensor::zeros(&[8, 4]),
-            ffn_down: Tensor::zeros(&[4, 8]),
+            ffn_norm:  Tensor::zeros(&[4]),
+            attn_q:      QuantizedTensor::from_f32(&vec![0.0f32; 16], 4, 4),
+            attn_k:      QuantizedTensor::from_f32(&vec![0.0f32; 16], 4, 4),
+            attn_v:      QuantizedTensor::from_f32(&vec![0.0f32; 16], 4, 4),
+            attn_output: QuantizedTensor::from_f32(&vec![0.0f32; 16], 4, 4),
+            ffn_gate:    QuantizedTensor::from_f32(&vec![0.0f32; 32], 8, 4),
+            ffn_up:      QuantizedTensor::from_f32(&vec![0.0f32; 32], 8, 4),
+            ffn_down:    QuantizedTensor::from_f32(&vec![0.0f32; 32], 4, 8),
         };
         let x = Tensor::from_vec(vec![1.0, 2.0, 3.0, 4.0], &[4]);
         let result = feed_forward(&x, &layer);
