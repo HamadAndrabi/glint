@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 use ferrite::model::config::ModelConfig;
 use ferrite::model::gguf::GgufModel;
+use ferrite::model::tokenizer::Tokenizer;
 use ferrite::transformer::{TransformerWeights, generate_greedy};
 
 #[derive(Parser)]
@@ -32,13 +33,28 @@ enum Commands {
         show_tensors: bool,
     },
 
-    /// Generate tokens from a GGUF model.
+    /// Generate text from a GGUF model with a text prompt.
+    Run {
+        /// Path to the .gguf model file.
+        #[arg(short, long)]
+        file: PathBuf,
+
+        /// Text prompt.
+        #[arg(short, long)]
+        prompt: String,
+
+        /// Maximum number of new tokens to generate.
+        #[arg(short, long, default_value_t = 50)]
+        max_tokens: usize,
+    },
+
+    /// Generate tokens from raw token IDs (for debugging).
     Generate {
         /// Path to the .gguf model file.
         #[arg(short, long)]
         file: PathBuf,
 
-        /// Prompt as comma-separated token IDs (e.g. "1,15043,29892").
+        /// Prompt as comma-separated token IDs.
         #[arg(short, long)]
         tokens: String,
 
@@ -58,6 +74,13 @@ fn main() {
             show_tensors,
         } => {
             inspect_model(&file, show_metadata, show_tensors);
+        }
+        Commands::Run {
+            file,
+            prompt,
+            max_tokens,
+        } => {
+            run_model(&file, &prompt, max_tokens);
         }
         Commands::Generate {
             file,
@@ -160,6 +183,43 @@ fn inspect_model(path: &PathBuf, show_metadata: bool, show_tensors: bool) {
             bytes as f64 / (1024.0 * 1024.0),
         );
     }
+}
+
+fn run_model(path: &PathBuf, prompt: &str, max_tokens: usize) {
+    let model = match GgufModel::load(path) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("Error loading GGUF file: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let config = ModelConfig::from_metadata(&model.metadata)
+        .expect("Failed to extract model configuration");
+
+    eprintln!("Loading tokenizer...");
+    let tokenizer = Tokenizer::from_gguf(&model);
+    eprintln!("Tokenizer: {} tokens", tokenizer.vocab_size());
+
+    let mut prompt_tokens = tokenizer.encode(prompt);
+    // Prepend BOS token
+    prompt_tokens.insert(0, tokenizer.bos_token_id);
+
+    eprintln!("Prompt: {:?}", prompt);
+    eprintln!("Tokens: {:?} ({} tokens)", prompt_tokens, prompt_tokens.len());
+
+    eprintln!("Loading weights...");
+    let weights = TransformerWeights::load(&model, &config);
+
+    eprintln!("Generating...\n");
+    let output = generate_greedy(&weights, &config, &prompt_tokens, max_tokens);
+
+    // Decode and print the generated tokens (only the new ones)
+    let generated = &output[prompt_tokens.len()..];
+    let text = tokenizer.decode(generated);
+    println!("Prompt: {prompt}");
+    println!("Output: {text}");
+    println!("\n({} tokens generated)", generated.len());
 }
 
 fn generate_tokens(path: &PathBuf, tokens_str: &str, max_tokens: usize) {
