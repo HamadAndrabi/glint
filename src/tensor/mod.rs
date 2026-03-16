@@ -4,6 +4,8 @@ mod tensor;
 mod ops;
 mod dequantize;
 mod quantized;
+#[cfg(target_arch = "x86_64")]
+mod simd;
 
 pub use tensor::Tensor;
 pub use ops::*;

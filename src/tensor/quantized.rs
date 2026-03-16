@@ -61,6 +61,11 @@ impl QuantizedTensor {
         }
     }
 
+    /// Build from raw quantized bytes. Used for benchmarks and testing.
+    pub fn from_raw(data: Vec<u8>, rows: usize, cols: usize, ggml_type: GgmlType) -> Self {
+        Self { data, rows, cols, ggml_type }
+    }
+
     /// Build from a flat f32 slice (re-encoded as F32 bytes). Used in tests.
     pub fn from_f32(values: &[f32], rows: usize, cols: usize) -> Self {
         assert_eq!(values.len(), rows * cols);
@@ -85,8 +90,8 @@ impl QuantizedTensor {
             vec.len(), self.cols
         );
         let out = match self.ggml_type {
-            GgmlType::Q8_0 => matvec_q8_0(&self.data, self.rows, self.cols, vec),
-            GgmlType::Q4_0 => matvec_q4_0(&self.data, self.rows, self.cols, vec),
+            GgmlType::Q8_0 => dispatch_q8_0(&self.data, self.rows, self.cols, vec),
+            GgmlType::Q4_0 => dispatch_q4_0(&self.data, self.rows, self.cols, vec),
             _ => matvec_fallback(&self.data, self.ggml_type, self.rows, self.cols, vec),
         };
         Tensor::from_vec(out, &[self.rows])
@@ -110,16 +115,41 @@ impl QuantizedTensor {
     }
 }
 
-// ── Quantized Kernels ────────────────────────────────────────────────────────
+// ── Dispatch ─────────────────────────────────────────────────────────────────
+//
+// Runtime CPU feature detection → SIMD if available, scalar fallback otherwise.
 
-/// Q8_0 matrix-vector multiply.
+fn dispatch_q8_0(data: &[u8], rows: usize, cols: usize, vec: &[f32]) -> Vec<f32> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            // SAFETY: we just verified AVX2+FMA are available.
+            return unsafe { crate::tensor::simd::matvec_q8_0_avx2(data, rows, cols, vec) };
+        }
+    }
+    matvec_q8_0_scalar(data, rows, cols, vec)
+}
+
+fn dispatch_q4_0(data: &[u8], rows: usize, cols: usize, vec: &[f32]) -> Vec<f32> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            return unsafe { crate::tensor::simd::matvec_q4_0_avx2(data, rows, cols, vec) };
+        }
+    }
+    matvec_q4_0_scalar(data, rows, cols, vec)
+}
+
+// ── Scalar Kernels ───────────────────────────────────────────────────────────
+
+/// Q8_0 matrix-vector multiply (scalar fallback).
 ///
 /// Block layout (34 bytes per 32 elements):
 ///   [f16 scale (2 bytes)] [32 × i8 values]
 ///
 /// For each output row, iterate over blocks, compute block_sum = Σ i8×f32,
 /// then accumulate block_sum × scale. One scale multiply per block (32 elements).
-fn matvec_q8_0(data: &[u8], rows: usize, cols: usize, vec: &[f32]) -> Vec<f32> {
+pub(crate) fn matvec_q8_0_scalar(data: &[u8], rows: usize, cols: usize, vec: &[f32]) -> Vec<f32> {
     const BLOCK_ELEMS: usize = 32;
     const BLOCK_BYTES: usize = 34; // 2 (f16 scale) + 32 (i8s)
 
@@ -147,13 +177,13 @@ fn matvec_q8_0(data: &[u8], rows: usize, cols: usize, vec: &[f32]) -> Vec<f32> {
     out
 }
 
-/// Q4_0 matrix-vector multiply.
+/// Q4_0 matrix-vector multiply (scalar fallback).
 ///
 /// Block layout (18 bytes per 32 elements):
 ///   [f16 scale (2 bytes)] [16 bytes of packed nibbles, 2 per byte]
 ///
 /// Nibble values are unsigned (0–15), centered by subtracting 8 → [-8, +7].
-fn matvec_q4_0(data: &[u8], rows: usize, cols: usize, vec: &[f32]) -> Vec<f32> {
+pub(crate) fn matvec_q4_0_scalar(data: &[u8], rows: usize, cols: usize, vec: &[f32]) -> Vec<f32> {
     const BLOCK_ELEMS: usize = 32;
     const BLOCK_BYTES: usize = 18; // 2 (f16 scale) + 16 (packed nibbles)
 
@@ -292,5 +322,82 @@ mod tests {
         assert_eq!(result.shape(), &[2]);
         assert!((result.data()[0] - 6.0).abs() < 1e-5);
         assert!((result.data()[1] - 15.0).abs() < 1e-5);
+    }
+
+    /// Verify SIMD and scalar Q8_0 kernels produce the same output.
+    /// Uses multiple blocks per row to exercise the cross-block accumulation.
+    #[test]
+    fn test_q8_0_simd_matches_scalar() {
+        // 4 rows × 128 cols = 4 blocks per row
+        let cols = 128;
+        let rows = 4;
+        let mut data = Vec::new();
+        for r in 0..rows {
+            for b in 0..4 {
+                let quants: Vec<i8> = (0..32)
+                    .map(|j| ((r * 4 + b) as i8).wrapping_mul(j as i8 + 1))
+                    .collect();
+                let scale = 0.1 * (r + 1) as f32;
+                data.extend(make_q8_0_block(scale, quants));
+            }
+        }
+
+        let input: Vec<f32> = (0..cols).map(|i| (i as f32) * 0.01).collect();
+
+        let scalar = matvec_q8_0_scalar(&data, rows, cols, &input);
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                let simd = unsafe {
+                    crate::tensor::simd::matvec_q8_0_avx2(&data, rows, cols, &input)
+                };
+                for i in 0..rows {
+                    assert!(
+                        (scalar[i] - simd[i]).abs() < 1e-3,
+                        "Row {i}: scalar={}, simd={}", scalar[i], simd[i]
+                    );
+                }
+            }
+        }
+    }
+
+    /// Verify SIMD and scalar Q4_0 kernels produce the same output.
+    #[test]
+    fn test_q4_0_simd_matches_scalar() {
+        // Build a 2×32 Q4_0 matrix (1 block per row)
+        let cols = 32;
+        let rows = 2;
+        let mut data = Vec::new();
+        for r in 0..rows {
+            // scale as f16 bytes
+            let scale = half::f16::from_f32(0.5 * (r + 1) as f32);
+            data.extend_from_slice(&scale.to_le_bytes());
+            // 16 packed nibble bytes → 32 elements
+            for byte_idx in 0..16 {
+                let lo = ((byte_idx + r * 3) % 16) as u8;
+                let hi = ((byte_idx + r * 7 + 1) % 16) as u8;
+                data.push(lo | (hi << 4));
+            }
+        }
+
+        let input: Vec<f32> = (0..cols).map(|i| (i as f32) * 0.1).collect();
+
+        let scalar = matvec_q4_0_scalar(&data, rows, cols, &input);
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                let simd = unsafe {
+                    crate::tensor::simd::matvec_q4_0_avx2(&data, rows, cols, &input)
+                };
+                for i in 0..rows {
+                    assert!(
+                        (scalar[i] - simd[i]).abs() < 1e-3,
+                        "Row {i}: scalar={}, simd={}", scalar[i], simd[i]
+                    );
+                }
+            }
+        }
     }
 }

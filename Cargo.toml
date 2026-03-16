@@ -27,3 +27,10 @@ thiserror = "2"
 [dev-dependencies]
 # Creates temporary files/directories for tests that auto-clean on drop.
 tempfile = "3"
+
+# Micro-benchmarking framework — statistical analysis, warmup, outlier detection.
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "matvec"
+harness = false

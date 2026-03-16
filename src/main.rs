@@ -2,6 +2,7 @@
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
+use std::time::Instant;
 
 use ferrite::model::config::ModelConfig;
 use ferrite::model::gguf::GgufModel;
@@ -212,14 +213,20 @@ fn run_model(path: &PathBuf, prompt: &str, max_tokens: usize) {
     let weights = TransformerWeights::load(&model, &config);
 
     eprintln!("Generating...\n");
+    let start = Instant::now();
     let output = generate_greedy_cached(&weights, &config, &prompt_tokens, max_tokens);
+    let elapsed = start.elapsed();
 
     // Decode and print the generated tokens (only the new ones)
     let generated = &output[prompt_tokens.len()..];
     let text = tokenizer.decode(generated);
     println!("Prompt: {prompt}");
     println!("Output: {text}");
-    println!("\n({} tokens generated)", generated.len());
+
+    let n_gen = generated.len();
+    let secs = elapsed.as_secs_f64();
+    let tok_per_sec = if secs > 0.0 { n_gen as f64 / secs } else { 0.0 };
+    println!("\n({n_gen} tokens in {secs:.2}s — {tok_per_sec:.1} tok/s)");
 }
 
 fn generate_tokens(path: &PathBuf, tokens_str: &str, max_tokens: usize) {
