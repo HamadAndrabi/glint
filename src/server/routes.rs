@@ -24,6 +24,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 
+use crate::model::chat_template::Message;
 use crate::sampling::{Sampler, SamplerConfig};
 use crate::transformer::{generate_cached, generate_streaming};
 
@@ -248,10 +249,11 @@ pub async fn chat_completions(
         return api_error(StatusCode::BAD_REQUEST, "messages must not be empty");
     }
 
-    // Convert messages to a plain text prompt.
-    // This is a simple universal format; production servers use model-specific
-    // chat templates, but this works for demonstration purposes.
-    let prompt = messages_to_prompt(&req.messages);
+    // Apply the model's chat template to format messages into a prompt.
+    let msgs: Vec<Message<'_>> = req.messages.iter()
+        .map(|m| Message { role: &m.role, content: &m.content })
+        .collect();
+    let prompt = state.chat_template.apply(&msgs);
 
     let mut prompt_tokens = state.tokenizer.encode(&prompt);
     prompt_tokens.insert(0, state.tokenizer.bos_token_id);
@@ -314,18 +316,3 @@ pub async fn chat_completions(
     }
 }
 
-/// Convert a list of chat messages to a plain text prompt.
-///
-/// Format: `{role}: {content}\n` for each message, then `assistant:` to prime
-/// the model to continue as the assistant.
-fn messages_to_prompt(messages: &[ChatMessage]) -> String {
-    let mut prompt = String::new();
-    for msg in messages {
-        prompt.push_str(&msg.role);
-        prompt.push_str(": ");
-        prompt.push_str(&msg.content);
-        prompt.push('\n');
-    }
-    prompt.push_str("assistant:");
-    prompt
-}

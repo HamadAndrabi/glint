@@ -6,6 +6,7 @@
 
 use std::sync::Arc;
 
+use crate::model::chat_template::ChatTemplate;
 use crate::model::config::ModelConfig;
 use crate::model::tokenizer::Tokenizer;
 use crate::transformer::TransformerWeights;
@@ -19,4 +20,6 @@ pub struct AppState {
     pub config: Arc<ModelConfig>,
     /// The model identifier returned in API responses (e.g. "smollm-135m-q8_0").
     pub model_name: String,
+    /// Detected chat template format for formatting chat messages into prompts.
+    pub chat_template: ChatTemplate,
 }

@@ -464,6 +464,7 @@ mod tests {
             feed_forward_length: Some(8),
             rms_norm_eps: 1e-5,
             rope_freq_base: Some(10000.0),
+            chat_template: None,
         };
         // Use QuantizedTensor::from_f32 which encodes as F32 bytes — exact round-trip.
         let weights = TransformerWeights {

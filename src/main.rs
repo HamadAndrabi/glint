@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
+use ferrite::model::chat_template::ChatTemplate;
 use ferrite::model::config::ModelConfig;
 use ferrite::model::gguf::GgufModel;
 use ferrite::model::tokenizer::Tokenizer;
@@ -368,11 +369,18 @@ async fn serve_model(path: &PathBuf, host: &str, port: u16) {
         .unwrap_or("ferrite-model")
         .to_string();
 
+    // Detect chat template from GGUF metadata
+    let chat_template = config.chat_template.as_deref()
+        .map(ChatTemplate::detect)
+        .unwrap_or(ChatTemplate::Generic);
+    eprintln!("Chat template:  {}", chat_template.name());
+
     let state = AppState {
         weights: Arc::new(weights),
         tokenizer: Arc::new(tokenizer),
         config: Arc::new(config),
         model_name,
+        chat_template,
     };
 
     ferrite::server::run_server(state, host, port).await;

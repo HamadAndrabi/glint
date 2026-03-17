@@ -17,6 +17,8 @@ pub struct ModelConfig {
     pub feed_forward_length: Option<u32>,
     pub rms_norm_eps: f32,
     pub rope_freq_base: Option<f32>,
+    /// Raw Jinja chat template from GGUF metadata (`tokenizer.chat_template`).
+    pub chat_template: Option<String>,
 }
 
 impl ModelConfig {
@@ -54,6 +56,11 @@ impl ModelConfig {
         let rms_norm_eps = get_f32("attention.layer_norm_rms_epsilon").unwrap_or(1e-5);
         let rope_freq_base = get_f32("rope.freq_base");
 
+        let chat_template = metadata
+            .get("tokenizer.chat_template")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
         Some(Self {
             architecture,
             context_length,
@@ -65,6 +72,7 @@ impl ModelConfig {
             feed_forward_length,
             rms_norm_eps,
             rope_freq_base,
+            chat_template,
         })
     }
 
