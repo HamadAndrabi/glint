@@ -20,6 +20,8 @@ use std::arch::x86_64::*;
 use half::f16;
 use rayon::prelude::*;
 
+use super::dequantize::get_scale_min_q4k;
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 /// Horizontal sum of 8 f32 lanes in a __m256 register.
@@ -169,6 +171,135 @@ pub(crate) unsafe fn matvec_q8_0_avx2(
     (0..rows)
         .into_par_iter()
         .map(|i| unsafe { dot_row_q8_0(data, i * bytes_per_row, n_blocks, vec) })
+        .collect()
+}
+
+// ── Q4_K helpers ─────────────────────────────────────────────────────────────
+
+/// Compute dot(nibbles_f32, input) and sum(input) in one pass.
+///
+/// `nibbles`: 32 u8 nibble values (0..15) packed in a __m256i.
+/// `input_ptr`: pointer to 32 contiguous f32 values.
+///
+/// Returns `(dot_sum, input_sum)` — caller multiplies by the sub-block
+/// scale and min to get the final contribution:
+///   `contribution = d_scale * dot_sum - d_min * input_sum`
+///
+/// The two scalars are returned separately so the caller can share the
+/// `input_sum` across multiple sub-block passes.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dot_and_sum_q4k(nibbles: __m256i, input_ptr: *const f32) -> (f32, f32) {
+    // Convert 32 nibbles (u8, 0..15) → 4×__m256 of f32.
+    // Sign-extend == zero-extend for values 0..15, so cvtepi8_epi16 is correct.
+    let lo_i8 = _mm256_castsi256_si128(nibbles);
+    let hi_i8 = _mm256_extracti128_si256::<1>(nibbles);
+    let lo_i16 = _mm256_cvtepi8_epi16(lo_i8);
+    let hi_i16 = _mm256_cvtepi8_epi16(hi_i8);
+    let w0 = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm256_castsi256_si128(lo_i16)));
+    let w1 = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm256_extracti128_si256::<1>(lo_i16)));
+    let w2 = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm256_castsi256_si128(hi_i16)));
+    let w3 = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm256_extracti128_si256::<1>(hi_i16)));
+
+    // Load 32 f32 input values.
+    let v0 = _mm256_loadu_ps(input_ptr);
+    let v1 = _mm256_loadu_ps(input_ptr.add(8));
+    let v2 = _mm256_loadu_ps(input_ptr.add(16));
+    let v3 = _mm256_loadu_ps(input_ptr.add(24));
+
+    // Dot product: sum(w × v)
+    let d01 = _mm256_fmadd_ps(w1, v1, _mm256_mul_ps(w0, v0));
+    let d23 = _mm256_fmadd_ps(w3, v3, _mm256_mul_ps(w2, v2));
+    let dot_sum = hsum_avx2(_mm256_add_ps(d01, d23));
+
+    // Input sum: sum(v)
+    let s01 = _mm256_add_ps(v0, v1);
+    let s23 = _mm256_add_ps(v2, v3);
+    let inp_sum = hsum_avx2(_mm256_add_ps(s01, s23));
+
+    (dot_sum, inp_sum)
+}
+
+/// Compute the dot product of one Q4_K row against the input vector.
+///
+/// Each super-block (144 bytes, 256 elements) is split into 4 groups of 64.
+/// Each group uses two (scale, min) pairs for its 32 low-nibble and 32
+/// high-nibble values.
+///
+/// `contribution = d_scale × dot(nibbles, input) − d_min × sum(input)`
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dot_row_q4_k(data: &[u8], row_start: usize, n_super: usize, vec: &[f32]) -> f32 {
+    const SUPER_BLOCK: usize = 256;
+    const BLOCK_BYTES: usize = 144;
+
+    let lo_mask = _mm256_set1_epi8(0x0F_u8 as i8);
+    let mut total = 0.0f32;
+
+    for sb in 0..n_super {
+        let b = &data[row_start + sb * BLOCK_BYTES..];
+        let d    = f16::from_le_bytes([b[0], b[1]]).to_f32();
+        let dmin = f16::from_le_bytes([b[2], b[3]]).to_f32();
+        let scales = &b[4..16];
+        let qs = &b[16..144];
+        let x_base = sb * SUPER_BLOCK;
+
+        for group in 0..4_usize {
+            let (sc0, mn0) = get_scale_min_q4k(group * 2,     scales);
+            let (sc1, mn1) = get_scale_min_q4k(group * 2 + 1, scales);
+            let d0 = d * sc0 as f32;  let m0 = dmin * mn0 as f32;
+            let d1 = d * sc1 as f32;  let m1 = dmin * mn1 as f32;
+
+            // Load 32 packed nibble bytes: low nibbles → first 32 elements,
+            // high nibbles → next 32 elements of this group.
+            let q_base = group * 32;
+            let packed = _mm256_loadu_si256(qs[q_base..].as_ptr() as *const __m256i);
+
+            // Extract nibbles. srli_epi16 + mask works correctly byte-wise:
+            // for each 16-bit lane [B1,B0], shifted >> 4 gives [B1>>4, B0>>4 | B1<<4],
+            // and masking with 0x0F extracts hi_B0 into byte position 0, hi_B1 into byte 1.
+            let lo_nibbles = _mm256_and_si256(packed, lo_mask);
+            let hi_nibbles = _mm256_and_si256(_mm256_srli_epi16(packed, 4), lo_mask);
+
+            let x_lo = vec.as_ptr().add(x_base + group * 64);
+            let x_hi = x_lo.add(32);
+
+            let (dot_lo, sum_lo) = dot_and_sum_q4k(lo_nibbles, x_lo);
+            let (dot_hi, sum_hi) = dot_and_sum_q4k(hi_nibbles, x_hi);
+
+            total += d0 * dot_lo - m0 * sum_lo;
+            total += d1 * dot_hi - m1 * sum_hi;
+        }
+    }
+
+    total
+}
+
+/// Q4_K matrix-vector multiply using AVX2 + FMA + rayon.
+///
+/// Rows distributed across threads; each row uses `dot_row_q4_k` which
+/// processes 4 groups of 64 elements per super-block with SIMD nibble
+/// extraction and dot-product accumulation.
+///
+/// # Safety
+/// Caller must verify AVX2 and FMA are available via `is_x86_feature_detected!`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+pub(crate) unsafe fn matvec_q4_k_avx2(
+    data: &[u8],
+    rows: usize,
+    cols: usize,
+    vec: &[f32],
+) -> Vec<f32> {
+    const SUPER_BLOCK: usize = 256;
+    const BLOCK_BYTES: usize = 144;
+
+    let n_super = cols / SUPER_BLOCK;
+    let bytes_per_row = n_super * BLOCK_BYTES;
+
+    (0..rows)
+        .into_par_iter()
+        .map(|r| unsafe { dot_row_q4_k(data, r * bytes_per_row, n_super, vec) })
         .collect()
 }
 
