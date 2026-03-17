@@ -303,6 +303,127 @@ pub(crate) unsafe fn matvec_q4_k_avx2(
         .collect()
 }
 
+// ── Q5_K kernel ──────────────────────────────────────────────────────────────
+
+/// Compute the dot product of one Q5_K row against the input vector.
+///
+/// Super-block layout (176 bytes / 256 elements):
+///   [f16 d (2B)] [f16 dmin (2B)] [scales u8×12] [qh u8×32] [qs u8×128]
+///
+/// Q5_K shares the same scale/min and group structure as Q4_K (4 groups of 64,
+/// 2 sub-blocks each via `get_scale_min_q4k`). The difference: each 4-bit
+/// nibble gains a 5th bit from the packed `qh` array, giving 5-bit values
+/// in [0, 31] instead of [0, 15].
+///
+/// Bit extraction from qh:
+///   low  nibbles of group g: bit `2*g`   of qh[l]  (mask = 1 << (2*g))
+///   high nibbles of group g: bit `2*g+1` of qh[l]  (mask = 2 << (2*g))
+///
+/// The 5th bit is extracted with `_mm256_cmpeq_epi8` vs zero + `_mm256_andnot_si256`
+/// to produce 0 or 16 per byte, then OR'd with the low nibbles.
+/// The resulting 5-bit values (0..31) go straight into `dot_and_sum_q4k`,
+/// which sign-extends u8→f32 (values ≤ 31 are safely non-negative in i8). ✓
+///
+/// Contribution per sub-block:  `d_scale × dot(nibble5, input) − d_min × sum(input)`
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dot_row_q5_k(data: &[u8], row_start: usize, n_super: usize, vec: &[f32]) -> f32 {
+    const SUPER_BLOCK: usize = 256;
+    const BLOCK_BYTES: usize = 176;
+
+    let lo_mask = _mm256_set1_epi8(0x0F_u8 as i8);
+    let zero    = _mm256_setzero_si256();
+    let sixteen = _mm256_set1_epi8(16_u8 as i8);
+
+    let mut total = 0.0f32;
+
+    for sb in 0..n_super {
+        let b      = &data[row_start + sb * BLOCK_BYTES..];
+        let d      = f16::from_le_bytes([b[0], b[1]]).to_f32();
+        let dmin   = f16::from_le_bytes([b[2], b[3]]).to_f32();
+        let scales = &b[4..16];
+        let qh     = &b[16..48];   // 32 bytes — one bit per element per sub-block
+        let qs     = &b[48..176];  // 128 bytes — low 4 bits (same layout as Q4_K)
+        let x_base = sb * SUPER_BLOCK;
+
+        // Load all 32 qh bytes once; each group uses two specific bits per byte.
+        let qh_v = _mm256_loadu_si256(qh.as_ptr() as *const __m256i);
+
+        for group in 0..4_usize {
+            let (sc0, mn0) = get_scale_min_q4k(group * 2,     scales);
+            let (sc1, mn1) = get_scale_min_q4k(group * 2 + 1, scales);
+            let d0 = d * sc0 as f32;  let m0 = dmin * mn0 as f32;
+            let d1 = d * sc1 as f32;  let m1 = dmin * mn1 as f32;
+
+            // 32 packed nibble bytes (same position as Q4_K)
+            let q_base = group * 32;
+            let packed = _mm256_loadu_si256(qs[q_base..].as_ptr() as *const __m256i);
+
+            // Extract 4-bit nibbles
+            let lo4 = _mm256_and_si256(packed, lo_mask);
+            let hi4 = _mm256_and_si256(_mm256_srli_epi16(packed, 4), lo_mask);
+
+            // Bit masks for the 5th bit of each sub-block in this group
+            //   u1 = 1 << (2*group)   → bit for low nibbles
+            //   u2 = 1 << (2*group+1) → bit for high nibbles
+            let u1: u8 = 1 << (group * 2);
+            let u2: u8 = 1 << (group * 2 + 1);
+
+            // For each of the 32 qh bytes: test bit u1 → 0 or 16 per byte.
+            //   cmpeq_epi8(and, zero) → 0xFF where bit was 0, 0x00 where bit was 1
+            //   andnot(is_zero, 16)   → 16 where bit was 1, 0 where bit was 0  ✓
+            let hi_bit_lo = _mm256_andnot_si256(
+                _mm256_cmpeq_epi8(_mm256_and_si256(qh_v, _mm256_set1_epi8(u1 as i8)), zero),
+                sixteen,
+            );
+            let hi_bit_hi = _mm256_andnot_si256(
+                _mm256_cmpeq_epi8(_mm256_and_si256(qh_v, _mm256_set1_epi8(u2 as i8)), zero),
+                sixteen,
+            );
+
+            // 5-bit values in [0, 31]: low nibble | 5th bit (no overlap, OR = ADD)
+            let nibbles5_lo = _mm256_or_si256(lo4, hi_bit_lo);
+            let nibbles5_hi = _mm256_or_si256(hi4, hi_bit_hi);
+
+            let x_lo = vec.as_ptr().add(x_base + group * 64);
+            let x_hi = x_lo.add(32);
+
+            // Reuse Q4_K dot-and-sum: values 0..31 sign-extend to correct f32 ✓
+            let (dot_lo, sum_lo) = dot_and_sum_q4k(nibbles5_lo, x_lo);
+            let (dot_hi, sum_hi) = dot_and_sum_q4k(nibbles5_hi, x_hi);
+
+            total += d0 * dot_lo - m0 * sum_lo;
+            total += d1 * dot_hi - m1 * sum_hi;
+        }
+    }
+
+    total
+}
+
+/// Q5_K matrix-vector multiply using AVX2 + FMA + rayon.
+///
+/// # Safety
+/// Caller must verify AVX2 and FMA are available via `is_x86_feature_detected!`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+pub(crate) unsafe fn matvec_q5_k_avx2(
+    data: &[u8],
+    rows: usize,
+    cols: usize,
+    vec: &[f32],
+) -> Vec<f32> {
+    const SUPER_BLOCK: usize = 256;
+    const BLOCK_BYTES: usize = 176;
+
+    let n_super = cols / SUPER_BLOCK;
+    let bytes_per_row = n_super * BLOCK_BYTES;
+
+    (0..rows)
+        .into_par_iter()
+        .map(|r| unsafe { dot_row_q5_k(data, r * bytes_per_row, n_super, vec) })
+        .collect()
+}
+
 // ── Q6_K helpers ─────────────────────────────────────────────────────────────
 
 /// Dot product of 16 signed i8 weights × 16 f32 inputs → f32.
