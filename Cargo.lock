@@ -286,6 +286,7 @@ dependencies = [
  "criterion",
  "half",
  "memmap2",
+ "rayon",
  "tempfile",
  "thiserror",
 ]

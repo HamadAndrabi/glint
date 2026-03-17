@@ -10,6 +10,7 @@
 //! cache utilization — more of the model fits in L2/L3 during matmul.
 
 use half::f16;
+use rayon::prelude::*;
 
 use crate::model::gguf::{GgmlType, GgufModel};
 use super::tensor::Tensor;
@@ -156,25 +157,23 @@ pub(crate) fn matvec_q8_0_scalar(data: &[u8], rows: usize, cols: usize, vec: &[f
     let n_blocks = cols / BLOCK_ELEMS;
     let bytes_per_row = n_blocks * BLOCK_BYTES;
 
-    let mut out = vec![0.0f32; rows];
-
-    for i in 0..rows {
-        let row_start = i * bytes_per_row;
-        let mut sum = 0.0f32;
-
-        for b in 0..n_blocks {
-            let block = &data[row_start + b * BLOCK_BYTES..];
-            let scale = f16::from_le_bytes([block[0], block[1]]).to_f32();
-
-            let mut block_sum = 0.0f32;
-            for j in 0..BLOCK_ELEMS {
-                block_sum += (block[2 + j] as i8) as f32 * vec[b * BLOCK_ELEMS + j];
+    (0..rows)
+        .into_par_iter()
+        .map(|i| {
+            let row_start = i * bytes_per_row;
+            let mut sum = 0.0f32;
+            for b in 0..n_blocks {
+                let block = &data[row_start + b * BLOCK_BYTES..];
+                let scale = f16::from_le_bytes([block[0], block[1]]).to_f32();
+                let mut block_sum = 0.0f32;
+                for j in 0..BLOCK_ELEMS {
+                    block_sum += (block[2 + j] as i8) as f32 * vec[b * BLOCK_ELEMS + j];
+                }
+                sum += block_sum * scale;
             }
-            sum += block_sum * scale;
-        }
-        out[i] = sum;
-    }
-    out
+            sum
+        })
+        .collect()
 }
 
 /// Q4_0 matrix-vector multiply (scalar fallback).
@@ -190,31 +189,29 @@ pub(crate) fn matvec_q4_0_scalar(data: &[u8], rows: usize, cols: usize, vec: &[f
     let n_blocks = cols / BLOCK_ELEMS;
     let bytes_per_row = n_blocks * BLOCK_BYTES;
 
-    let mut out = vec![0.0f32; rows];
-
-    for i in 0..rows {
-        let row_start = i * bytes_per_row;
-        let mut sum = 0.0f32;
-
-        for b in 0..n_blocks {
-            let block = &data[row_start + b * BLOCK_BYTES..];
-            let scale = f16::from_le_bytes([block[0], block[1]]).to_f32();
-
-            let mut block_sum = 0.0f32;
-            for j in 0..BLOCK_ELEMS {
-                let byte = block[2 + j / 2];
-                let nibble = if j % 2 == 0 {
-                    (byte & 0x0F) as i32
-                } else {
-                    ((byte >> 4) & 0x0F) as i32
-                };
-                block_sum += (nibble - 8) as f32 * vec[b * BLOCK_ELEMS + j];
+    (0..rows)
+        .into_par_iter()
+        .map(|i| {
+            let row_start = i * bytes_per_row;
+            let mut sum = 0.0f32;
+            for b in 0..n_blocks {
+                let block = &data[row_start + b * BLOCK_BYTES..];
+                let scale = f16::from_le_bytes([block[0], block[1]]).to_f32();
+                let mut block_sum = 0.0f32;
+                for j in 0..BLOCK_ELEMS {
+                    let byte = block[2 + j / 2];
+                    let nibble = if j % 2 == 0 {
+                        (byte & 0x0F) as i32
+                    } else {
+                        ((byte >> 4) & 0x0F) as i32
+                    };
+                    block_sum += (nibble - 8) as f32 * vec[b * BLOCK_ELEMS + j];
+                }
+                sum += block_sum * scale;
             }
-            sum += block_sum * scale;
-        }
-        out[i] = sum;
-    }
-    out
+            sum
+        })
+        .collect()
 }
 
 /// Fallback matvec: dequantize each row on-the-fly, then do a plain dot product.
@@ -233,17 +230,18 @@ fn matvec_fallback(
     let n_blocks = (cols + block_size - 1) / block_size;
     let bytes_per_row = n_blocks * type_size;
 
-    let mut out = vec![0.0f32; rows];
-    for i in 0..rows {
-        let row_bytes = &data[i * bytes_per_row..(i + 1) * bytes_per_row];
-        let row_f32 = dequantize(row_bytes, ggml_type, cols);
-        let mut sum = 0.0f32;
-        for j in 0..cols {
-            sum += row_f32[j] * vec[j];
-        }
-        out[i] = sum;
-    }
-    out
+    (0..rows)
+        .into_par_iter()
+        .map(|i| {
+            let row_bytes = &data[i * bytes_per_row..(i + 1) * bytes_per_row];
+            let row_f32 = dequantize(row_bytes, ggml_type, cols);
+            let mut sum = 0.0f32;
+            for j in 0..cols {
+                sum += row_f32[j] * vec[j];
+            }
+            sum
+        })
+        .collect()
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────

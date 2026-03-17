@@ -8,6 +8,9 @@
 //! is broadcast and accumulated into a single __m256, with a single horizontal
 //! sum at the end of each output row.
 //!
+//! Row-level parallelism via rayon: each output row's dot product is independent,
+//! so we distribute rows across all CPU cores.
+//!
 //! Only compiled on x86_64. Caller must verify `is_x86_feature_detected!("avx2")`
 //! and `is_x86_feature_detected!("fma")` before calling these functions.
 
@@ -15,6 +18,7 @@
 use std::arch::x86_64::*;
 
 use half::f16;
+use rayon::prelude::*;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -86,16 +90,65 @@ unsafe fn accum_block_q8(
     _mm256_fmadd_ps(scale_vec, block_partial, acc)
 }
 
-// ── Q8_0 AVX2 Kernel ────────────────────────────────────────────────────────
+// ── Per-row functions ────────────────────────────────────────────────────────
+//
+// Closures (including rayon's) don't inherit #[target_feature], so we extract
+// the per-row SIMD logic into standalone functions that closures can call.
 
-/// Q8_0 matrix-vector multiply using AVX2 + FMA.
+/// Compute the dot product of one Q8_0 row against the input vector.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dot_row_q8_0(data: &[u8], row_start: usize, n_blocks: usize, vec: &[f32]) -> f32 {
+    const BLOCK_ELEMS: usize = 32;
+    const BLOCK_BYTES: usize = 34;
+
+    let mut acc = _mm256_setzero_ps();
+    for b in 0..n_blocks {
+        let block = &data[row_start + b * BLOCK_BYTES..];
+        let scale = f16::from_le_bytes([block[0], block[1]]).to_f32();
+        let weights = _mm256_loadu_si256(block[2..].as_ptr() as *const __m256i);
+        acc = accum_block_q8(weights, vec.as_ptr().add(b * BLOCK_ELEMS), scale, acc);
+    }
+    hsum_avx2(acc)
+}
+
+/// Compute the dot product of one Q4_0 row against the input vector.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dot_row_q4_0(data: &[u8], row_start: usize, n_blocks: usize, vec: &[f32]) -> f32 {
+    const BLOCK_ELEMS: usize = 32;
+    const BLOCK_BYTES: usize = 18;
+
+    let low_mask = _mm_set1_epi8(0x0F);
+    let offset_8 = _mm256_set1_epi8(8);
+
+    let mut acc = _mm256_setzero_ps();
+    for b in 0..n_blocks {
+        let block = &data[row_start + b * BLOCK_BYTES..];
+        let scale = f16::from_le_bytes([block[0], block[1]]).to_f32();
+
+        let packed = _mm_loadu_si128(block[2..].as_ptr() as *const __m128i);
+        let lo_nib = _mm_and_si128(packed, low_mask);
+        let hi_nib = _mm_and_si128(_mm_srli_epi16(packed, 4), low_mask);
+        let interleaved_lo = _mm_unpacklo_epi8(lo_nib, hi_nib);
+        let interleaved_hi = _mm_unpackhi_epi8(lo_nib, hi_nib);
+        let values_u8 = _mm256_inserti128_si256::<1>(
+            _mm256_castsi128_si256(interleaved_lo),
+            interleaved_hi,
+        );
+        let centered = _mm256_sub_epi8(values_u8, offset_8);
+
+        acc = accum_block_q8(centered, vec.as_ptr().add(b * BLOCK_ELEMS), scale, acc);
+    }
+    hsum_avx2(acc)
+}
+
+// ── Public kernels ───────────────────────────────────────────────────────────
+
+/// Q8_0 matrix-vector multiply using AVX2 + FMA + rayon.
 ///
-/// Block layout (34 bytes per 32 elements):
-///   [f16 scale (2 bytes)] [32 × i8 values]
-///
-/// For each output row, we keep a single __m256 accumulator across all blocks.
-/// Each block: load 32 i8 weights → convert to 4×8 f32 → FMA with input → scale
-/// and accumulate. One horizontal sum at the very end of each row.
+/// Rows are distributed across threads via rayon's work-stealing pool.
+/// Each thread computes its rows using SIMD, then results are collected.
 ///
 /// # Safety
 /// Caller must verify AVX2 and FMA are available via `is_x86_feature_detected!`.
@@ -108,48 +161,18 @@ pub(crate) unsafe fn matvec_q8_0_avx2(
     vec: &[f32],
 ) -> Vec<f32> {
     const BLOCK_ELEMS: usize = 32;
-    const BLOCK_BYTES: usize = 34; // 2 (f16 scale) + 32 (i8s)
+    const BLOCK_BYTES: usize = 34;
 
     let n_blocks = cols / BLOCK_ELEMS;
     let bytes_per_row = n_blocks * BLOCK_BYTES;
 
-    let mut out = vec![0.0f32; rows];
-
-    for i in 0..rows {
-        let row_start = i * bytes_per_row;
-        let mut acc = _mm256_setzero_ps();
-
-        for b in 0..n_blocks {
-            let block = &data[row_start + b * BLOCK_BYTES..];
-            let scale = f16::from_le_bytes([block[0], block[1]]).to_f32();
-
-            // Load 32 i8 weights from block[2..34]
-            let weights = _mm256_loadu_si256(block[2..].as_ptr() as *const __m256i);
-
-            acc = accum_block_q8(
-                weights,
-                vec.as_ptr().add(b * BLOCK_ELEMS),
-                scale,
-                acc,
-            );
-        }
-
-        out[i] = hsum_avx2(acc);
-    }
-
-    out
+    (0..rows)
+        .into_par_iter()
+        .map(|i| unsafe { dot_row_q8_0(data, i * bytes_per_row, n_blocks, vec) })
+        .collect()
 }
 
-// ── Q4_0 AVX2 Kernel ────────────────────────────────────────────────────────
-
-/// Q4_0 matrix-vector multiply using AVX2 + FMA.
-///
-/// Block layout (18 bytes per 32 elements):
-///   [f16 scale (2 bytes)] [16 bytes of packed nibbles, 2 per byte]
-///
-/// Each byte holds two 4-bit unsigned values (0–15). Low nibble = even element,
-/// high nibble = odd element. We unpack, subtract 8 to center → signed [-8, +7],
-/// then reuse the same i8→f32 FMA pipeline as Q8_0.
+/// Q4_0 matrix-vector multiply using AVX2 + FMA + rayon.
 ///
 /// # Safety
 /// Caller must verify AVX2 and FMA are available via `is_x86_feature_detected!`.
@@ -162,60 +185,13 @@ pub(crate) unsafe fn matvec_q4_0_avx2(
     vec: &[f32],
 ) -> Vec<f32> {
     const BLOCK_ELEMS: usize = 32;
-    const BLOCK_BYTES: usize = 18; // 2 (f16 scale) + 16 (packed nibbles)
+    const BLOCK_BYTES: usize = 18;
 
     let n_blocks = cols / BLOCK_ELEMS;
     let bytes_per_row = n_blocks * BLOCK_BYTES;
 
-    let low_mask = _mm_set1_epi8(0x0F);
-    let offset_8 = _mm256_set1_epi8(8);
-
-    let mut out = vec![0.0f32; rows];
-
-    for i in 0..rows {
-        let row_start = i * bytes_per_row;
-        let mut acc = _mm256_setzero_ps();
-
-        for b in 0..n_blocks {
-            let block = &data[row_start + b * BLOCK_BYTES..];
-            let scale = f16::from_le_bytes([block[0], block[1]]).to_f32();
-
-            // Load 16 packed nibble bytes
-            let packed = _mm_loadu_si128(block[2..].as_ptr() as *const __m128i);
-
-            // Extract low nibbles (even elements) and high nibbles (odd elements)
-            let lo_nib = _mm_and_si128(packed, low_mask);
-            let hi_nib = _mm_and_si128(_mm_srli_epi16(packed, 4), low_mask);
-
-            // Interleave back to element order:
-            //   lo_nib = [elem0, elem2, elem4, ...]
-            //   hi_nib = [elem1, elem3, elem5, ...]
-            //   unpacklo → [elem0, elem1, elem2, elem3, ..., elem15]
-            //   unpackhi → [elem16, elem17, ..., elem31]
-            let interleaved_lo = _mm_unpacklo_epi8(lo_nib, hi_nib);
-            let interleaved_hi = _mm_unpackhi_epi8(lo_nib, hi_nib);
-
-            // Combine into 256-bit: all 32 unsigned nibble values in element order
-            let values_u8 = _mm256_inserti128_si256::<1>(
-                _mm256_castsi128_si256(interleaved_lo),
-                interleaved_hi,
-            );
-
-            // Subtract 8 to center: unsigned [0,15] → signed [-8, +7]
-            // Byte subtraction is signedness-agnostic at the bit level.
-            let centered = _mm256_sub_epi8(values_u8, offset_8);
-
-            // Now we have 32 signed i8 values — same as Q8_0 from here.
-            acc = accum_block_q8(
-                centered,
-                vec.as_ptr().add(b * BLOCK_ELEMS),
-                scale,
-                acc,
-            );
-        }
-
-        out[i] = hsum_avx2(acc);
-    }
-
-    out
+    (0..rows)
+        .into_par_iter()
+        .map(|i| unsafe { dot_row_q4_0(data, i * bytes_per_row, n_blocks, vec) })
+        .collect()
 }

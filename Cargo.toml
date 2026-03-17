@@ -24,6 +24,9 @@ clap = { version = "4", features = ["derive"] }
 # using a simple derive macro instead of manual boilerplate.
 thiserror = "2"
 
+# Data parallelism — work-stealing thread pool for parallelizing matmul across rows.
+rayon = "1.10"
+
 [dev-dependencies]
 # Creates temporary files/directories for tests that auto-clean on drop.
 tempfile = "3"
