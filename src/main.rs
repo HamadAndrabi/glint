@@ -7,7 +7,8 @@ use std::time::Instant;
 use ferrite::model::config::ModelConfig;
 use ferrite::model::gguf::GgufModel;
 use ferrite::model::tokenizer::Tokenizer;
-use ferrite::transformer::{TransformerWeights, generate_greedy_cached};
+use ferrite::sampling::{Sampler, SamplerConfig};
+use ferrite::transformer::{TransformerWeights, generate_cached, generate_greedy_cached};
 
 #[derive(Parser)]
 #[command(name = "ferrite")]
@@ -47,6 +48,26 @@ enum Commands {
         /// Maximum number of new tokens to generate.
         #[arg(short, long, default_value_t = 50)]
         max_tokens: usize,
+
+        /// Sampling temperature. 0.0 = greedy (default), higher = more random.
+        #[arg(long, default_value_t = 0.0)]
+        temperature: f32,
+
+        /// Top-k sampling. 0 = disabled (default).
+        #[arg(long, default_value_t = 0)]
+        top_k: usize,
+
+        /// Top-p (nucleus) sampling. 1.0 = disabled (default).
+        #[arg(long, default_value_t = 1.0)]
+        top_p: f32,
+
+        /// Repetition penalty. 1.0 = disabled (default).
+        #[arg(long, default_value_t = 1.0)]
+        repeat_penalty: f32,
+
+        /// Random seed for reproducible sampling.
+        #[arg(long)]
+        seed: Option<u64>,
     },
 
     /// Generate tokens from raw token IDs (for debugging).
@@ -80,8 +101,13 @@ fn main() {
             file,
             prompt,
             max_tokens,
+            temperature,
+            top_k,
+            top_p,
+            repeat_penalty,
+            seed,
         } => {
-            run_model(&file, &prompt, max_tokens);
+            run_model(&file, &prompt, max_tokens, temperature, top_k, top_p, repeat_penalty, seed);
         }
         Commands::Generate {
             file,
@@ -186,7 +212,16 @@ fn inspect_model(path: &PathBuf, show_metadata: bool, show_tensors: bool) {
     }
 }
 
-fn run_model(path: &PathBuf, prompt: &str, max_tokens: usize) {
+fn run_model(
+    path: &PathBuf,
+    prompt: &str,
+    max_tokens: usize,
+    temperature: f32,
+    top_k: usize,
+    top_p: f32,
+    repeat_penalty: f32,
+    seed: Option<u64>,
+) {
     let model = match GgufModel::load(path) {
         Ok(m) => m,
         Err(e) => {
@@ -212,9 +247,33 @@ fn run_model(path: &PathBuf, prompt: &str, max_tokens: usize) {
     eprintln!("Loading weights...");
     let weights = TransformerWeights::load(&model, &config);
 
+    let use_sampling = temperature > 0.0;
+    if use_sampling {
+        eprintln!(
+            "Sampling: temp={temperature}, top_k={top_k}, top_p={top_p}, repeat_penalty={repeat_penalty}{}",
+            seed.map_or(String::new(), |s| format!(", seed={s}"))
+        );
+    } else {
+        eprintln!("Sampling: greedy (temperature=0)");
+    }
+
     eprintln!("Generating...\n");
     let start = Instant::now();
-    let output = generate_greedy_cached(&weights, &config, &prompt_tokens, max_tokens);
+
+    let output = if use_sampling {
+        let mut sampler = Sampler::new(SamplerConfig {
+            temperature,
+            top_k,
+            top_p,
+            repeat_penalty,
+            seed,
+            ..Default::default()
+        });
+        generate_cached(&weights, &config, &prompt_tokens, max_tokens, &mut sampler, tokenizer.eos_token_id)
+    } else {
+        generate_greedy_cached(&weights, &config, &prompt_tokens, max_tokens)
+    };
+
     let elapsed = start.elapsed();
 
     // Decode and print the generated tokens (only the new ones)

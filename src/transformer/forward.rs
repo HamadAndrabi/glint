@@ -2,6 +2,7 @@
 
 use crate::cache::KvCache;
 use crate::model::config::ModelConfig;
+use crate::sampling::Sampler;
 use crate::tensor::{self, Tensor};
 use super::weights::{LayerWeights, TransformerWeights};
 
@@ -333,6 +334,58 @@ pub fn generate_greedy_cached(
         tokens.push(next_token);
 
         if next_token == 2 {
+            break;
+        }
+
+        let pos = tokens.len() - 1;
+        last_logits = forward_one(weights, config, next_token, pos, &mut cache);
+    }
+
+    tokens
+}
+
+/// Token generation with configurable sampling.
+///
+/// Like `generate_greedy_cached`, but uses a `Sampler` to select each token
+/// instead of hardcoded argmax. This enables temperature, top-k, top-p,
+/// repetition penalty, and other sampling strategies.
+///
+/// Two phases:
+/// 1. **Prefill** — process each prompt token, populating the cache.
+/// 2. **Decode** — generate new tokens using the sampler.
+pub fn generate_cached(
+    weights: &TransformerWeights,
+    config: &ModelConfig,
+    prompt_tokens: &[u32],
+    max_new_tokens: usize,
+    sampler: &mut Sampler,
+    eos_token: u32,
+) -> Vec<u32> {
+    let max_seq_len = config.context_length as usize;
+    let n_layers = config.block_count as usize;
+    let n_kv_heads = config.head_count_kv as usize;
+    let head_dim = config.head_dim() as usize;
+
+    let mut cache = KvCache::new(n_layers, max_seq_len, n_kv_heads, head_dim);
+    let mut tokens = prompt_tokens.to_vec();
+
+    // Phase 1: Prefill — process all prompt tokens
+    eprintln!("Prefill: {} tokens", prompt_tokens.len());
+    let mut last_logits = Tensor::zeros(&[1]); // placeholder
+    for (i, &token_id) in prompt_tokens.iter().enumerate() {
+        eprint!("\r  Prefill token {}/{}...", i + 1, prompt_tokens.len());
+        last_logits = forward_one(weights, config, token_id, i, &mut cache);
+    }
+    eprintln!();
+
+    // Phase 2: Decode — generate new tokens using the sampler
+    for step in 0..max_new_tokens {
+        let next_token = sampler.sample(last_logits.data(), &tokens);
+
+        eprintln!("  Decode step {}/{}: token {next_token}", step + 1, max_new_tokens);
+        tokens.push(next_token);
+
+        if next_token == eos_token {
             break;
         }
 
