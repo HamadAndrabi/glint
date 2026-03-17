@@ -27,6 +27,19 @@ thiserror = "2"
 # Data parallelism — work-stealing thread pool for parallelizing matmul across rows.
 rayon = "1.10"
 
+# HTTP server framework built on tokio — handler-based routing, SSE streaming.
+axum = { version = "0.8", features = ["macros"] }
+
+# Async runtime — drives the HTTP server and provides spawn_blocking for CPU work.
+tokio = { version = "1", features = ["full"] }
+
+# JSON serialization/deserialization for the OpenAI-compatible API.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Bridges tokio mpsc channels to async streams (used for SSE token streaming).
+tokio-stream = "0.1"
+
 [dev-dependencies]
 # Creates temporary files/directories for tests that auto-clean on drop.
 tempfile = "3"

@@ -1,13 +1,15 @@
-//! Ferrite CLI — inspect and run GGUF models.
+//! Ferrite CLI — inspect, run, and serve GGUF models.
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Instant;
 
 use ferrite::model::config::ModelConfig;
 use ferrite::model::gguf::GgufModel;
 use ferrite::model::tokenizer::Tokenizer;
 use ferrite::sampling::{Sampler, SamplerConfig};
+use ferrite::server::AppState;
 use ferrite::transformer::{TransformerWeights, generate_cached, generate_greedy_cached};
 
 #[derive(Parser)]
@@ -84,9 +86,25 @@ enum Commands {
         #[arg(short, long, default_value_t = 20)]
         max_tokens: usize,
     },
+
+    /// Start the OpenAI-compatible HTTP inference server.
+    Serve {
+        /// Path to the .gguf model file.
+        #[arg(short, long)]
+        file: PathBuf,
+
+        /// Port to listen on.
+        #[arg(short, long, default_value_t = 8080)]
+        port: u16,
+
+        /// Host/IP to bind to. Use 0.0.0.0 to accept external connections.
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+    },
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let cli = Cli::parse();
 
     match cli.command {
@@ -115,6 +133,9 @@ fn main() {
             max_tokens,
         } => {
             generate_tokens(&file, &tokens, max_tokens);
+        }
+        Commands::Serve { file, port, host } => {
+            serve_model(&file, &host, port).await;
         }
     }
 }
@@ -318,6 +339,43 @@ fn generate_tokens(path: &PathBuf, tokens_str: &str, max_tokens: usize) {
     println!("\n═══ Output Tokens ═══");
     println!("{:?}", output);
     println!("\nGenerated {} new tokens", output.len() - prompt_tokens.len());
+}
+
+async fn serve_model(path: &PathBuf, host: &str, port: u16) {
+    let model = match GgufModel::load(path) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("Error loading GGUF file: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let config = ModelConfig::from_metadata(&model.metadata)
+        .expect("Failed to extract model configuration");
+
+    eprintln!("Loading tokenizer...");
+    let tokenizer = Tokenizer::from_gguf(&model);
+    eprintln!("Tokenizer: {} tokens", tokenizer.vocab_size());
+
+    eprintln!("Loading weights...");
+    let weights = TransformerWeights::load(&model, &config);
+    eprintln!("Weights loaded.");
+
+    // Derive a model name from the file stem (e.g. "smollm-135m-instruct.Q8_0")
+    let model_name = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("ferrite-model")
+        .to_string();
+
+    let state = AppState {
+        weights: Arc::new(weights),
+        tokenizer: Arc::new(tokenizer),
+        config: Arc::new(config),
+        model_name,
+    };
+
+    ferrite::server::run_server(state, host, port).await;
 }
 
 fn format_number(n: u64) -> String {

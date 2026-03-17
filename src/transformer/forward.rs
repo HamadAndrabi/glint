@@ -344,6 +344,55 @@ pub fn generate_greedy_cached(
     tokens
 }
 
+/// Token generation with configurable sampling and a per-token callback.
+///
+/// Like `generate_cached`, but calls `on_token(id)` for every generated token.
+/// If `on_token` returns `false`, generation stops early — used by the HTTP
+/// server to detect client disconnects.
+///
+/// Two phases:
+/// 1. **Prefill** — process each prompt token, populating the cache.
+/// 2. **Decode** — generate new tokens; call `on_token` after each one.
+pub fn generate_streaming(
+    weights: &TransformerWeights,
+    config: &ModelConfig,
+    prompt_tokens: &[u32],
+    max_new_tokens: usize,
+    sampler: &mut Sampler,
+    eos_token: u32,
+    on_token: impl Fn(u32) -> bool,
+) -> Vec<u32> {
+    let max_seq_len = config.context_length as usize;
+    let n_layers = config.block_count as usize;
+    let n_kv_heads = config.head_count_kv as usize;
+    let head_dim = config.head_dim() as usize;
+
+    let mut cache = KvCache::new(n_layers, max_seq_len, n_kv_heads, head_dim);
+    let mut tokens = prompt_tokens.to_vec();
+
+    // Prefill
+    let mut last_logits = Tensor::zeros(&[1]);
+    for (i, &token_id) in prompt_tokens.iter().enumerate() {
+        last_logits = forward_one(weights, config, token_id, i, &mut cache);
+    }
+
+    // Decode
+    for _ in 0..max_new_tokens {
+        let next_token = sampler.sample(last_logits.data(), &tokens);
+        tokens.push(next_token);
+
+        let keep_going = on_token(next_token);
+        if !keep_going || next_token == eos_token {
+            break;
+        }
+
+        let pos = tokens.len() - 1;
+        last_logits = forward_one(weights, config, next_token, pos, &mut cache);
+    }
+
+    tokens
+}
+
 /// Token generation with configurable sampling.
 ///
 /// Like `generate_greedy_cached`, but uses a `Sampler` to select each token
