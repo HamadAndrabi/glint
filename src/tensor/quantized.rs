@@ -95,7 +95,7 @@ impl QuantizedTensor {
             GgmlType::Q4_0 => dispatch_q4_0(&self.data, self.rows, self.cols, vec),
             GgmlType::Q4K  => dispatch_q4_k(&self.data, self.rows, self.cols, vec),
             GgmlType::Q5K  => matvec_q5_k_scalar(&self.data, self.rows, self.cols, vec),
-            GgmlType::Q6K  => matvec_q6_k_scalar(&self.data, self.rows, self.cols, vec),
+            GgmlType::Q6K  => dispatch_q6_k(&self.data, self.rows, self.cols, vec),
             _ => matvec_fallback(&self.data, self.ggml_type, self.rows, self.cols, vec),
         };
         Tensor::from_vec(out, &[self.rows])
@@ -142,6 +142,16 @@ fn dispatch_q4_k(data: &[u8], rows: usize, cols: usize, vec: &[f32]) -> Vec<f32>
         }
     }
     matvec_q4_k_scalar(data, rows, cols, vec)
+}
+
+fn dispatch_q6_k(data: &[u8], rows: usize, cols: usize, vec: &[f32]) -> Vec<f32> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            return unsafe { crate::tensor::simd::matvec_q6_k_avx2(data, rows, cols, vec) };
+        }
+    }
+    matvec_q6_k_scalar(data, rows, cols, vec)
 }
 
 fn dispatch_q4_0(data: &[u8], rows: usize, cols: usize, vec: &[f32]) -> Vec<f32> {
@@ -680,6 +690,54 @@ mod tests {
             }
         }
         let _ = &GgmlType::Q4K; // suppress unused import warning
+    }
+
+    /// Verify Q6_K SIMD and scalar kernels produce the same output.
+    ///
+    /// Two rows, 1 super-block each: varied ql, qh, scales, and d.
+    #[test]
+    fn test_q6_k_simd_matches_scalar() {
+        let rows = 2;
+        let cols = 256;
+        let mut data = Vec::new();
+
+        for r in 0..rows {
+            let mut block = vec![0u8; 210];
+            // ql (0..128): varied nibble patterns
+            for i in 0..128 {
+                block[i] = (r * 37 + i * 13 + 7) as u8;
+            }
+            // qh (128..192): varied high-bit patterns
+            for i in 0..64 {
+                block[128 + i] = (r * 11 + i * 5 + 3) as u8;
+            }
+            // scales (192..208): non-zero i8 values (avoid 0 to make errors visible)
+            for i in 0..16 {
+                block[192 + i] = (((r * 7 + i * 3 + 1) % 15) as u8).wrapping_add(1);
+            }
+            // d = 0.25 + 0.125 * r
+            let d_val = 0.25 + 0.125 * r as f32;
+            block[208..210].copy_from_slice(&half::f16::from_f32(d_val).to_le_bytes());
+            data.extend(block);
+        }
+
+        let input: Vec<f32> = (0..cols).map(|i| (i as f32) * 0.01 - 1.28).collect();
+        let scalar = matvec_q6_k_scalar(&data, rows, cols, &input);
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                let simd = unsafe {
+                    crate::tensor::simd::matvec_q6_k_avx2(&data, rows, cols, &input)
+                };
+                for i in 0..rows {
+                    assert!(
+                        (scalar[i] - simd[i]).abs() < 1e-3,
+                        "Row {i}: scalar={}, simd={}", scalar[i], simd[i]
+                    );
+                }
+            }
+        }
     }
 
     /// Verify SIMD and scalar Q4_0 kernels produce the same output.

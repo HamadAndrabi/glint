@@ -303,6 +303,180 @@ pub(crate) unsafe fn matvec_q4_k_avx2(
         .collect()
 }
 
+// ── Q6_K helpers ─────────────────────────────────────────────────────────────
+
+/// Dot product of 16 signed i8 weights × 16 f32 inputs → f32.
+///
+/// i8 values are sign-extended to i16 → i32 → f32, then multiplied and summed.
+/// Handles 16 elements using two AVX2 registers of 8 f32 each.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dot16_i8_f32(weights: __m128i, input_ptr: *const f32) -> f32 {
+    // Sign-extend 16 × i8 → 16 × i16 (256-bit register)
+    let w_i16 = _mm256_cvtepi8_epi16(weights);
+    // Convert two groups of 8 i16 → i32 → f32
+    let w0 = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm256_castsi256_si128(w_i16)));
+    let w1 = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm256_extracti128_si256::<1>(w_i16)));
+    // Load 16 f32 input values
+    let v0 = _mm256_loadu_ps(input_ptr);
+    let v1 = _mm256_loadu_ps(input_ptr.add(8));
+    // Dot: sum(w0*v0 + w1*v1)
+    hsum_avx2(_mm256_fmadd_ps(w1, v1, _mm256_mul_ps(w0, v0)))
+}
+
+/// Compute the dot product of one Q6_K row against the input vector.
+///
+/// Super-block layout (210 bytes / 256 elements):
+///   [ql u8×128] [qh u8×64] [scales i8×16] [f16 d]
+///
+/// Each super-block splits into 2 groups of 128. Within each group,
+/// 32 × l-index assembles 4 non-contiguous output positions (l, l+32, l+64,
+/// l+96) from `ql` and `qh`. The 16 scales change at l=16 (is=0→1), so
+/// we process each group in two halves of 16 elements.
+///
+/// 6-bit assembly per element:
+///   q1 = (ql[l]    & 0x0F) | ((qh[l] & 0x03)      << 4) − 32
+///   q2 = (ql[l+32] & 0x0F) | (((qh[l] >> 2) & 0x03) << 4) − 32
+///   q3 = (ql[l]    >>   4) | (((qh[l] >> 4) & 0x03) << 4) − 32
+///   q4 = (ql[l+32] >>   4) | (((qh[l] >> 6) & 0x03) << 4) − 32
+///
+/// The `<< 4` inside each byte uses `_mm_mullo_epi16(val_0..3, 16)`:
+/// for a 16-bit lane [B1, B0] with B0, B1 ∈ 0..3, this produces
+/// [B1×16, B0×16] — correct byte-level ×16 without AVX-512.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dot_row_q6_k(data: &[u8], row_start: usize, n_super: usize, vec: &[f32]) -> f32 {
+    const BLOCK_BYTES: usize = 210;
+    const SUPER_BLOCK: usize = 256;
+
+    let lo4    = _mm_set1_epi8(0x0F_u8 as i8);  // mask low nibble
+    let mask03 = _mm_set1_epi8(0x03_u8 as i8);  // mask 2 bits
+    let mul16  = _mm_set1_epi16(16);             // ×16 per byte (values 0..3 only)
+    let sub32  = _mm_set1_epi8(32_u8 as i8);     // centering offset
+
+    let mut total = 0.0f32;
+
+    for sb in 0..n_super {
+        let b    = &data[row_start + sb * BLOCK_BYTES..];
+        let ql   = &b[0..128];
+        let qh   = &b[128..192];
+        let sc   = &b[192..208]; // 16 × i8 sub-block scales
+        let d    = f16::from_le_bytes([b[208], b[209]]).to_f32();
+        let x_base = sb * SUPER_BLOCK;
+
+        for group in 0..2_usize {
+            let ql_off  = group * 64;
+            let qh_off  = group * 32;
+            let sc_off  = group * 8;
+            let x_group = x_base + group * 128;
+
+            // Each group has 32 l-values; the scale index `is = l / 16` changes
+            // at l=16, so we process in two halves.
+            for half in 0..2_usize {
+                let l = half * 16;
+
+                // Sub-block scales for this (group, half): indices 0,2,4,6 + half
+                let sc0 = d * sc[sc_off + half    ] as i8 as f32;
+                let sc2 = d * sc[sc_off + half + 2] as i8 as f32;
+                let sc4 = d * sc[sc_off + half + 4] as i8 as f32;
+                let sc6 = d * sc[sc_off + half + 6] as i8 as f32;
+
+                // Load 16 raw bytes from each needed region
+                let ql_a = _mm_loadu_si128(ql[ql_off +  l..].as_ptr()      as *const __m128i);
+                let ql_b = _mm_loadu_si128(ql[ql_off + 32 + l..].as_ptr()  as *const __m128i);
+                let qhv  = _mm_loadu_si128(qh[qh_off +  l..].as_ptr()      as *const __m128i);
+
+                // ── Assemble 6-bit values (0..63) then subtract 32 → i8 (−32..+31) ──
+                //
+                // Byte-level ×16 via mullo_epi16: for a 16-bit lane [B1,B0] with
+                // each byte ∈ 0..3, multiplying by 16 gives [B1×16, B0×16].
+                // The ql high-nibble extraction uses srli_epi16+lo4 which, for
+                // each byte B in a 16-bit lane: gives B>>4 in the low nibble. ✓
+
+                // q1 = (ql_a & 0x0F) | ((qh & 0x03) << 4) − 32
+                let q1 = _mm_sub_epi8(
+                    _mm_or_si128(
+                        _mm_and_si128(ql_a, lo4),
+                        _mm_mullo_epi16(_mm_and_si128(qhv, mask03), mul16),
+                    ),
+                    sub32,
+                );
+
+                // q2 = (ql_b & 0x0F) | (((qh >> 2) & 0x03) << 4) − 32
+                let q2 = _mm_sub_epi8(
+                    _mm_or_si128(
+                        _mm_and_si128(ql_b, lo4),
+                        _mm_mullo_epi16(
+                            _mm_and_si128(_mm_srli_epi16(qhv, 2), mask03),
+                            mul16,
+                        ),
+                    ),
+                    sub32,
+                );
+
+                // q3 = (ql_a >> 4) | (((qh >> 4) & 0x03) << 4) − 32
+                let q3 = _mm_sub_epi8(
+                    _mm_or_si128(
+                        _mm_and_si128(_mm_srli_epi16(ql_a, 4), lo4),
+                        _mm_mullo_epi16(
+                            _mm_and_si128(_mm_srli_epi16(qhv, 4), mask03),
+                            mul16,
+                        ),
+                    ),
+                    sub32,
+                );
+
+                // q4 = (ql_b >> 4) | (((qh >> 6) & 0x03) << 4) − 32
+                let q4 = _mm_sub_epi8(
+                    _mm_or_si128(
+                        _mm_and_si128(_mm_srli_epi16(ql_b, 4), lo4),
+                        _mm_mullo_epi16(
+                            _mm_and_si128(_mm_srli_epi16(qhv, 6), mask03),
+                            mul16,
+                        ),
+                    ),
+                    sub32,
+                );
+
+                // Dot each 16-element region against its input slice
+                total += sc0 * dot16_i8_f32(q1, vec.as_ptr().add(x_group +       l));
+                total += sc2 * dot16_i8_f32(q2, vec.as_ptr().add(x_group + 32  + l));
+                total += sc4 * dot16_i8_f32(q3, vec.as_ptr().add(x_group + 64  + l));
+                total += sc6 * dot16_i8_f32(q4, vec.as_ptr().add(x_group + 96  + l));
+            }
+        }
+    }
+
+    total
+}
+
+/// Q6_K matrix-vector multiply using AVX2 + FMA + rayon.
+///
+/// Rows distributed across threads; each row uses `dot_row_q6_k` which
+/// processes 16-element chunks with AVX2 6-bit assembly and FMA dot products.
+///
+/// # Safety
+/// Caller must verify AVX2 and FMA are available via `is_x86_feature_detected!`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+pub(crate) unsafe fn matvec_q6_k_avx2(
+    data: &[u8],
+    rows: usize,
+    cols: usize,
+    vec: &[f32],
+) -> Vec<f32> {
+    const SUPER_BLOCK: usize = 256;
+    const BLOCK_BYTES: usize = 210;
+
+    let n_super = cols / SUPER_BLOCK;
+    let bytes_per_row = n_super * BLOCK_BYTES;
+
+    (0..rows)
+        .into_par_iter()
+        .map(|r| unsafe { dot_row_q6_k(data, r * bytes_per_row, n_super, vec) })
+        .collect()
+}
+
 /// Q4_0 matrix-vector multiply using AVX2 + FMA + rayon.
 ///
 /// # Safety
