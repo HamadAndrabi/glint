@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 
+use crate::error::FerriteError;
 use crate::model::gguf::GgufModel;
 
 /// A byte-pair encoding tokenizer loaded from GGUF metadata.
@@ -20,13 +21,13 @@ pub struct Tokenizer {
 
 impl Tokenizer {
     /// Load tokenizer from GGUF model metadata.
-    pub fn from_gguf(model: &GgufModel) -> Self {
+    pub fn from_gguf(model: &GgufModel) -> Result<Self, FerriteError> {
         // Extract vocabulary
         let tokens_meta = model
             .metadata
             .get("tokenizer.ggml.tokens")
             .and_then(|v| v.as_array())
-            .expect("Missing tokenizer.ggml.tokens in model metadata");
+            .ok_or(FerriteError::MissingVocabulary)?;
 
         let vocab: Vec<String> = tokens_meta
             .iter()
@@ -70,13 +71,13 @@ impl Tokenizer {
             .and_then(|v| v.as_u32())
             .unwrap_or(2);
 
-        Self {
+        Ok(Self {
             vocab,
             token_to_id,
             merges,
             bos_token_id,
             eos_token_id,
-        }
+        })
     }
 
     /// Encode a string into token IDs using BPE.

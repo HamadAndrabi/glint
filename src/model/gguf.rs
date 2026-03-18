@@ -395,7 +395,7 @@ impl TensorInfo {
         let n_elements = self.n_elements() as usize;
         let block_size = self.ggml_type.block_size();
         let type_size = self.ggml_type.type_size();
-        let n_blocks = (n_elements + block_size - 1) / block_size;
+        let n_blocks = n_elements.div_ceil(block_size);
         n_blocks * type_size
     }
 }
@@ -599,7 +599,7 @@ impl GgufModel {
         }
 
         let version = cursor.read_u32()?;
-        if version < 2 || version > 3 {
+        if !(2..=3).contains(&version) {
             return Err(GgufError::UnsupportedVersion(version));
         }
 

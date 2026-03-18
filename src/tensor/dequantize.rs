@@ -6,6 +6,7 @@
 
 use half::f16;
 
+use crate::error::FerriteError;
 use crate::model::gguf::{GgmlType, GgufModel};
 use super::tensor::Tensor;
 
@@ -20,7 +21,7 @@ pub fn dequantize(data: &[u8], ggml_type: GgmlType, n_elements: usize) -> Vec<f3
         GgmlType::Q4K  => dequantize_q4_k(data, n_elements),
         GgmlType::Q5K  => dequantize_q5_k(data, n_elements),
         GgmlType::Q6K  => dequantize_q6_k(data, n_elements),
-        _ => unimplemented!("Dequantization not yet implemented for {}", ggml_type),
+        _ => panic!("{}", FerriteError::UnsupportedQuantization(ggml_type.to_string())),
     }
 }
 
@@ -68,7 +69,7 @@ fn dequantize_q8_0(data: &[u8], n_elements: usize) -> Vec<f32> {
     const BLOCK_SIZE: usize = 32;
     const BLOCK_BYTES: usize = 34; // 2 (scale) + 32 (int8s)
 
-    let n_blocks = (n_elements + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    let n_blocks = n_elements.div_ceil(BLOCK_SIZE);
     assert!(data.len() >= n_blocks * BLOCK_BYTES);
 
     let mut out = Vec::with_capacity(n_elements);
@@ -83,8 +84,8 @@ fn dequantize_q8_0(data: &[u8], n_elements: usize) -> Vec<f32> {
         let quants = &block_data[2..2 + BLOCK_SIZE];
         let remaining = (n_elements - block * BLOCK_SIZE).min(BLOCK_SIZE);
 
-        for i in 0..remaining {
-            out.push(quants[i] as i8 as f32 * scale);
+        for q in quants.iter().take(remaining) {
+            out.push(*q as i8 as f32 * scale);
         }
     }
     out
@@ -121,7 +122,7 @@ fn dequantize_q4_0(data: &[u8], n_elements: usize) -> Vec<f32> {
     const BLOCK_SIZE: usize = 32;
     const BLOCK_BYTES: usize = 18; // 2 (scale) + 16 (packed nibbles)
 
-    let n_blocks = (n_elements + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    let n_blocks = n_elements.div_ceil(BLOCK_SIZE);
     assert!(data.len() >= n_blocks * BLOCK_BYTES);
 
     let mut out = Vec::with_capacity(n_elements);
@@ -159,7 +160,7 @@ fn dequantize_q4_k(data: &[u8], n_elements: usize) -> Vec<f32> {
     const SUPER_BLOCK: usize = 256;
     const BLOCK_BYTES: usize = 144;
 
-    let n_blocks = (n_elements + SUPER_BLOCK - 1) / SUPER_BLOCK;
+    let n_blocks = n_elements.div_ceil(SUPER_BLOCK);
     assert!(data.len() >= n_blocks * BLOCK_BYTES);
 
     let mut out = Vec::with_capacity(n_elements);
@@ -210,7 +211,7 @@ fn dequantize_q5_k(data: &[u8], n_elements: usize) -> Vec<f32> {
     const SUPER_BLOCK: usize = 256;
     const BLOCK_BYTES: usize = 176;
 
-    let n_blocks = (n_elements + SUPER_BLOCK - 1) / SUPER_BLOCK;
+    let n_blocks = n_elements.div_ceil(SUPER_BLOCK);
     assert!(data.len() >= n_blocks * BLOCK_BYTES);
 
     let mut out = Vec::with_capacity(n_elements);
@@ -268,7 +269,7 @@ fn dequantize_q6_k(data: &[u8], n_elements: usize) -> Vec<f32> {
     const SUPER_BLOCK: usize = 256;
     const BLOCK_BYTES: usize = 210;
 
-    let n_blocks = (n_elements + SUPER_BLOCK - 1) / SUPER_BLOCK;
+    let n_blocks = n_elements.div_ceil(SUPER_BLOCK);
     assert!(data.len() >= n_blocks * BLOCK_BYTES);
 
     // Pre-allocate with zeros so we can scatter-write within each super-block
@@ -295,7 +296,7 @@ fn dequantize_q6_k(data: &[u8], n_elements: usize) -> Vec<f32> {
                 let qhl = qh[qh_off + l];
 
                 // Assemble four 6-bit values from this l-offset
-                let v1 = (ql[ql_off + l     ] & 0x0F) | (((qhl >> 0) & 0x03) << 4);
+                let v1 = (ql[ql_off + l     ] & 0x0F) | ((qhl & 0x03) << 4);
                 let v2 = (ql[ql_off + l + 32] & 0x0F) | (((qhl >> 2) & 0x03) << 4);
                 let v3 = (ql[ql_off + l     ] >>   4) | (((qhl >> 4) & 0x03) << 4);
                 let v4 = (ql[ql_off + l + 32] >>   4) | (((qhl >> 6) & 0x03) << 4);
@@ -328,10 +329,10 @@ fn dequantize_q6_k(data: &[u8], n_elements: usize) -> Vec<f32> {
 ///
 /// GGUF dimensions are column-major (first dim = fastest-varying),
 /// so we reverse them to match our row-major Tensor layout.
-pub fn load_tensor_f32(model: &GgufModel, name: &str) -> Tensor {
+pub fn load_tensor_f32(model: &GgufModel, name: &str) -> Result<Tensor, FerriteError> {
     let info = model
         .get_tensor_info(name)
-        .unwrap_or_else(|| panic!("Tensor '{}' not found in model", name));
+        .ok_or_else(|| FerriteError::TensorNotFound(name.to_string()))?;
 
     let n_elements = info.n_elements() as usize;
     // Reverse dimensions: GGUF is column-major, we are row-major
@@ -339,10 +340,13 @@ pub fn load_tensor_f32(model: &GgufModel, name: &str) -> Tensor {
 
     let raw_data = model
         .tensor_data(name)
-        .unwrap_or_else(|e| panic!("Failed to read tensor '{}': {}", name, e));
+        .map_err(|e| FerriteError::TensorReadError {
+            name: name.to_string(),
+            detail: e.to_string(),
+        })?;
 
     let f32_data = dequantize(raw_data, info.ggml_type, n_elements);
-    Tensor::from_vec(f32_data, &shape)
+    Ok(Tensor::from_vec(f32_data, &shape))
 }
 
 #[cfg(test)]

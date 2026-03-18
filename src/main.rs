@@ -275,6 +275,7 @@ fn inspect_model(path: &PathBuf, show_metadata: bool, show_tensors: bool) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_model(
     path: &PathBuf,
     prompt: &str,
@@ -293,11 +294,16 @@ fn run_model(
         }
     };
 
-    let config = ModelConfig::from_metadata(&model.metadata)
-        .expect("Failed to extract model configuration");
+    let config = match ModelConfig::from_metadata(&model.metadata) {
+        Some(c) => c,
+        None => { eprintln!("Error: could not extract model configuration from GGUF metadata"); std::process::exit(1); }
+    };
 
     eprintln!("Loading tokenizer...");
-    let tokenizer = Tokenizer::from_gguf(&model);
+    let tokenizer = match Tokenizer::from_gguf(&model) {
+        Ok(t) => t,
+        Err(e) => { eprintln!("Error: {e}"); std::process::exit(1); }
+    };
     eprintln!("Tokenizer: {} tokens", tokenizer.vocab_size());
 
     let mut prompt_tokens = tokenizer.encode(prompt);
@@ -308,7 +314,10 @@ fn run_model(
     eprintln!("Tokens: {:?} ({} tokens)", prompt_tokens, prompt_tokens.len());
 
     eprintln!("Loading weights...");
-    let weights = TransformerWeights::load(&model, &config);
+    let weights = match TransformerWeights::load(&model, &config) {
+        Ok(w) => w,
+        Err(e) => { eprintln!("Error: {e}"); std::process::exit(1); }
+    };
 
     let use_sampling = temperature > 0.0;
     if use_sampling {
@@ -360,8 +369,10 @@ fn generate_tokens(path: &PathBuf, tokens_str: &str, max_tokens: usize) {
         }
     };
 
-    let config = ModelConfig::from_metadata(&model.metadata)
-        .expect("Failed to extract model configuration");
+    let config = match ModelConfig::from_metadata(&model.metadata) {
+        Some(c) => c,
+        None => { eprintln!("Error: could not extract model configuration from GGUF metadata"); std::process::exit(1); }
+    };
     println!("Model: {} ({})", config.architecture, path.display());
     println!("{config}");
 
@@ -373,7 +384,10 @@ fn generate_tokens(path: &PathBuf, tokens_str: &str, max_tokens: usize) {
     println!();
 
     eprintln!("Loading weights...");
-    let weights = TransformerWeights::load(&model, &config);
+    let weights = match TransformerWeights::load(&model, &config) {
+        Ok(w) => w,
+        Err(e) => { eprintln!("Error: {e}"); std::process::exit(1); }
+    };
 
     eprintln!("Generating...");
     let output = generate_greedy_cached(&weights, &config, &prompt_tokens, max_tokens);
@@ -383,6 +397,7 @@ fn generate_tokens(path: &PathBuf, tokens_str: &str, max_tokens: usize) {
     println!("\nGenerated {} new tokens", output.len() - prompt_tokens.len());
 }
 
+#[allow(clippy::too_many_arguments)]
 fn chat_model(
     path: &PathBuf,
     system_prompt: Option<&str>,
@@ -401,15 +416,23 @@ fn chat_model(
         }
     };
 
-    let config = ModelConfig::from_metadata(&model.metadata)
-        .expect("Failed to extract model configuration");
+    let config = match ModelConfig::from_metadata(&model.metadata) {
+        Some(c) => c,
+        None => { eprintln!("Error: could not extract model configuration from GGUF metadata"); std::process::exit(1); }
+    };
 
     eprintln!("Loading tokenizer...");
-    let tokenizer = Tokenizer::from_gguf(&model);
+    let tokenizer = match Tokenizer::from_gguf(&model) {
+        Ok(t) => t,
+        Err(e) => { eprintln!("Error: {e}"); std::process::exit(1); }
+    };
     eprintln!("Tokenizer: {} tokens", tokenizer.vocab_size());
 
     eprintln!("Loading weights...");
-    let weights = TransformerWeights::load(&model, &config);
+    let weights = match TransformerWeights::load(&model, &config) {
+        Ok(w) => w,
+        Err(e) => { eprintln!("Error: {e}"); std::process::exit(1); }
+    };
 
     let chat_template = config.chat_template.as_deref()
         .map(ChatTemplate::detect)
@@ -499,15 +522,23 @@ async fn serve_model(path: &PathBuf, host: &str, port: u16) {
         }
     };
 
-    let config = ModelConfig::from_metadata(&model.metadata)
-        .expect("Failed to extract model configuration");
+    let config = match ModelConfig::from_metadata(&model.metadata) {
+        Some(c) => c,
+        None => { eprintln!("Error: could not extract model configuration from GGUF metadata"); std::process::exit(1); }
+    };
 
     eprintln!("Loading tokenizer...");
-    let tokenizer = Tokenizer::from_gguf(&model);
+    let tokenizer = match Tokenizer::from_gguf(&model) {
+        Ok(t) => t,
+        Err(e) => { eprintln!("Error: {e}"); std::process::exit(1); }
+    };
     eprintln!("Tokenizer: {} tokens", tokenizer.vocab_size());
 
     eprintln!("Loading weights...");
-    let weights = TransformerWeights::load(&model, &config);
+    let weights = match TransformerWeights::load(&model, &config) {
+        Ok(w) => w,
+        Err(e) => { eprintln!("Error: {e}"); std::process::exit(1); }
+    };
     eprintln!("Weights loaded.");
 
     // Derive a model name from the file stem (e.g. "smollm-135m-instruct.Q8_0")

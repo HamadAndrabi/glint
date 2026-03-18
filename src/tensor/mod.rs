@@ -1,5 +1,6 @@
 //! Tensor operations module — data structures, math ops, and dequantization.
 
+#[allow(clippy::module_inception)]
 mod tensor;
 mod ops;
 mod dequantize;

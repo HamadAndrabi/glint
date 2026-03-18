@@ -196,13 +196,17 @@ impl Sampler {
 // ── Pipeline stages ──────────────────────────────────────────────────────────
 
 /// Argmax: return the index of the largest element.
+///
+/// Uses `total_cmp` for a NaN-safe total order — NaN values sort last,
+/// so they are never selected as the maximum when finite values exist.
+/// Returns 0 for an empty slice.
 pub(crate) fn argmax(logits: &[f32]) -> u32 {
     logits
         .iter()
         .enumerate()
-        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+        .max_by(|(_, a), (_, b)| a.total_cmp(b))
         .map(|(idx, _)| idx as u32)
-        .unwrap()
+        .unwrap_or(0)
 }
 
 /// Repetition penalty: penalize tokens that have already appeared.

@@ -12,6 +12,7 @@
 use half::f16;
 use rayon::prelude::*;
 
+use crate::error::FerriteError;
 use crate::model::gguf::{GgmlType, GgufModel};
 use super::tensor::Tensor;
 use super::dequantize::{dequantize, get_scale_min_q4k};
@@ -37,29 +38,32 @@ impl QuantizedTensor {
     ///
     /// GGUF stores dimensions in column-major order (first dim varies fastest).
     /// We reverse them to match our row-major convention.
-    pub fn load(model: &GgufModel, name: &str) -> Self {
+    pub fn load(model: &GgufModel, name: &str) -> Result<Self, FerriteError> {
         let info = model
             .get_tensor_info(name)
-            .unwrap_or_else(|| panic!("Tensor '{}' not found in model", name));
+            .ok_or_else(|| FerriteError::TensorNotFound(name.to_string()))?;
 
         // Reverse dimensions: GGUF column-major → our row-major
         let dims: Vec<usize> = info.dimensions.iter().rev().map(|&d| d as usize).collect();
         let (rows, cols) = match dims.len() {
             1 => (dims[0], 1),
             2 => (dims[0], dims[1]),
-            n => panic!("QuantizedTensor::load: unexpected {n}-D tensor '{name}'"),
+            n => return Err(FerriteError::InvalidTensorShape { name: name.to_string(), ndim: n }),
         };
 
         let raw = model
             .tensor_data(name)
-            .unwrap_or_else(|e| panic!("Failed to read tensor '{}': {}", name, e));
+            .map_err(|e| FerriteError::TensorReadError {
+                name: name.to_string(),
+                detail: e.to_string(),
+            })?;
 
-        Self {
+        Ok(Self {
             data: raw.to_vec(), // copy out of the mmap
             rows,
             cols,
             ggml_type: info.ggml_type,
-        }
+        })
     }
 
     /// Build from raw quantized bytes. Used for benchmarks and testing.
@@ -110,7 +114,7 @@ impl QuantizedTensor {
         let n_elements = self.cols;
         let block_size = self.ggml_type.block_size();
         let type_size = self.ggml_type.type_size();
-        let n_blocks = (n_elements + block_size - 1) / block_size;
+        let n_blocks = n_elements.div_ceil(block_size);
         let bytes_per_row = n_blocks * type_size;
 
         let row_bytes = &self.data[row * bytes_per_row..(row + 1) * bytes_per_row];
@@ -382,7 +386,7 @@ fn matvec_q6_k_scalar(data: &[u8], rows: usize, cols: usize, vec: &[f32]) -> Vec
                     for l in 0..32 {
                         let is = l / 16;
                         let qhl = qh[qh_off + l];
-                        let v1 = (ql[ql_off + l     ] & 0x0F) | (((qhl >> 0) & 0x03) << 4);
+                        let v1 = (ql[ql_off + l     ] & 0x0F) | ((qhl & 0x03) << 4);
                         let v2 = (ql[ql_off + l + 32] & 0x0F) | (((qhl >> 2) & 0x03) << 4);
                         let v3 = (ql[ql_off + l     ] >>   4) | (((qhl >> 4) & 0x03) << 4);
                         let v4 = (ql[ql_off + l + 32] >>   4) | (((qhl >> 6) & 0x03) << 4);
@@ -419,7 +423,7 @@ fn matvec_fallback(
 ) -> Vec<f32> {
     let block_size = ggml_type.block_size();
     let type_size = ggml_type.type_size();
-    let n_blocks = (cols + block_size - 1) / block_size;
+    let n_blocks = cols.div_ceil(block_size);
     let bytes_per_row = n_blocks * type_size;
 
     (0..rows)

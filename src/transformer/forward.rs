@@ -82,8 +82,8 @@ fn attention(
     let mut k_cache: Vec<Tensor> = Vec::with_capacity(pos + 1);
     let mut v_cache: Vec<Tensor> = Vec::with_capacity(pos + 1);
 
-    for p in 0..pos {
-        let normed_p = tensor::rms_norm(&all_hidden[p], &layer.attn_norm, config.rms_norm_eps);
+    for (p, hidden) in all_hidden.iter().enumerate().take(pos) {
+        let normed_p = tensor::rms_norm(hidden, &layer.attn_norm, config.rms_norm_eps);
         let k_p = layer.attn_k.matvec(normed_p.data());
         let v_p = layer.attn_v.matvec(normed_p.data());
         k_cache.push(tensor::rope(&k_p, p, head_dim, freq_base));
@@ -161,14 +161,14 @@ pub fn generate_greedy(
         eprintln!("--- Step {}/{} (seq_len={}) ---", step + 1, max_new_tokens, tokens.len());
         let logits = forward(weights, config, &tokens);
 
-        // Argmax
+        // Argmax — total_cmp handles NaN safely (NaN sorts last)
         let next_token = logits
             .data()
             .iter()
             .enumerate()
-            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+            .max_by(|(_, a), (_, b)| a.total_cmp(b))
             .map(|(idx, _)| idx as u32)
-            .unwrap();
+            .unwrap_or(0);
 
         eprintln!("  → token {next_token}");
         tokens.push(next_token);
@@ -262,14 +262,14 @@ fn attention_cached(
 
         // Score against all cached K vectors (including current)
         let mut scores = vec![0.0f32; seq_len];
-        for s in 0..seq_len {
+        for (s, score) in scores.iter_mut().enumerate() {
             let k_row = cache.k_at(layer_idx, s);
             let k_head = &k_row[kv_h * head_dim..(kv_h + 1) * head_dim];
             let mut dot = 0.0f32;
             for d in 0..head_dim {
                 dot += q_head[d] * k_head[d];
             }
-            scores[s] = dot * scale;
+            *score = dot * scale;
         }
 
         // Softmax over scores
@@ -321,14 +321,14 @@ pub fn generate_greedy_cached(
 
     // Phase 2: Decode — generate new tokens
     for step in 0..max_new_tokens {
-        // Argmax over logits
+        // Argmax over logits — total_cmp handles NaN safely (NaN sorts last)
         let next_token = last_logits
             .data()
             .iter()
             .enumerate()
-            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+            .max_by(|(_, a), (_, b)| a.total_cmp(b))
             .map(|(idx, _)| idx as u32)
-            .unwrap();
+            .unwrap_or(0);
 
         eprintln!("  Decode step {}/{}: token {next_token}", step + 1, max_new_tokens);
         tokens.push(next_token);

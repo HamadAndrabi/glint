@@ -47,6 +47,11 @@ impl KvCache {
         self.len
     }
 
+    /// Returns true if no positions have been cached yet.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
     /// Write K and V vectors for one position in one layer.
     ///
     /// Called once per layer per position. After all layers have written

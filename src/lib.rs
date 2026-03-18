@@ -1,5 +1,6 @@
 //! Ferrite — LLM Inference Engine
 
+pub mod error;
 pub mod model;
 
 pub mod backend;
