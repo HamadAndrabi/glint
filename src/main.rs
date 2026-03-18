@@ -1,4 +1,4 @@
-//! Ferrite CLI — inspect, run, and serve GGUF models.
+//! Glint CLI — inspect, run, and serve GGUF models.
 
 use clap::{Parser, Subcommand};
 use std::io::{self, BufRead, Write as IoWrite};
@@ -6,16 +6,16 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-use ferrite::model::chat_template::{ChatTemplate, Message};
-use ferrite::model::config::ModelConfig;
-use ferrite::model::gguf::GgufModel;
-use ferrite::model::tokenizer::Tokenizer;
-use ferrite::sampling::{Sampler, SamplerConfig};
-use ferrite::server::AppState;
-use ferrite::transformer::{TransformerWeights, generate_cached, generate_greedy_cached, generate_streaming};
+use glint::model::chat_template::{ChatTemplate, Message};
+use glint::model::config::ModelConfig;
+use glint::model::gguf::GgufModel;
+use glint::model::tokenizer::Tokenizer;
+use glint::sampling::{Sampler, SamplerConfig};
+use glint::server::AppState;
+use glint::transformer::{TransformerWeights, generate_cached, generate_greedy_cached, generate_streaming};
 
 #[derive(Parser)]
-#[command(name = "ferrite")]
+#[command(name = "glint")]
 #[command(version, about = "LLM inference engine built in Rust")]
 struct Cli {
     #[command(subcommand)]
@@ -445,7 +445,7 @@ fn chat_model(
         history.push(("system".to_string(), sys.to_string()));
     }
 
-    eprintln!("\nFerrite Chat — type your message and press Enter. Ctrl+D to exit.\n");
+    eprintln!("\nGlint Chat — type your message and press Enter. Ctrl+D to exit.\n");
 
     let stdin = io::stdin();
     let mut input = String::new();
@@ -468,14 +468,35 @@ fn chat_model(
 
         history.push(("user".to_string(), user_text.to_string()));
 
-        // Build prompt from full conversation history
-        let msgs: Vec<Message<'_>> = history.iter()
-            .map(|(role, content)| Message { role, content })
-            .collect();
-        let prompt = chat_template.apply(&msgs);
+        // Build prompt, trimming oldest non-system messages if over context budget
+        let context_budget = config.context_length as usize;
+        let prompt_tokens = loop {
+            let msgs: Vec<Message<'_>> = history.iter()
+                .map(|(role, content)| Message { role, content })
+                .collect();
+            let prompt = chat_template.apply(&msgs);
+            let mut tokens = tokenizer.encode(&prompt);
+            tokens.insert(0, tokenizer.bos_token_id);
 
-        let mut prompt_tokens = tokenizer.encode(&prompt);
-        prompt_tokens.insert(0, tokenizer.bos_token_id);
+            if tokens.len() + max_tokens <= context_budget {
+                break tokens;
+            }
+
+            // Drop the oldest non-system message to free space
+            let drop_idx = history.iter().position(|(r, _)| r != "system");
+            match drop_idx {
+                Some(idx) => {
+                    eprintln!("[Context limit reached — dropping oldest message to make room]");
+                    history.remove(idx);
+                }
+                None => {
+                    // Only system message remains and still too long — truncate
+                    eprintln!("[Warning: prompt still exceeds context window after trimming, truncating]");
+                    tokens.truncate(context_budget.saturating_sub(max_tokens));
+                    break tokens;
+                }
+            }
+        };
 
         let sampler_cfg = SamplerConfig {
             temperature,
@@ -545,7 +566,7 @@ async fn serve_model(path: &PathBuf, host: &str, port: u16) {
     let model_name = path
         .file_stem()
         .and_then(|s| s.to_str())
-        .unwrap_or("ferrite-model")
+        .unwrap_or("glint-model")
         .to_string();
 
     // Detect chat template from GGUF metadata
@@ -562,7 +583,7 @@ async fn serve_model(path: &PathBuf, host: &str, port: u16) {
         chat_template,
     };
 
-    ferrite::server::run_server(state, host, port).await;
+    glint::server::run_server(state, host, port).await;
 }
 
 fn format_number(n: u64) -> String {

@@ -101,7 +101,7 @@ pub async fn list_models(State(state): State<Arc<AppState>>) -> impl IntoRespons
             id: state.model_name.clone(),
             object: "model",
             created: 0,
-            owned_by: "ferrite",
+            owned_by: "glint",
         }],
     })
 }
@@ -129,6 +129,16 @@ pub async fn completions(
     let prompt_len = prompt_tokens.len();
     let model_name = req.model.clone();
     let eos = state.tokenizer.eos_token_id;
+
+    // Validate against context window
+    let context_limit = state.config.context_length as usize;
+    if prompt_len >= context_limit {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            format!("prompt ({prompt_len} tokens) exceeds model context window ({context_limit} tokens)"),
+        );
+    }
+    let max_tokens = max_tokens.min(context_limit - prompt_len);
 
     if stream {
         streaming_completion(state, prompt_tokens, max_tokens, sampler_cfg, eos, model_name).await
@@ -279,6 +289,16 @@ pub async fn chat_completions(
     let prompt_len = prompt_tokens.len();
     let model_name = req.model.clone();
     let eos = state.tokenizer.eos_token_id;
+
+    // Validate against context window
+    let context_limit = state.config.context_length as usize;
+    if prompt_len >= context_limit {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            format!("prompt ({prompt_len} tokens) exceeds model context window ({context_limit} tokens)"),
+        );
+    }
+    let max_tokens = max_tokens.min(context_limit - prompt_len);
 
     if stream {
         // For streaming chat, reuse the completions streaming path
