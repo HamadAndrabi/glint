@@ -1,80 +1,175 @@
 # Ferrite
 
-Ferrite is a high-performance, production-grade LLM inference engine built from scratch in Rust. It is designed to be a lightweight, dependency-minimal alternative for running large language models with a focus on memory efficiency and architectural clarity.
+A high-performance LLM inference engine built from scratch in Rust. Ferrite loads GGUF models, runs the full transformer forward pass, and serves an OpenAI-compatible HTTP API — all without PyTorch, ONNX, or any ML framework dependency.
 
-## Overview
+## Features
 
-Ferrite implements the full transformer inference stack, from raw GGUF parsing to token generation. By leveraging Rust's memory safety and zero-cost abstractions, Ferrite provides a robust foundation for local LLM deployment without the overhead of heavy machine learning frameworks.
+**Inference**
+- Full LLaMA-family transformer: RMSNorm, RoPE, SwiGLU, grouped-query attention
+- KV-cache for O(n) per-token generation (no re-computing past tokens)
+- Greedy and configurable sampling (temperature, top-k, top-p, repetition penalty, seeds)
 
-## Key Features
+**Quantization**
+- 5 formats: Q8_0, Q4_0, Q4_K, Q5_K, Q6_K — covers the vast majority of published GGUF models
+- AVX2+FMA SIMD kernels for all formats (runtime detection, scalar fallback on non-x86)
+- Rayon row-parallel matvec across all CPU cores
+- Weights stay compressed in memory — ~140 MB for a 135M-parameter Q8_0 model vs ~540 MB dequantized
 
-- **Zero-Copy Loading**: Utilizes memory-mapped file I/O (`mmap`) to map GGUF models directly into virtual memory, enabling near-instant startup and efficient memory usage.
-- **Block Quantization**: Native support for quantized formats including Q8_0 and Q4_0, allowing large models to run on consumer hardware with minimal precision loss.
-- **Optimized Tensor Core**: A custom tensor implementation featuring row-major contiguous storage and optimized primitives for matrix-vector operations.
-- **LLaMA Architecture**: Full support for modern transformer architectures, including RMSNorm, RoPE (Rotary Positional Embeddings), and SwiGLU activation.
-- **Integrated Tokenizer**: Built-in GGUF-based tokenizer support for seamless end-to-end text generation.
-- **Type-Safe Inference**: Leverages Rust's type system to ensure architectural integrity and prevent common runtime errors in the inference pipeline.
+**Server**
+- OpenAI-compatible HTTP API: `/v1/completions`, `/v1/chat/completions`, `/v1/models`
+- Token-by-token SSE streaming
+- Chat template auto-detection from GGUF metadata (ChatML, Llama 3, Mistral, Zephyr, Gemma)
+- CORS enabled for browser clients, `/health` endpoint for orchestrators
 
-## Technical Architecture
-
-### GGUF Parser
-A robust parser for the GGUF (GPT-Generated Unified Format) binary format. It handles hierarchical metadata, tensor descriptors, and aligned data sections with strict validation.
-
-### Tensor Operations
-The engine includes a specialized suite of linear algebra primitives:
-- **MatVec**: Optimized matrix-vector multiplication for single-batch inference.
-- **RMSNorm**: Root Mean Square Layer Normalization for improved stability.
-- **RoPE**: Frequency-based rotary positional embeddings for long-context support.
-- **Softmax**: Numerically stable softmax implementation for probability distribution.
-
-### KV Caching
-Implements an efficient Key-Value (KV) cache to store past activations, significantly accelerating autoregressive generation by avoiding redundant computations.
+**Model loading**
+- Zero-copy GGUF parser with memory-mapped I/O
+- Built-in BPE tokenizer loaded from GGUF vocabulary
+- Supports any LLaMA-architecture model in GGUF format
 
 ## Getting Started
 
-### Installation
-
-Ensure you have the Rust toolchain installed. Clone the repository and build in release mode for maximum performance:
-
 ```bash
-git clone https://github.com/your-username/ferrite
+git clone https://github.com/HamadAndrabi/ferrite
 cd ferrite
 cargo build --release
 ```
 
-The binary will be available at `./target/release/ferrite`.
-
-### Usage
-
-#### Inspect a Model
-View metadata, architecture details, and tensor information of a GGUF file:
+### Generate text
 
 ```bash
-./target/release/ferrite inspect --file path/to/model.gguf
+ferrite run -f model.Q4_K_M.gguf -p "The future of AI is" -m 100
 ```
 
-#### Run Inference
-Generate text from a prompt using a GGUF model:
+With sampling:
 
 ```bash
-./target/release/ferrite run --file path/to/model.gguf --prompt "The future of AI is" --max-tokens 100
+ferrite run -f model.gguf -p "Once upon a time" -m 200 \
+  --temperature 0.8 --top-k 40 --top-p 0.95 --repeat-penalty 1.1
 ```
 
-## Performance
+### Start the server
 
-Ferrite is engineered for efficiency:
-- **Memory Efficiency**: Only required model weights are paged into RAM by the OS.
-- **CPU Optimization**: Core loops are designed for cache-friendliness and future SIMD acceleration.
-- **Minimal Dependencies**: Keeps the binary small and the security surface narrow.
+```bash
+ferrite serve -f model.Q4_K_M.gguf -p 8080
+```
 
-## Roadmap
+Then use any OpenAI-compatible client:
 
-- [ ] SIMD Acceleration (AVX2/NEON) for tensor primitives.
-- [ ] Multithreaded matrix operations.
-- [ ] Support for additional quantization formats (Q4_K, Q5_K).
-- [ ] GPU Backend support (WGPU/CUDA).
-- [ ] Python bindings for easier integration.
+```bash
+# Chat completion
+curl http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "model",
+    "messages": [{"role": "user", "content": "Hello!"}],
+    "max_tokens": 50,
+    "temperature": 0.7
+  }'
+
+# Streaming
+curl http://localhost:8080/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "model",
+    "prompt": "The meaning of life is",
+    "max_tokens": 100,
+    "stream": true
+  }'
+
+# Health check
+curl http://localhost:8080/health
+```
+
+### Inspect a model
+
+```bash
+ferrite inspect -f model.gguf --show-metadata --show-tensors
+```
+
+## Architecture
+
+```
+                    GGUF file (mmap)
+                         |
+              +----------+----------+
+              |          |          |
+          Metadata    Tokenizer   Tensor data
+              |          |          |
+         ModelConfig   BPE      QuantizedTensor
+              |        encode/     (raw bytes)
+              |        decode        |
+              |          |      +----+----+
+              |          |      | matvec  |
+              |          |      | Q8/Q4/K |
+              |          |      | AVX2    |
+              |          |      +---------+
+              |          |          |
+              +-----+----+----+----+
+                    |              |
+              TransformerWeights   |
+                    |              |
+               forward(token) ----+
+                    |
+              logits [vocab]
+                    |
+               Sampler
+            (temp/top-k/top-p)
+                    |
+               next token
+                    |
+          +----+----+----+
+          |              |
+     CLI output    HTTP SSE stream
+                   (OpenAI API)
+```
+
+## Benchmarks
+
+Matvec throughput at 4096x4096 (Llama-3-8B scale), AVX2+FMA, rayon:
+
+| Format | Throughput | Time |
+|--------|-----------|------|
+| Q4_0 | 24.4 Gelem/s | 687 us |
+| Q8_0 | 22.7 Gelem/s | 739 us |
+| Q4_K | 20.8 Gelem/s | 808 us |
+| Q6_K | 18.7 Gelem/s | 899 us |
+| Q5_K | 17.0 Gelem/s | 984 us |
+
+Run benchmarks:
+
+```bash
+cargo bench --bench matvec
+```
+
+## Project Structure
+
+```
+src/
+  model/
+    gguf.rs            GGUF binary format parser
+    config.rs          Model hyperparameters from metadata
+    tokenizer.rs       BPE tokenizer (encode/decode)
+    chat_template.rs   Chat template detection and rendering
+  tensor/
+    tensor.rs          Contiguous f32 tensor type
+    ops.rs             Primitives: matmul, RMSNorm, RoPE, softmax, SiLU
+    quantized.rs       QuantizedTensor with block-wise matvec kernels
+    simd.rs            AVX2+FMA SIMD kernels (Q8_0, Q4_0, Q4_K, Q5_K, Q6_K)
+    dequantize.rs      Scalar dequantization for all formats
+  transformer/
+    weights.rs         Weight loading from GGUF into QuantizedTensors
+    forward.rs         Full transformer forward pass + generation loops
+  cache/               KV-cache for autoregressive generation
+  sampling/            Temperature, top-k, top-p, repetition penalty
+  server/              Axum HTTP server, OpenAI-compatible routes, SSE streaming
+```
+
+## Tests
+
+```bash
+cargo test --lib     # 84 tests covering all modules
+```
 
 ## License
 
-This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
+MIT. See [LICENSE](LICENSE).

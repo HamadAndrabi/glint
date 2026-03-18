@@ -82,6 +82,15 @@ fn api_error(status: StatusCode, msg: impl Into<String>) -> Response {
     (status, body).into_response()
 }
 
+// ── GET /health ──────────────────────────────────────────────────────────────
+
+/// Health check — returns 200 OK with a minimal JSON body.
+///
+/// Used by load balancers, orchestrators (k8s), and monitoring systems.
+pub async fn health() -> impl IntoResponse {
+    Json(serde_json::json!({ "status": "ok" }))
+}
+
 // ── GET /v1/models ────────────────────────────────────────────────────────────
 
 /// List the loaded model.
