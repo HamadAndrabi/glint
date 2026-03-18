@@ -47,6 +47,18 @@ ferrite run -f model.gguf -p "Once upon a time" -m 200 \
   --temperature 0.8 --top-k 40 --top-p 0.95 --repeat-penalty 1.1
 ```
 
+### Interactive chat
+
+```bash
+ferrite chat -f model.gguf --system "You are a helpful assistant"
+```
+
+Multi-turn conversation with streaming output. Supports the same sampling parameters:
+
+```bash
+ferrite chat -f model.gguf --temperature 0.8 --top-k 40 --top-p 0.95 -m 512
+```
+
 ### Start the server
 
 ```bash

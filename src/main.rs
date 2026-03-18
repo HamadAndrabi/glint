@@ -1,17 +1,18 @@
 //! Ferrite CLI — inspect, run, and serve GGUF models.
 
 use clap::{Parser, Subcommand};
+use std::io::{self, BufRead, Write as IoWrite};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-use ferrite::model::chat_template::ChatTemplate;
+use ferrite::model::chat_template::{ChatTemplate, Message};
 use ferrite::model::config::ModelConfig;
 use ferrite::model::gguf::GgufModel;
 use ferrite::model::tokenizer::Tokenizer;
 use ferrite::sampling::{Sampler, SamplerConfig};
 use ferrite::server::AppState;
-use ferrite::transformer::{TransformerWeights, generate_cached, generate_greedy_cached};
+use ferrite::transformer::{TransformerWeights, generate_cached, generate_greedy_cached, generate_streaming};
 
 #[derive(Parser)]
 #[command(name = "ferrite")]
@@ -88,6 +89,41 @@ enum Commands {
         max_tokens: usize,
     },
 
+    /// Interactive multi-turn chat with a GGUF model.
+    Chat {
+        /// Path to the .gguf model file.
+        #[arg(short, long)]
+        file: PathBuf,
+
+        /// Optional system prompt prepended to every conversation.
+        #[arg(long)]
+        system: Option<String>,
+
+        /// Maximum number of new tokens to generate per response.
+        #[arg(short, long, default_value_t = 256)]
+        max_tokens: usize,
+
+        /// Sampling temperature. 0.0 = greedy, higher = more random.
+        #[arg(long, default_value_t = 0.7)]
+        temperature: f32,
+
+        /// Top-k sampling. 0 = disabled.
+        #[arg(long, default_value_t = 0)]
+        top_k: usize,
+
+        /// Top-p (nucleus) sampling. 1.0 = disabled.
+        #[arg(long, default_value_t = 0.9)]
+        top_p: f32,
+
+        /// Repetition penalty. 1.0 = disabled.
+        #[arg(long, default_value_t = 1.1)]
+        repeat_penalty: f32,
+
+        /// Random seed for reproducible sampling.
+        #[arg(long)]
+        seed: Option<u64>,
+    },
+
     /// Start the OpenAI-compatible HTTP inference server.
     Serve {
         /// Path to the .gguf model file.
@@ -134,6 +170,11 @@ async fn main() {
             max_tokens,
         } => {
             generate_tokens(&file, &tokens, max_tokens);
+        }
+        Commands::Chat {
+            file, system, max_tokens, temperature, top_k, top_p, repeat_penalty, seed,
+        } => {
+            chat_model(&file, system.as_deref(), max_tokens, temperature, top_k, top_p, repeat_penalty, seed);
         }
         Commands::Serve { file, port, host } => {
             serve_model(&file, &host, port).await;
@@ -340,6 +381,113 @@ fn generate_tokens(path: &PathBuf, tokens_str: &str, max_tokens: usize) {
     println!("\n═══ Output Tokens ═══");
     println!("{:?}", output);
     println!("\nGenerated {} new tokens", output.len() - prompt_tokens.len());
+}
+
+fn chat_model(
+    path: &PathBuf,
+    system_prompt: Option<&str>,
+    max_tokens: usize,
+    temperature: f32,
+    top_k: usize,
+    top_p: f32,
+    repeat_penalty: f32,
+    seed: Option<u64>,
+) {
+    let model = match GgufModel::load(path) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("Error loading GGUF file: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let config = ModelConfig::from_metadata(&model.metadata)
+        .expect("Failed to extract model configuration");
+
+    eprintln!("Loading tokenizer...");
+    let tokenizer = Tokenizer::from_gguf(&model);
+    eprintln!("Tokenizer: {} tokens", tokenizer.vocab_size());
+
+    eprintln!("Loading weights...");
+    let weights = TransformerWeights::load(&model, &config);
+
+    let chat_template = config.chat_template.as_deref()
+        .map(ChatTemplate::detect)
+        .unwrap_or(ChatTemplate::Generic);
+    eprintln!("Chat template:  {}", chat_template.name());
+
+    // Conversation history as owned (role, content) pairs
+    let mut history: Vec<(String, String)> = Vec::new();
+    if let Some(sys) = system_prompt {
+        history.push(("system".to_string(), sys.to_string()));
+    }
+
+    eprintln!("\nFerrite Chat — type your message and press Enter. Ctrl+D to exit.\n");
+
+    let stdin = io::stdin();
+    let mut input = String::new();
+
+    loop {
+        print!("> ");
+        io::stdout().flush().ok();
+
+        input.clear();
+        match stdin.lock().read_line(&mut input) {
+            Ok(0) => break, // EOF (Ctrl+D)
+            Ok(_) => {}
+            Err(_) => break,
+        }
+
+        let user_text = input.trim();
+        if user_text.is_empty() {
+            continue;
+        }
+
+        history.push(("user".to_string(), user_text.to_string()));
+
+        // Build prompt from full conversation history
+        let msgs: Vec<Message<'_>> = history.iter()
+            .map(|(role, content)| Message { role, content })
+            .collect();
+        let prompt = chat_template.apply(&msgs);
+
+        let mut prompt_tokens = tokenizer.encode(&prompt);
+        prompt_tokens.insert(0, tokenizer.bos_token_id);
+
+        let sampler_cfg = SamplerConfig {
+            temperature,
+            top_k,
+            top_p,
+            repeat_penalty,
+            seed,
+            ..Default::default()
+        };
+        let mut sampler = Sampler::new(sampler_cfg);
+
+        // Stream tokens to stdout
+        let output = generate_streaming(
+            &weights,
+            &config,
+            &prompt_tokens,
+            max_tokens,
+            &mut sampler,
+            tokenizer.eos_token_id,
+            |token_id| {
+                let text = tokenizer.decode(&[token_id]);
+                print!("{text}");
+                io::stdout().flush().ok();
+                true
+            },
+        );
+        println!();
+
+        // Add assistant response to history for multi-turn
+        let generated = &output[prompt_tokens.len()..];
+        let assistant_text = tokenizer.decode(generated);
+        history.push(("assistant".to_string(), assistant_text));
+    }
+
+    eprintln!("\nGoodbye!");
 }
 
 async fn serve_model(path: &PathBuf, host: &str, port: u16) {
