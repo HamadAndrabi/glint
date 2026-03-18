@@ -169,6 +169,32 @@ pub struct ModelInfo {
     pub owned_by: &'static str,
 }
 
+// ── Embeddings ────────────────────────────────────────────────────────────────
+
+/// `POST /v1/embeddings` request body.
+#[derive(Debug, Deserialize)]
+pub struct EmbeddingRequest {
+    pub model: String,
+    /// Text to embed. Accepts a single string (OpenAI-compatible).
+    pub input: String,
+}
+
+/// `POST /v1/embeddings` response.
+#[derive(Debug, Serialize)]
+pub struct EmbeddingResponse {
+    pub object: &'static str,
+    pub data: Vec<EmbeddingData>,
+    pub model: String,
+    pub usage: UsageInfo,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EmbeddingData {
+    pub object: &'static str,
+    pub embedding: Vec<f32>,
+    pub index: usize,
+}
+
 // ── Error response ────────────────────────────────────────────────────────────
 
 #[derive(Debug, Serialize)]

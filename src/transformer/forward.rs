@@ -148,6 +148,59 @@ fn feed_forward(x: &Tensor, layer: &LayerWeights) -> Tensor {
     layer.ffn_down.matvec(hidden.data())
 }
 
+/// Compute a text embedding by mean-pooling the final hidden states.
+///
+/// Runs all transformer layers on the input tokens, applies the final RMS-norm
+/// to each position's hidden state, then averages across all positions.
+/// Returns a vector of length `embed_dim` suitable for similarity search.
+///
+/// This is the same computation as `forward()` up to (and including) the final
+/// norm, but skips the LM-head projection and pools instead of picking the last
+/// token's logits.
+pub fn embed(
+    weights: &TransformerWeights,
+    config: &ModelConfig,
+    token_ids: &[u32],
+) -> Vec<f32> {
+    let n_tokens = token_ids.len();
+    let embed_dim = config.embedding_length as usize;
+
+    // 1. Token embeddings
+    let mut hidden_states: Vec<Tensor> = token_ids
+        .iter()
+        .map(|&id| weights.token_embedding.row_as_f32(id as usize))
+        .collect();
+
+    // 2. Transformer layers (identical to forward())
+    for layer in weights.layers.iter() {
+        let mut new_hidden_states = Vec::with_capacity(n_tokens);
+        for pos in 0..n_tokens {
+            let normed = tensor::rms_norm(&hidden_states[pos], &layer.attn_norm, config.rms_norm_eps);
+            let attn_out = attention(&normed, &hidden_states, layer, config, pos);
+            let after_attn = tensor::add(&hidden_states[pos], &attn_out);
+
+            let normed_ffn = tensor::rms_norm(&after_attn, &layer.ffn_norm, config.rms_norm_eps);
+            let ffn_out = feed_forward(&normed_ffn, layer);
+            new_hidden_states.push(tensor::add(&after_attn, &ffn_out));
+        }
+        hidden_states = new_hidden_states;
+    }
+
+    // 3. Apply final norm to each position, then mean-pool
+    let mut embedding = vec![0.0f32; embed_dim];
+    for hidden in &hidden_states {
+        let normed = tensor::rms_norm(hidden, &weights.output_norm, config.rms_norm_eps);
+        for (acc, &v) in embedding.iter_mut().zip(normed.data()) {
+            *acc += v;
+        }
+    }
+    let n = n_tokens as f32;
+    for acc in &mut embedding {
+        *acc /= n;
+    }
+    embedding
+}
+
 /// Greedy decoding: iteratively pick the highest-probability next token.
 pub fn generate_greedy(
     weights: &TransformerWeights,

@@ -5,6 +5,7 @@
 //!   GET  /v1/models                 — list the loaded model
 //!   POST /v1/completions            — text completion (streaming or not)
 //!   POST /v1/chat/completions       — chat completion (streaming or not)
+//!   POST /v1/embeddings             — text embedding (mean-pooled hidden states)
 //!
 //! CORS is enabled for all origins so browser-based clients work out of the box.
 //!
@@ -42,6 +43,7 @@ pub async fn run_server(state: AppState, host: &str, port: u16) {
         .route("/v1/models", get(routes::list_models))
         .route("/v1/completions", post(routes::completions))
         .route("/v1/chat/completions", post(routes::chat_completions))
+        .route("/v1/embeddings", post(routes::embeddings))
         .layer(cors)
         .with_state(shared);
 
@@ -51,6 +53,7 @@ pub async fn run_server(state: AppState, host: &str, port: u16) {
     eprintln!("  GET  http://{addr}/v1/models");
     eprintln!("  POST http://{addr}/v1/completions");
     eprintln!("  POST http://{addr}/v1/chat/completions");
+    eprintln!("  POST http://{addr}/v1/embeddings");
 
     let listener = tokio::net::TcpListener::bind(&addr)
         .await

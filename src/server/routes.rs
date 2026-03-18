@@ -26,7 +26,7 @@ use tokio_stream::StreamExt;
 
 use crate::model::chat_template::Message;
 use crate::sampling::{Sampler, SamplerConfig};
-use crate::transformer::{generate_cached, generate_streaming};
+use crate::transformer::{embed, generate_cached, generate_streaming};
 
 use super::state::AppState;
 use super::types::*;
@@ -325,3 +325,50 @@ pub async fn chat_completions(
     }
 }
 
+// ── POST /v1/embeddings ───────────────────────────────────────────────────────
+
+/// Text embedding — tokenize the input, run the forward pass, mean-pool hidden states.
+///
+/// Returns an OpenAI-compatible embedding object. The vector dimension equals
+/// the model's `embedding_length` (e.g. 576 for SmolLM-135M, 4096 for LLaMA-3-8B).
+pub async fn embeddings(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<EmbeddingRequest>,
+) -> Response {
+    if req.input.is_empty() {
+        return api_error(StatusCode::BAD_REQUEST, "input must not be empty");
+    }
+
+    // Tokenize (include BOS so the forward pass mirrors normal inference)
+    let mut tokens = state.tokenizer.encode(&req.input);
+    tokens.insert(0, state.tokenizer.bos_token_id);
+    let n_tokens = tokens.len();
+    let model_name = req.model.clone();
+
+    let weights = Arc::clone(&state.weights);
+    let config = Arc::clone(&state.config);
+
+    let result = tokio::task::spawn_blocking(move || {
+        embed(&weights, &config, &tokens)
+    })
+    .await;
+
+    match result {
+        Err(_) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "Embedding task panicked"),
+        Ok(vector) => Json(EmbeddingResponse {
+            object: "list",
+            data: vec![EmbeddingData {
+                object: "embedding",
+                embedding: vector,
+                index: 0,
+            }],
+            model: model_name,
+            usage: UsageInfo {
+                prompt_tokens: n_tokens,
+                completion_tokens: 0,
+                total_tokens: n_tokens,
+            },
+        })
+        .into_response(),
+    }
+}
