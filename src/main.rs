@@ -397,6 +397,49 @@ fn generate_tokens(path: &PathBuf, tokens_str: &str, max_tokens: usize) {
     println!("\nGenerated {} new tokens", output.len() - prompt_tokens.len());
 }
 
+/// Run the model on a summarization prompt and return the decoded summary string.
+///
+/// Used by the chat loop to compress old conversation turns before they're evicted
+/// from the context window. Runs greedy sampling for deterministic output.
+fn summarize_messages(
+    weights: &TransformerWeights,
+    config: &ModelConfig,
+    tokenizer: &Tokenizer,
+    messages: &[(String, String)],
+    context_budget: usize,
+) -> String {
+    let mut transcript =
+        String::from("Summarize the following conversation briefly in 2-3 sentences:\n\n");
+    for (role, content) in messages {
+        let label = match role.as_str() {
+            "user" => "User",
+            "assistant" => "Assistant",
+            _ => continue,
+        };
+        transcript.push_str(&format!("{label}: {content}\n"));
+    }
+    transcript.push_str("\nSummary:");
+
+    let mut prompt_tokens = tokenizer.encode(&transcript);
+    prompt_tokens.insert(0, tokenizer.bos_token_id);
+
+    let max_summary_tokens = 120usize;
+    let available = context_budget.saturating_sub(prompt_tokens.len());
+    let gen_tokens = max_summary_tokens.min(available);
+    if gen_tokens == 0 {
+        return String::from("[prior conversation]");
+    }
+
+    let mut sampler = Sampler::new(SamplerConfig {
+        temperature: 0.0,
+        ..Default::default()
+    });
+    let output = generate_cached(
+        weights, config, &prompt_tokens, gen_tokens, &mut sampler, tokenizer.eos_token_id,
+    );
+    tokenizer.decode(&output[prompt_tokens.len()..]).trim().to_string()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn chat_model(
     path: &PathBuf,
@@ -468,7 +511,7 @@ fn chat_model(
 
         history.push(("user".to_string(), user_text.to_string()));
 
-        // Build prompt, trimming oldest non-system messages if over context budget
+        // Build prompt, summarizing or trimming if over context budget
         let context_budget = config.context_length as usize;
         let prompt_tokens = loop {
             let msgs: Vec<Message<'_>> = history.iter()
@@ -482,19 +525,43 @@ fn chat_model(
                 break tokens;
             }
 
-            // Drop the oldest non-system message to free space
-            let drop_idx = history.iter().position(|(r, _)| r != "system");
-            match drop_idx {
-                Some(idx) => {
-                    eprintln!("[Context limit reached — dropping oldest message to make room]");
-                    history.remove(idx);
+            // Collect indices of non-system messages
+            let non_sys: Vec<usize> = history.iter().enumerate()
+                .filter(|(_, (r, _))| r != "system")
+                .map(|(i, _)| i)
+                .collect();
+
+            // Summarize if we have enough old messages (keep 2 recent, summarize the rest)
+            if non_sys.len() >= 3 {
+                let keep_from = non_sys.len() - 2;
+                let to_summarize: Vec<(String, String)> = non_sys[..keep_from]
+                    .iter()
+                    .map(|&i| history[i].clone())
+                    .collect();
+                eprintln!("[Context limit reached — summarizing earlier conversation...]");
+                let summary = summarize_messages(&weights, &config, &tokenizer, &to_summarize, context_budget);
+                // Remove summarized messages (reverse order to keep indices valid)
+                for &i in non_sys[..keep_from].iter().rev() {
+                    history.remove(i);
                 }
-                None => {
-                    // Only system message remains and still too long — truncate
-                    eprintln!("[Warning: prompt still exceeds context window after trimming, truncating]");
-                    tokens.truncate(context_budget.saturating_sub(max_tokens));
-                    break tokens;
-                }
+                // Insert summary after system messages
+                let insert_at = history.iter().position(|(r, _)| r != "system").unwrap_or(0);
+                history.insert(insert_at, (
+                    "system".to_string(),
+                    format!("Summary of earlier conversation: {summary}"),
+                ));
+                continue;
+            }
+
+            // Fall back: drop the oldest non-system message
+            if let Some(idx) = history.iter().position(|(r, _)| r != "system") {
+                eprintln!("[Context limit reached — dropping oldest message to make room]");
+                history.remove(idx);
+            } else {
+                // Only system message remains and still too long — truncate
+                eprintln!("[Warning: prompt still exceeds context window, truncating]");
+                tokens.truncate(context_budget.saturating_sub(max_tokens));
+                break tokens;
             }
         };
 
