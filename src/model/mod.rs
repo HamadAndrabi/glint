@@ -3,4 +3,5 @@
 pub mod chat_template;
 pub mod config;
 pub mod gguf;
+pub mod pull;
 pub mod tokenizer;

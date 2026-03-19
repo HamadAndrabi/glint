@@ -43,6 +43,15 @@ tokio-stream = "0.1"
 # HTTP middleware — CORS headers for browser-based API clients.
 tower-http = { version = "0.6", features = ["cors"] }
 
+# Async HTTP client with streaming body — used for downloading models from HuggingFace.
+reqwest = { version = "0.12", features = ["stream", "json"] }
+
+# Terminal progress bars — used to show download progress.
+indicatif = "0.17"
+
+# Cross-platform user/cache directory paths (e.g. ~/.cache or %LOCALAPPDATA%).
+dirs = "5"
+
 [dev-dependencies]
 # Creates temporary files/directories for tests that auto-clean on drop.
 tempfile = "3"

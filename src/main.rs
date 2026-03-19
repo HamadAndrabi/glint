@@ -2,13 +2,14 @@
 
 use clap::{Parser, Subcommand};
 use std::io::{self, BufRead, Write as IoWrite};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
 use glint::model::chat_template::{ChatTemplate, Message};
 use glint::model::config::ModelConfig;
 use glint::model::gguf::GgufModel;
+use glint::model::pull::{pull_model, search_huggingface};
 use glint::model::tokenizer::Tokenizer;
 use glint::sampling::{Sampler, SamplerConfig};
 use glint::server::AppState;
@@ -138,6 +139,21 @@ enum Commands {
         #[arg(long, default_value = "127.0.0.1")]
         host: String,
     },
+
+    /// Download a GGUF model from HuggingFace Hub.
+    ///
+    /// Example: glint pull bartowski/SmolLM2-135M-Instruct-GGUF SmolLM2-135M-Instruct-Q8_0.gguf
+    Pull {
+        /// HuggingFace repository in "owner/repo" format.
+        repo: String,
+
+        /// GGUF filename to download (e.g. "SmolLM2-135M-Instruct-Q8_0.gguf").
+        file: String,
+
+        /// Directory to save the model to (default: platform cache dir / ferrite / models).
+        #[arg(long)]
+        dir: Option<PathBuf>,
+    },
 }
 
 #[tokio::main]
@@ -162,6 +178,7 @@ async fn main() {
             repeat_penalty,
             seed,
         } => {
+            let file = maybe_download(&file).await;
             run_model(&file, &prompt, max_tokens, temperature, top_k, top_p, repeat_penalty, seed);
         }
         Commands::Generate {
@@ -174,10 +191,15 @@ async fn main() {
         Commands::Chat {
             file, system, max_tokens, temperature, top_k, top_p, repeat_penalty, seed,
         } => {
+            let file = maybe_download(&file).await;
             chat_model(&file, system.as_deref(), max_tokens, temperature, top_k, top_p, repeat_penalty, seed);
         }
         Commands::Serve { file, port, host } => {
+            let file = maybe_download(&file).await;
             serve_model(&file, &host, port).await;
+        }
+        Commands::Pull { repo, file, dir } => {
+            pull_model_cmd(&repo, &file, dir.as_deref()).await;
         }
     }
 }
@@ -674,5 +696,110 @@ fn format_bytes(bytes: u64) -> String {
         format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
     } else {
         format!("{:.2} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+    }
+}
+
+// ── Model download helpers ────────────────────────────────────────────────────
+
+/// Returns the platform-specific default model cache directory.
+///
+/// - Windows: `%LOCALAPPDATA%\ferrite\models`
+/// - Linux/macOS: `~/.cache/ferrite/models`
+fn default_cache_dir(override_dir: Option<&Path>) -> PathBuf {
+    match override_dir {
+        Some(d) => d.to_path_buf(),
+        None => dirs::cache_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("ferrite")
+            .join("models"),
+    }
+}
+
+/// If `path` doesn't exist and looks like a `.gguf` filename, search HuggingFace
+/// and offer to download it. Returns the resolved path (either the original or the
+/// freshly-downloaded one).
+async fn maybe_download(path: &Path) -> PathBuf {
+    if path.exists() {
+        return path.to_path_buf();
+    }
+
+    let filename = match path.file_name().and_then(|n| n.to_str()) {
+        Some(f) if f.ends_with(".gguf") => f,
+        _ => return path.to_path_buf(), // let GgufModel::load produce the normal error
+    };
+
+    // Build a search query by stripping the quantization suffix
+    // e.g. "SmolLM2-135M-Instruct-Q8_0" → "SmolLM2-135M-Instruct"
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(filename);
+    let query = stem
+        .split('-')
+        .take_while(|p| !p.starts_with('Q') && !p.starts_with('I'))
+        .collect::<Vec<_>>()
+        .join("-");
+
+    eprintln!("File not found: {}", path.display());
+    eprint!("Searching HuggingFace for \"{query}\"... ");
+    io::stdout().flush().ok();
+
+    let repos = match search_huggingface(&query).await {
+        Ok(r) if !r.is_empty() => r,
+        _ => {
+            eprintln!("no results.");
+            eprintln!("Download manually with:  glint pull <repo> {filename}");
+            return path.to_path_buf();
+        }
+    };
+
+    eprintln!("found {} match(es):", repos.len());
+    for (i, repo) in repos.iter().enumerate() {
+        eprintln!("  [{}] {}", i + 1, repo);
+    }
+
+    eprint!("Download which? [1-{}/N]: ", repos.len());
+    io::stdout().flush().ok();
+
+    let mut choice = String::new();
+    io::stdin().lock().read_line(&mut choice).ok();
+
+    if let Ok(n) = choice.trim().parse::<usize>() {
+        if n >= 1 && n <= repos.len() {
+            let repo = &repos[n - 1];
+            let dest_dir = default_cache_dir(None);
+            eprintln!("Downloading from {repo}...");
+            match pull_model(repo, filename, &dest_dir).await {
+                Ok(downloaded) => {
+                    eprintln!("Saved to: {}", downloaded.display());
+                    return downloaded;
+                }
+                Err(e) => eprintln!("Download failed: {e}"),
+            }
+        }
+    }
+
+    eprintln!("Cancelled.");
+    path.to_path_buf()
+}
+
+/// Handle the `glint pull` subcommand.
+async fn pull_model_cmd(repo: &str, filename: &str, dir: Option<&Path>) {
+    let dest_dir = default_cache_dir(dir);
+    eprintln!("Repository: {repo}");
+    eprintln!("File:       {filename}");
+    eprintln!("Saving to:  {}", dest_dir.display());
+    eprintln!();
+
+    match pull_model(repo, filename, &dest_dir).await {
+        Ok(path) => {
+            eprintln!("\nSaved to: {}", path.display());
+            eprintln!("\nRun with:");
+            eprintln!("  glint run --file \"{}\" --prompt \"Your prompt here\"", path.display());
+        }
+        Err(e) => {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        }
     }
 }
