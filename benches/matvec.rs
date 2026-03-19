@@ -13,8 +13,8 @@
 //! Run:  cargo bench --bench matvec
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId, Throughput};
-use ferrite::model::gguf::GgmlType;
-use ferrite::tensor::QuantizedTensor;
+use glint::model::gguf::GgmlType;
+use glint::tensor::QuantizedTensor;
 
 const SIZES: &[(usize, usize)] = &[
     (576, 576),

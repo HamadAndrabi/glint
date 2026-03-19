@@ -1,7 +1,7 @@
 //! OpenAI-compatible request and response types.
 //!
 //! These match the shape of the OpenAI API so that any existing client library
-//! (the OpenAI SDK, LangChain, curl, etc.) works with Ferrite without changes.
+//! (the OpenAI SDK, LangChain, curl, etc.) works with Glint without changes.
 //!
 //! Reference: https://platform.openai.com/docs/api-reference/completions
 

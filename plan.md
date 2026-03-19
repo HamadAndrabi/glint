@@ -1,4 +1,4 @@
-# ferrite- A Rust LLM Inference Engine — Project Roadmap
+# glint- A Rust LLM Inference Engine — Project Roadmap
 
 ## Project Vision
 

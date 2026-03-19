@@ -1,5 +1,5 @@
 [package]
-name = "ferrite"
+name = "glint"
 version = "0.1.0"
 edition = "2021"
 description = "A production-grade LLM inference engine built from scratch in Rust"

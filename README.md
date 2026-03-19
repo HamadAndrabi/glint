@@ -1,74 +1,128 @@
-# Ferrite
+# <div align="center">Glint</div>
 
-A high-performance LLM inference engine built from scratch in Rust. Ferrite loads GGUF models, runs the full transformer forward pass, and serves an OpenAI-compatible HTTP API — all without PyTorch, ONNX, or any ML framework dependency.
+<div align="center">
+  <img src="assets/logo.svg" alt="Glint logo" width="280" />
 
-## Features
+  <p><strong>A high-performance LLM inference engine built from scratch in Rust.</strong></p>
 
-**Inference**
-- Full LLaMA-family transformer: RMSNorm, RoPE, SwiGLU, grouped-query attention
-- KV-cache for O(n) per-token generation (no re-computing past tokens)
-- Greedy and configurable sampling (temperature, top-k, top-p, repetition penalty, seeds)
+  <p>
+    Glint loads GGUF models, runs the full transformer forward pass, and serves an
+    OpenAI-compatible HTTP API without depending on PyTorch, ONNX, or any other ML framework.
+  </p>
 
-**Quantization**
-- 5 formats: Q8_0, Q4_0, Q4_K, Q5_K, Q6_K — covers the vast majority of published GGUF models
-- AVX2+FMA SIMD kernels for all formats (runtime detection, scalar fallback on non-x86)
-- Rayon row-parallel matvec across all CPU cores
-- Weights stay compressed in memory — ~140 MB for a 135M-parameter Q8_0 model vs ~540 MB dequantized
+  <p>
+    <img alt="Rust" src="https://img.shields.io/badge/Rust-2021-black?logo=rust" />
+    <img alt="Tests" src="https://img.shields.io/badge/tests-84%20passing-success" />
+    <img alt="License" src="https://img.shields.io/badge/license-MIT-blue" />
+  </p>
+</div>
 
-**Server**
-- OpenAI-compatible HTTP API: `/v1/completions`, `/v1/chat/completions`, `/v1/models`
-- Token-by-token SSE streaming
-- Chat template auto-detection from GGUF metadata (ChatML, Llama 3, Mistral, Zephyr, Gemma)
-- CORS enabled for browser clients, `/health` endpoint for orchestrators
+## Why Glint?
 
-**Model loading**
-- Zero-copy GGUF parser with memory-mapped I/O
-- Built-in BPE tokenizer loaded from GGUF vocabulary
-- Supports any LLaMA-architecture model in GGUF format
+Glint is a focused inference engine for GGUF-based LLaMA-family models. It is designed to be small, understandable, and fast on CPU while still covering the pieces that make a local inference stack practical:
 
-## Getting Started
+- zero-copy GGUF loading with memory-mapped I/O
+- quantized execution with SIMD kernels and Rayon parallelism
+- KV-cache backed autoregressive generation
+- built-in tokenizer and chat template detection
+- OpenAI-compatible HTTP endpoints with SSE streaming
+
+## Feature Overview
+
+| Area | What you get |
+| --- | --- |
+| Inference | Full transformer forward pass with RMSNorm, RoPE, SwiGLU, and grouped-query attention |
+| Quantization | Q8_0, Q4_0, Q4_K, Q5_K, and Q6_K support with compressed weights kept in memory |
+| Performance | AVX2+FMA kernels where available, scalar fallback elsewhere, Rayon row-parallel matvec |
+| Serving | `/v1/completions`, `/v1/chat/completions`, `/v1/models`, `/health`, and token streaming over SSE |
+| Compatibility | GGUF loading, built-in BPE tokenizer, and chat template auto-detection from model metadata |
+
+## Highlights
+
+### Inference
+
+- Full LLaMA-family transformer implementation in Rust
+- KV-cache for efficient per-token generation without recomputing prior context
+- Greedy decoding and configurable sampling with temperature, top-k, top-p, repetition penalty, and seeding
+
+### Quantization
+
+- Five commonly used GGUF quantization formats: `Q8_0`, `Q4_0`, `Q4_K`, `Q5_K`, `Q6_K`
+- SIMD kernels for all supported formats on AVX2+FMA systems
+- Compressed weights stay compressed in memory
+- Example footprint: a 135M-parameter `Q8_0` model is about 140 MB in memory versus about 540 MB dequantized
+
+### Server
+
+- OpenAI-style completions and chat completions APIs
+- Streaming responses via Server-Sent Events
+- CORS enabled for browser clients
+- `/health` endpoint for readiness checks and simple orchestration
+
+### Model Loading
+
+- Zero-copy GGUF parser using `memmap2`
+- Tokenizer loaded directly from GGUF vocabulary
+- Chat template detection for ChatML, Llama 3, Mistral, Zephyr, Gemma, and a generic fallback
+
+## Quick Start
 
 ```bash
-git clone https://github.com/HamadAndrabi/ferrite
-cd ferrite
+git clone https://github.com/HamadAndrabi/glint
+cd glint
 cargo build --release
 ```
+
+## CLI Usage
 
 ### Generate text
 
 ```bash
-ferrite run -f model.Q4_K_M.gguf -p "The future of AI is" -m 100
+glint run -f model.Q4_K_M.gguf -p "The future of AI is" -m 100
 ```
 
-With sampling:
+Sampling example:
 
 ```bash
-ferrite run -f model.gguf -p "Once upon a time" -m 200 \
+glint run -f model.gguf -p "Once upon a time" -m 200 \
   --temperature 0.8 --top-k 40 --top-p 0.95 --repeat-penalty 1.1
 ```
 
 ### Interactive chat
 
 ```bash
-ferrite chat -f model.gguf --system "You are a helpful assistant"
+glint chat -f model.gguf --system "You are a helpful assistant"
 ```
 
-Multi-turn conversation with streaming output. Supports the same sampling parameters:
+With custom sampling:
 
 ```bash
-ferrite chat -f model.gguf --temperature 0.8 --top-k 40 --top-p 0.95 -m 512
+glint chat -f model.gguf --temperature 0.8 --top-k 40 --top-p 0.95 -m 512
 ```
 
-### Start the server
+### Run the server
 
 ```bash
-ferrite serve -f model.Q4_K_M.gguf -p 8080
+glint serve -f model.Q4_K_M.gguf -p 8080
 ```
 
-Then use any OpenAI-compatible client:
+You can also bind to another host:
 
 ```bash
-# Chat completion
+glint serve -f model.gguf --host 0.0.0.0 -p 8080
+```
+
+### Inspect a model
+
+```bash
+glint inspect -f model.gguf --show-metadata --show-tensors
+```
+
+## OpenAI-Compatible API
+
+### Chat completion
+
+```bash
 curl http://localhost:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
@@ -77,8 +131,11 @@ curl http://localhost:8080/v1/chat/completions \
     "max_tokens": 50,
     "temperature": 0.7
   }'
+```
 
-# Streaming
+### Streaming completion
+
+```bash
 curl http://localhost:8080/v1/completions \
   -H "Content-Type: application/json" \
   -d '{
@@ -87,20 +144,35 @@ curl http://localhost:8080/v1/completions \
     "max_tokens": 100,
     "stream": true
   }'
+```
 
-# Health check
+### Health check
+
+```bash
 curl http://localhost:8080/health
 ```
 
-### Inspect a model
+## Benchmarks
+
+Matvec throughput at `4096 x 4096` (Llama 3 8B scale), AVX2+FMA, Rayon:
+
+| Format | Throughput | Time |
+| --- | --- | --- |
+| `Q4_0` | 24.4 Gelem/s | 687 us |
+| `Q8_0` | 22.7 Gelem/s | 739 us |
+| `Q4_K` | 20.8 Gelem/s | 808 us |
+| `Q6_K` | 18.7 Gelem/s | 899 us |
+| `Q5_K` | 17.0 Gelem/s | 984 us |
+
+Run the benchmark suite with:
 
 ```bash
-ferrite inspect -f model.gguf --show-metadata --show-tensors
+cargo bench --bench matvec
 ```
 
 ## Architecture
 
-```
+```text
                     GGUF file (mmap)
                          |
               +----------+----------+
@@ -120,42 +192,22 @@ ferrite inspect -f model.gguf --show-metadata --show-tensors
                     |              |
               TransformerWeights   |
                     |              |
-               forward(token) ----+
+               forward(token) -----+
                     |
-              logits [vocab]
+                  logits
                     |
-               Sampler
-            (temp/top-k/top-p)
+                  Sampler
                     |
-               next token
+                next token
                     |
-          +----+----+----+
-          |              |
-     CLI output    HTTP SSE stream
-                   (OpenAI API)
-```
-
-## Benchmarks
-
-Matvec throughput at 4096x4096 (Llama-3-8B scale), AVX2+FMA, rayon:
-
-| Format | Throughput | Time |
-|--------|-----------|------|
-| Q4_0 | 24.4 Gelem/s | 687 us |
-| Q8_0 | 22.7 Gelem/s | 739 us |
-| Q4_K | 20.8 Gelem/s | 808 us |
-| Q6_K | 18.7 Gelem/s | 899 us |
-| Q5_K | 17.0 Gelem/s | 984 us |
-
-Run benchmarks:
-
-```bash
-cargo bench --bench matvec
+          +---------+---------+
+          |                   |
+     CLI output        HTTP SSE stream
 ```
 
 ## Project Structure
 
-```
+```text
 src/
   model/
     gguf.rs            GGUF binary format parser
@@ -165,22 +217,26 @@ src/
   tensor/
     tensor.rs          Contiguous f32 tensor type
     ops.rs             Primitives: matmul, RMSNorm, RoPE, softmax, SiLU
-    quantized.rs       QuantizedTensor with block-wise matvec kernels
-    simd.rs            AVX2+FMA SIMD kernels (Q8_0, Q4_0, Q4_K, Q5_K, Q6_K)
-    dequantize.rs      Scalar dequantization for all formats
+    quantized.rs       Quantized tensor storage and block-wise matvec kernels
+    simd.rs            AVX2+FMA SIMD kernels
+    dequantize.rs      Scalar dequantization helpers
   transformer/
-    weights.rs         Weight loading from GGUF into QuantizedTensors
-    forward.rs         Full transformer forward pass + generation loops
+    weights.rs         Weight loading from GGUF
+    forward.rs         Transformer forward pass and generation loops
   cache/               KV-cache for autoregressive generation
   sampling/            Temperature, top-k, top-p, repetition penalty
-  server/              Axum HTTP server, OpenAI-compatible routes, SSE streaming
+  server/              Axum server, OpenAI-compatible routes, SSE streaming
 ```
 
-## Tests
+## Testing
+
+The library test suite currently covers tokenizer behavior, GGUF parsing, quantization paths, tensor ops, sampling, KV-cache handling, and transformer forward logic.
 
 ```bash
-cargo test --lib     # 84 tests covering all modules
+cargo test --lib
 ```
+
+Current status: `84` tests passing.
 
 ## License
 

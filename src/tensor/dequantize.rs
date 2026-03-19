@@ -6,7 +6,7 @@
 
 use half::f16;
 
-use crate::error::FerriteError;
+use crate::error::GlintError;
 use crate::model::gguf::{GgmlType, GgufModel};
 use super::tensor::Tensor;
 
@@ -21,7 +21,7 @@ pub fn dequantize(data: &[u8], ggml_type: GgmlType, n_elements: usize) -> Vec<f3
         GgmlType::Q4K  => dequantize_q4_k(data, n_elements),
         GgmlType::Q5K  => dequantize_q5_k(data, n_elements),
         GgmlType::Q6K  => dequantize_q6_k(data, n_elements),
-        _ => panic!("{}", FerriteError::UnsupportedQuantization(ggml_type.to_string())),
+        _ => panic!("{}", GlintError::UnsupportedQuantization(ggml_type.to_string())),
     }
 }
 
@@ -329,10 +329,10 @@ fn dequantize_q6_k(data: &[u8], n_elements: usize) -> Vec<f32> {
 ///
 /// GGUF dimensions are column-major (first dim = fastest-varying),
 /// so we reverse them to match our row-major Tensor layout.
-pub fn load_tensor_f32(model: &GgufModel, name: &str) -> Result<Tensor, FerriteError> {
+pub fn load_tensor_f32(model: &GgufModel, name: &str) -> Result<Tensor, GlintError> {
     let info = model
         .get_tensor_info(name)
-        .ok_or_else(|| FerriteError::TensorNotFound(name.to_string()))?;
+        .ok_or_else(|| GlintError::TensorNotFound(name.to_string()))?;
 
     let n_elements = info.n_elements() as usize;
     // Reverse dimensions: GGUF is column-major, we are row-major
@@ -340,7 +340,7 @@ pub fn load_tensor_f32(model: &GgufModel, name: &str) -> Result<Tensor, FerriteE
 
     let raw_data = model
         .tensor_data(name)
-        .map_err(|e| FerriteError::TensorReadError {
+        .map_err(|e| GlintError::TensorReadError {
             name: name.to_string(),
             detail: e.to_string(),
         })?;

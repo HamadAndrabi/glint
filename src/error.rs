@@ -1,22 +1,22 @@
-//! Error types for Ferrite.
+//! Error types for Glint.
 //!
-//! `FerriteError` covers failures that can occur at model load time —
+//! `GlintError` covers failures that can occur at model load time —
 //! missing tensors, unsupported formats, or bad metadata. These are
 //! returned as `Result` so callers can print a clean message instead of
 //! crashing with a Rust panic backtrace.
 
 use std::fmt;
 
-/// Errors that can occur while loading or running a Ferrite model.
+/// Errors that can occur while loading or running a Glint model.
 #[derive(Debug)]
-pub enum FerriteError {
+pub enum GlintError {
     /// A required weight tensor was not found in the GGUF file.
     TensorNotFound(String),
     /// A tensor had an unexpected number of dimensions (we support 1-D and 2-D).
     InvalidTensorShape { name: String, ndim: usize },
     /// Reading raw tensor bytes from the GGUF memory map failed.
     TensorReadError { name: String, detail: String },
-    /// The model uses a quantization format Ferrite does not yet support.
+    /// The model uses a quantization format Glint does not yet support.
     UnsupportedQuantization(String),
     /// The GGUF file is missing the `tokenizer.ggml.tokens` vocabulary.
     MissingVocabulary,
@@ -24,7 +24,7 @@ pub enum FerriteError {
     MissingModelConfig,
 }
 
-impl fmt::Display for FerriteError {
+impl fmt::Display for GlintError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::TensorNotFound(name) => {
@@ -53,4 +53,4 @@ impl fmt::Display for FerriteError {
     }
 }
 
-impl std::error::Error for FerriteError {}
+impl std::error::Error for GlintError {}

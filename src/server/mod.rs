@@ -48,7 +48,7 @@ pub async fn run_server(state: AppState, host: &str, port: u16) {
         .with_state(shared);
 
     let addr = format!("{host}:{port}");
-    eprintln!("Ferrite server listening on http://{addr}");
+    eprintln!("Glint server listening on http://{addr}");
     eprintln!("  GET  http://{addr}/health");
     eprintln!("  GET  http://{addr}/v1/models");
     eprintln!("  POST http://{addr}/v1/completions");

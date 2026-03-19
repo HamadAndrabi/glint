@@ -1,4 +1,4 @@
-//! Ferrite — LLM Inference Engine
+//! Glint — LLM Inference Engine
 
 pub mod error;
 pub mod model;

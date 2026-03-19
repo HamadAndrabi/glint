@@ -4,7 +4,7 @@
 //! `QuantizedTensor` — keeping raw quantized bytes in memory instead of
 //! expanding to f32. Norm weights are tiny and stay as `Tensor` (f32).
 
-use crate::error::FerriteError;
+use crate::error::GlintError;
 use crate::model::config::ModelConfig;
 use crate::model::gguf::GgufModel;
 use crate::tensor::{load_tensor_f32, QuantizedTensor, Tensor};
@@ -49,7 +49,7 @@ impl TransformerWeights {
     ///
     /// Weight matrices are loaded as `QuantizedTensor` (raw bytes kept).
     /// Norm vectors are loaded as `Tensor` (f32, tiny — ~2 KB each).
-    pub fn load(model: &GgufModel, config: &ModelConfig) -> Result<Self, FerriteError> {
+    pub fn load(model: &GgufModel, config: &ModelConfig) -> Result<Self, GlintError> {
         eprintln!("Loading token embedding...");
         let token_embedding = QuantizedTensor::load(model, "token_embd.weight")?;
 

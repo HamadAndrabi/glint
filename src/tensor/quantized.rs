@@ -12,7 +12,7 @@
 use half::f16;
 use rayon::prelude::*;
 
-use crate::error::FerriteError;
+use crate::error::GlintError;
 use crate::model::gguf::{GgmlType, GgufModel};
 use super::tensor::Tensor;
 use super::dequantize::{dequantize, get_scale_min_q4k};
@@ -38,22 +38,22 @@ impl QuantizedTensor {
     ///
     /// GGUF stores dimensions in column-major order (first dim varies fastest).
     /// We reverse them to match our row-major convention.
-    pub fn load(model: &GgufModel, name: &str) -> Result<Self, FerriteError> {
+    pub fn load(model: &GgufModel, name: &str) -> Result<Self, GlintError> {
         let info = model
             .get_tensor_info(name)
-            .ok_or_else(|| FerriteError::TensorNotFound(name.to_string()))?;
+            .ok_or_else(|| GlintError::TensorNotFound(name.to_string()))?;
 
         // Reverse dimensions: GGUF column-major → our row-major
         let dims: Vec<usize> = info.dimensions.iter().rev().map(|&d| d as usize).collect();
         let (rows, cols) = match dims.len() {
             1 => (dims[0], 1),
             2 => (dims[0], dims[1]),
-            n => return Err(FerriteError::InvalidTensorShape { name: name.to_string(), ndim: n }),
+            n => return Err(GlintError::InvalidTensorShape { name: name.to_string(), ndim: n }),
         };
 
         let raw = model
             .tensor_data(name)
-            .map_err(|e| FerriteError::TensorReadError {
+            .map_err(|e| GlintError::TensorReadError {
                 name: name.to_string(),
                 detail: e.to_string(),
             })?;
