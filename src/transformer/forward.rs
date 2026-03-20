@@ -4,6 +4,7 @@ use rayon::prelude::*;
 
 use crate::cache::{KvCache, KvCacheQ8, KvStore};
 use crate::model::config::ModelConfig;
+use crate::model::lora::LoraLayerAdapters;
 use crate::sampling::Sampler;
 use crate::tensor::{self, Tensor};
 use super::weights::{LayerWeights, TransformerWeights};
@@ -30,7 +31,7 @@ pub fn forward(
             let attn_out = attention(&normed, &hidden_states, layer, config, pos);
             let after_attn = tensor::add(&hidden_states[pos], &attn_out);
             let normed_ffn = tensor::rms_norm(&after_attn, &layer.ffn_norm, config.rms_norm_eps);
-            let ffn_out = feed_forward(&normed_ffn, layer);
+            let ffn_out = feed_forward(&normed_ffn, layer, None);
             new_hidden_states.push(tensor::add(&after_attn, &ffn_out));
         }
         hidden_states = new_hidden_states;
@@ -106,11 +107,19 @@ fn attention(
 }
 
 /// SwiGLU feed-forward: `down(silu(gate(x)) * up(x))`.
-fn feed_forward(x: &Tensor, layer: &LayerWeights) -> Tensor {
-    let gate   = layer.ffn_gate.matvec(x.data());
-    let up     = layer.ffn_up.matvec(x.data());
+fn feed_forward(x: &Tensor, layer: &LayerWeights, lora: Option<&LoraLayerAdapters>) -> Tensor {
+    let mut gate = layer.ffn_gate.matvec(x.data());
+    let mut up   = layer.ffn_up.matvec(x.data());
+    if let Some(ll) = lora {
+        if let Some(a) = &ll.ffn_gate { a.apply(x.data(), gate.data_mut()); }
+        if let Some(a) = &ll.ffn_up   { a.apply(x.data(),   up.data_mut()); }
+    }
     let hidden = tensor::mul(&tensor::silu(&gate), &up);
-    layer.ffn_down.matvec(hidden.data())
+    let mut out = layer.ffn_down.matvec(hidden.data());
+    if let Some(ll) = lora {
+        if let Some(a) = &ll.ffn_down { a.apply(hidden.data(), out.data_mut()); }
+    }
+    out
 }
 
 /// Compute a text embedding by mean-pooling the final hidden states.
@@ -132,7 +141,7 @@ pub fn embed(
             let attn_out = attention(&normed, &hidden_states, layer, config, pos);
             let after_attn = tensor::add(&hidden_states[pos], &attn_out);
             let normed_ffn = tensor::rms_norm(&after_attn, &layer.ffn_norm, config.rms_norm_eps);
-            let ffn_out = feed_forward(&normed_ffn, layer);
+            let ffn_out = feed_forward(&normed_ffn, layer, None);
             new_hs.push(tensor::add(&after_attn, &ffn_out));
         }
         hidden_states = new_hs;
@@ -182,11 +191,12 @@ pub fn forward_one(
     let mut hidden = weights.token_embedding.row_as_f32(token_id as usize);
 
     for (layer_idx, layer) in weights.layers.iter().enumerate() {
+        let lora_layer = weights.lora.as_ref().and_then(|l| l.layers.get(layer_idx));
         let normed = tensor::rms_norm(&hidden, &layer.attn_norm, config.rms_norm_eps);
-        let attn_out = attention_cached(&normed, layer, config, pos, layer_idx, cache);
+        let attn_out = attention_cached(&normed, layer, lora_layer, config, pos, layer_idx, cache);
         let after_attn = tensor::add(&hidden, &attn_out);
         let normed_ffn = tensor::rms_norm(&after_attn, &layer.ffn_norm, config.rms_norm_eps);
-        let ffn_out = feed_forward(&normed_ffn, layer);
+        let ffn_out = feed_forward(&normed_ffn, layer, lora_layer);
         hidden = tensor::add(&after_attn, &ffn_out);
     }
 
@@ -198,6 +208,7 @@ pub fn forward_one(
 fn attention_cached(
     x: &Tensor,
     layer: &LayerWeights,
+    lora: Option<&LoraLayerAdapters>,
     config: &ModelConfig,
     pos: usize,
     layer_idx: usize,
@@ -214,9 +225,14 @@ fn attention_cached(
         .map(|f| (head_dim as f32 * f) as usize & !1)
         .unwrap_or(head_dim);
 
-    let q_all = layer.attn_q.matvec(x.data());
-    let k_cur = layer.attn_k.matvec(x.data());
-    let v_cur = layer.attn_v.matvec(x.data());
+    let mut q_all = layer.attn_q.matvec(x.data());
+    let mut k_cur = layer.attn_k.matvec(x.data());
+    let mut v_cur = layer.attn_v.matvec(x.data());
+    if let Some(ll) = lora {
+        if let Some(a) = &ll.attn_q { a.apply(x.data(), q_all.data_mut()); }
+        if let Some(a) = &ll.attn_k { a.apply(x.data(), k_cur.data_mut()); }
+        if let Some(a) = &ll.attn_v { a.apply(x.data(), v_cur.data_mut()); }
+    }
     let q_all = tensor::rope(&q_all, pos, head_dim, freq_base, rope_scaling, rot_dim);
     let k_cur = tensor::rope(&k_cur, pos, head_dim, freq_base, rope_scaling, rot_dim);
 
@@ -242,7 +258,11 @@ fn attention_cached(
     }
 
     let attn_vec = Tensor::from_vec(attn_output, &[embed_dim]);
-    layer.attn_output.matvec(attn_vec.data())
+    let mut out = layer.attn_output.matvec(attn_vec.data());
+    if let Some(ll) = lora {
+        if let Some(a) = &ll.attn_output { a.apply(attn_vec.data(), out.data_mut()); }
+    }
+    out
 }
 
 // ── Batched prefill (Phase 13) ────────────────────────────────────────────────
@@ -310,6 +330,8 @@ fn forward_prefill_inner(
 
     // 2. Transformer layers
     for (layer_idx, layer) in weights.layers.iter().enumerate() {
+        let lora_layer = weights.lora.as_ref().and_then(|l| l.layers.get(layer_idx));
+
         // a. Q/K/V projections + RoPE — parallel across positions
         let qkv: Vec<(Vec<f32>, Vec<f32>, Vec<f32>)> = hidden.par_iter()
             .enumerate()
@@ -317,9 +339,14 @@ fn forward_prefill_inner(
                 let abs = pos_offset + lp;
                 let h_t    = Tensor::from_vec(h.clone(), &[embed_dim]);
                 let normed = tensor::rms_norm(&h_t, &layer.attn_norm, config.rms_norm_eps);
-                let q = layer.attn_q.matvec(normed.data());
-                let k = layer.attn_k.matvec(normed.data());
-                let v = layer.attn_v.matvec(normed.data());
+                let mut q = layer.attn_q.matvec(normed.data());
+                let mut k = layer.attn_k.matvec(normed.data());
+                let mut v = layer.attn_v.matvec(normed.data());
+                if let Some(ll) = lora_layer {
+                    if let Some(a) = &ll.attn_q { a.apply(normed.data(), q.data_mut()); }
+                    if let Some(a) = &ll.attn_k { a.apply(normed.data(), k.data_mut()); }
+                    if let Some(a) = &ll.attn_v { a.apply(normed.data(), v.data_mut()); }
+                }
                 let q = tensor::rope(&q, abs, head_dim, freq_base, rope_scale, rot_dim);
                 let k = tensor::rope(&k, abs, head_dim, freq_base, rope_scale, rot_dim);
                 (q.data().to_vec(), k.data().to_vec(), v.data().to_vec())
@@ -352,7 +379,11 @@ fn forward_prefill_inner(
                     );
                 }
                 let attn_vec = Tensor::from_vec(out, &[embed_dim]);
-                layer.attn_output.matvec(attn_vec.data()).data().to_vec()
+                let mut proj = layer.attn_output.matvec(attn_vec.data());
+                if let Some(ll) = lora_layer {
+                    if let Some(a) = &ll.attn_output { a.apply(attn_vec.data(), proj.data_mut()); }
+                }
+                proj.data().to_vec()
             })
             .collect();
 
@@ -364,7 +395,7 @@ fn forward_prefill_inner(
                 let a_t        = Tensor::from_vec(ao, &[embed_dim]);
                 let after_attn = tensor::add(&h_t, &a_t);
                 let nf         = tensor::rms_norm(&after_attn, &layer.ffn_norm, config.rms_norm_eps);
-                let ffn_out    = feed_forward(&nf, layer);
+                let ffn_out    = feed_forward(&nf, layer, lora_layer);
                 tensor::add(&after_attn, &ffn_out).data().to_vec()
             })
             .collect();
@@ -537,6 +568,7 @@ mod tests {
             }],
             output_norm: Tensor::from_vec(vec![1.0; 4], &[4]),
             output: QuantizedTensor::from_f32(&(0..32).map(|i| i as f32 * 0.1 - 1.6).collect::<Vec<_>>(), 8, 4),
+            lora: None,
         };
         (weights, config)
     }
@@ -623,6 +655,6 @@ mod tests {
             ffn_down:    QuantizedTensor::from_f32(&vec![0.0f32; 32], 4, 8),
         };
         let x = Tensor::from_vec(vec![1.0, 2.0, 3.0, 4.0], &[4]);
-        assert_eq!(feed_forward(&x, &layer).shape(), &[4]);
+        assert_eq!(feed_forward(&x, &layer, None).shape(), &[4]);
     }
 }

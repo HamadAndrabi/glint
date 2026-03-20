@@ -81,6 +81,10 @@ enum Commands {
         /// Number of tokens the draft model generates per verification round.
         #[arg(long, default_value_t = 4)]
         lookahead: usize,
+
+        /// Path to a LoRA adapter GGUF file (optional).
+        #[arg(long)]
+        lora: Option<PathBuf>,
     },
 
     /// Generate tokens from raw token IDs (for debugging).
@@ -131,6 +135,10 @@ enum Commands {
         /// Random seed for reproducible sampling.
         #[arg(long)]
         seed: Option<u64>,
+
+        /// Path to a LoRA adapter GGUF file (optional).
+        #[arg(long)]
+        lora: Option<PathBuf>,
     },
 
     /// Start the OpenAI-compatible HTTP inference server.
@@ -187,9 +195,10 @@ async fn main() {
             seed,
             draft_model,
             lookahead,
+            lora,
         } => {
             let file = maybe_download(&file).await;
-            run_model(&file, &prompt, max_tokens, temperature, top_k, top_p, repeat_penalty, seed, draft_model.as_deref(), lookahead);
+            run_model(&file, &prompt, max_tokens, temperature, top_k, top_p, repeat_penalty, seed, draft_model.as_deref(), lookahead, lora.as_deref());
         }
         Commands::Generate {
             file,
@@ -199,10 +208,10 @@ async fn main() {
             generate_tokens(&file, &tokens, max_tokens);
         }
         Commands::Chat {
-            file, system, max_tokens, temperature, top_k, top_p, repeat_penalty, seed,
+            file, system, max_tokens, temperature, top_k, top_p, repeat_penalty, seed, lora,
         } => {
             let file = maybe_download(&file).await;
-            chat_model(&file, system.as_deref(), max_tokens, temperature, top_k, top_p, repeat_penalty, seed);
+            chat_model(&file, system.as_deref(), max_tokens, temperature, top_k, top_p, repeat_penalty, seed, lora.as_deref());
         }
         Commands::Serve { file, port, host } => {
             let file = maybe_download(&file).await;
@@ -319,6 +328,7 @@ fn run_model(
     seed: Option<u64>,
     draft_path: Option<&Path>,
     lookahead: usize,
+    lora_path: Option<&Path>,
 ) {
     let model = match GgufModel::load(path) {
         Ok(m) => m,
@@ -352,6 +362,13 @@ fn run_model(
         Ok(w) => w,
         Err(e) => { eprintln!("Error: {e}"); std::process::exit(1); }
     };
+    let weights = if let Some(lp) = lora_path {
+        let lora_model = match GgufModel::load(lp) {
+            Ok(m) => m,
+            Err(e) => { eprintln!("Error loading LoRA file: {e}"); std::process::exit(1); }
+        };
+        weights.with_lora(&lora_model)
+    } else { weights };
 
     let use_sampling = temperature > 0.0;
     if use_sampling {
@@ -505,6 +522,7 @@ fn chat_model(
     top_p: f32,
     repeat_penalty: f32,
     seed: Option<u64>,
+    lora_path: Option<&Path>,
 ) {
     let model = match GgufModel::load(path) {
         Ok(m) => m,
@@ -531,6 +549,13 @@ fn chat_model(
         Ok(w) => w,
         Err(e) => { eprintln!("Error: {e}"); std::process::exit(1); }
     };
+    let weights = if let Some(lp) = lora_path {
+        let lora_model = match GgufModel::load(lp) {
+            Ok(m) => m,
+            Err(e) => { eprintln!("Error loading LoRA file: {e}"); std::process::exit(1); }
+        };
+        weights.with_lora(&lora_model)
+    } else { weights };
 
     let chat_template = config.chat_template.as_deref()
         .map(ChatTemplate::detect)

@@ -7,6 +7,7 @@
 use crate::error::GlintError;
 use crate::model::config::ModelConfig;
 use crate::model::gguf::GgufModel;
+use crate::model::lora::LoraWeights;
 use crate::tensor::{load_tensor_f32, QuantizedTensor, Tensor};
 
 /// All weights for a single transformer block (one layer).
@@ -42,6 +43,8 @@ pub struct TransformerWeights {
     pub output_norm: Tensor,
     /// LM head [vocab_size, embed_dim] — quantized.
     pub output: QuantizedTensor,
+    /// Optional LoRA adapters — `None` unless loaded via `with_lora()`.
+    pub lora: Option<LoraWeights>,
 }
 
 impl TransformerWeights {
@@ -80,6 +83,20 @@ impl TransformerWeights {
             token_embedding.clone()
         };
 
-        Ok(Self { token_embedding, layers, output_norm, output })
+        Ok(Self { token_embedding, layers, output_norm, output, lora: None })
+    }
+
+    /// Attach LoRA adapters loaded from a separate GGUF file.
+    ///
+    /// Returns `Self` unchanged if the file contains no LoRA tensors.
+    pub fn with_lora(mut self, lora_model: &GgufModel) -> Self {
+        let n_layers = self.layers.len();
+        if let Some(lora) = LoraWeights::load(lora_model, n_layers) {
+            eprintln!("LoRA adapters loaded ({} layers).", n_layers);
+            self.lora = Some(lora);
+        } else {
+            eprintln!("Warning: no lora_a/lora_b tensors found in adapter file.");
+        }
+        self
     }
 }
