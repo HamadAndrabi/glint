@@ -313,31 +313,16 @@ fn attention_cached(
         let q_offset = h * head_dim;
         let q_head = &q_all.data()[q_offset..q_offset + head_dim];
 
-        // Score against all cached K vectors (including current)
-        let mut scores = vec![0.0f32; seq_len];
-        for (s, score) in scores.iter_mut().enumerate() {
-            let k_row = cache.k_at(layer_idx, s);
-            let k_head = &k_row[kv_h * head_dim..(kv_h + 1) * head_dim];
-            let mut dot = 0.0f32;
-            for d in 0..head_dim {
-                dot += q_head[d] * k_head[d];
-            }
-            *score = dot * scale;
-        }
-
-        // Softmax over scores
-        let scores_tensor = Tensor::from_vec(scores, &[seq_len]);
-        let attn_weights = tensor::softmax(&scores_tensor);
-
-        // Weighted sum of cached V vectors
-        for s in 0..seq_len {
-            let w = attn_weights.get_flat(s);
-            let v_row = cache.v_at(layer_idx, s);
-            let v_head = &v_row[kv_h * head_dim..(kv_h + 1) * head_dim];
-            for d in 0..head_dim {
-                attn_output[q_offset + d] += w * v_head[d];
-            }
-        }
+        tensor::flash_attn_1d(
+            q_head,
+            cache,
+            layer_idx,
+            kv_h,
+            seq_len,
+            head_dim,
+            scale,
+            &mut attn_output[q_offset..q_offset + head_dim],
+        );
     }
 
     let attn_vec = Tensor::from_vec(attn_output, &[embed_dim]);
