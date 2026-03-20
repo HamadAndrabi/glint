@@ -125,18 +125,35 @@ pub fn softmax(x: &Tensor) -> Tensor {
 /// needing additive position embeddings.
 ///
 /// For each pair `(x0, x1)` at dimension index `i`:
-///   freq = 1 / (base ^ (2i / dim))
-///   angle = pos * freq
+///   freq = 1 / (base ^ (2i / head_dim))
+///   angle = (pos / scaling_factor) * freq
 ///   x0' = x0 * cos(angle) - x1 * sin(angle)
 ///   x1' = x0 * sin(angle) + x1 * cos(angle)
-pub fn rope(x: &Tensor, pos: usize, head_dim: usize, freq_base: f32) -> Tensor {
+///
+/// # Arguments
+/// * `scaling_factor` — linear RoPE scaling for extended-context models (Phi-3, Qwen2-long).
+///   Use `1.0` for standard RoPE. Values >1 extend the effective context window.
+/// * `rot_dim` — number of head dimensions to rotate. Use `head_dim` for full RoPE.
+///   Phi-3 uses `partial_rotary_factor = 0.5`, so `rot_dim = head_dim / 2`; the
+///   remaining dimensions are left unchanged.
+pub fn rope(
+    x: &Tensor,
+    pos: usize,
+    head_dim: usize,
+    freq_base: f32,
+    scaling_factor: f32,
+    rot_dim: usize,
+) -> Tensor {
     assert_eq!(x.ndim(), 1);
     let data = x.data();
-    let mut out = vec![0.0f32; data.len()];
+    // Start from a copy so dimensions outside rot_dim are already correct.
+    let mut out = data.to_vec();
 
-    for i in (0..head_dim).step_by(2) {
+    let pos_scaled = pos as f32 / scaling_factor;
+
+    for i in (0..rot_dim).step_by(2) {
         let freq = 1.0 / freq_base.powf(i as f32 / head_dim as f32);
-        let angle = pos as f32 * freq;
+        let angle = pos_scaled * freq;
         let cos_val = angle.cos();
         let sin_val = angle.sin();
 
@@ -289,8 +306,27 @@ mod tests {
     fn test_rope_basic() {
         // At position 0, all angles are 0, so cos=1, sin=0 → no change
         let x = Tensor::from_vec(vec![1.0, 2.0, 3.0, 4.0], &[4]);
-        let result = rope(&x, 0, 4, 10000.0);
+        let result = rope(&x, 0, 4, 10000.0, 1.0, 4);
         approx_eq(result.data(), x.data(), 1e-6);
+    }
+
+    #[test]
+    fn test_rope_partial_rotary() {
+        // rot_dim=2 on a 4-dim head: first pair rotated, second pair unchanged.
+        // At pos=0 all angles are 0, so rotation is identity — both pairs unchanged.
+        let x = Tensor::from_vec(vec![1.0, 2.0, 3.0, 4.0], &[4]);
+        let result = rope(&x, 0, 4, 10000.0, 1.0, 2);
+        approx_eq(result.data(), x.data(), 1e-6);
+    }
+
+    #[test]
+    fn test_rope_scaling_factor() {
+        // scaling_factor=2 halves the effective position, so pos=2 with scale=2
+        // should equal pos=1 with scale=1.
+        let x = Tensor::from_vec(vec![1.0, 2.0, 3.0, 4.0], &[4]);
+        let scaled = rope(&x, 2, 4, 10000.0, 2.0, 4);
+        let unscaled = rope(&x, 1, 4, 10000.0, 1.0, 4);
+        approx_eq(scaled.data(), unscaled.data(), 1e-6);
     }
 
     #[test]

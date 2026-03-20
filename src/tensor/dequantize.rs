@@ -18,9 +18,12 @@ pub fn dequantize(data: &[u8], ggml_type: GgmlType, n_elements: usize) -> Vec<f3
         GgmlType::BF16 => dequantize_bf16(data, n_elements),
         GgmlType::Q8_0 => dequantize_q8_0(data, n_elements),
         GgmlType::Q4_0 => dequantize_q4_0(data, n_elements),
-        GgmlType::Q4K  => dequantize_q4_k(data, n_elements),
-        GgmlType::Q5K  => dequantize_q5_k(data, n_elements),
-        GgmlType::Q6K  => dequantize_q6_k(data, n_elements),
+        GgmlType::Q4K   => dequantize_q4_k(data, n_elements),
+        GgmlType::Q5K   => dequantize_q5_k(data, n_elements),
+        GgmlType::Q6K   => dequantize_q6_k(data, n_elements),
+        GgmlType::Q2K   => dequantize_q2_k(data, n_elements),
+        GgmlType::Q3K   => dequantize_q3_k(data, n_elements),
+        GgmlType::IQ4NL => dequantize_iq4_nl(data, n_elements),
         _ => panic!("{}", GlintError::UnsupportedQuantization(ggml_type.to_string())),
     }
 }
@@ -322,6 +325,140 @@ fn dequantize_q6_k(data: &[u8], n_elements: usize) -> Vec<f32> {
     }
 
     out.truncate(n_elements);
+    out
+}
+
+/// Q2_K dequantization.
+///
+/// Super-block layout (84 bytes per 256 elements):
+///   [scales u8×16] [qs u8×64] [f16 d] [f16 dmin]
+///
+/// 16 sub-groups of 16 elements. `scales[j]` low nibble = sub-block scale,
+/// high nibble = sub-block min. Each element uses 2 bits from `qs`.
+fn dequantize_q2_k(data: &[u8], n_elements: usize) -> Vec<f32> {
+    const SUPER_BLOCK: usize = 256;
+    const BLOCK_BYTES: usize = 84;
+
+    let n_blocks = n_elements.div_ceil(SUPER_BLOCK);
+    assert!(data.len() >= n_blocks * BLOCK_BYTES);
+
+    let mut out = Vec::with_capacity(n_elements);
+
+    for block in 0..n_blocks {
+        let b = &data[block * BLOCK_BYTES..];
+        let scales = &b[0..16];
+        let qs     = &b[16..80];
+        let d    = f16::from_le_bytes([b[80], b[81]]).to_f32();
+        let dmin = f16::from_le_bytes([b[82], b[83]]).to_f32();
+
+        let remaining = (n_elements - block * SUPER_BLOCK).min(SUPER_BLOCK);
+
+        for j in 0..16_usize {
+            let sc = (scales[j] & 0x0F) as f32;
+            let mn = (scales[j] >> 4) as f32;
+            let d_sc = d * sc;
+            let d_mn = dmin * mn;
+
+            for l in 0..16_usize {
+                if j * 16 + l >= remaining { break; }
+                let pos = j * 16 + l;
+                let q2 = ((qs[pos / 4] >> ((pos % 4) * 2)) & 0x3) as f32;
+                out.push(d_sc * q2 - d_mn);
+            }
+        }
+    }
+
+    out
+}
+
+/// Q3_K dequantization.
+///
+/// Super-block layout (110 bytes per 256 elements):
+///   [hmask u8×32] [qs u8×64] [scales u8×12] [f16 d]
+///
+/// 16 sub-groups of 16 elements. Each element is a 3-bit value (0..7) formed
+/// from 2 low bits in `qs` and 1 high bit in `hmask`. Scales are packed 6-bit
+/// signed integers (stored as raw + 32, so subtract 32 to recover the signed value).
+///
+/// Scale packing: 4 values per 3 bytes (group g, offset k):
+///   low4  = sc_raw[3g + k/2] >> ((k%2)*4) & 0xF
+///   high2 = sc_raw[3g + 2]   >> (k*2)     & 0x3
+///   raw6  = low4 | (high2 << 4)  →  signed = raw6 - 32
+fn dequantize_q3_k(data: &[u8], n_elements: usize) -> Vec<f32> {
+    const SUPER_BLOCK: usize = 256;
+    const BLOCK_BYTES: usize = 110;
+
+    let n_blocks = n_elements.div_ceil(SUPER_BLOCK);
+    assert!(data.len() >= n_blocks * BLOCK_BYTES);
+
+    let mut out = Vec::with_capacity(n_elements);
+
+    for block in 0..n_blocks {
+        let b = &data[block * BLOCK_BYTES..];
+        let hmask  = &b[0..32];
+        let qs     = &b[32..96];
+        let sc_raw = &b[96..108];
+        let d = f16::from_le_bytes([b[108], b[109]]).to_f32();
+
+        let remaining = (n_elements - block * SUPER_BLOCK).min(SUPER_BLOCK);
+
+        // Extract 16 signed 6-bit scale values from packed 12-byte array
+        let mut lscales = [0i32; 16];
+        for j in 0..16_usize {
+            let g = j / 4;
+            let k = j % 4;
+            let low4  = (sc_raw[3 * g + k / 2] >> ((k % 2) * 4)) & 0xF;
+            let high2 = (sc_raw[3 * g + 2] >> (k * 2)) & 0x3;
+            lscales[j] = (low4 | (high2 << 4)) as i32 - 32;
+        }
+
+        for j in 0..16_usize {
+            let dl = d * lscales[j] as f32;
+            for l in 0..16_usize {
+                if j * 16 + l >= remaining { break; }
+                let pos = j * 16 + l;
+                let lo2 = (qs[pos / 4] >> ((pos % 4) * 2)) & 0x3;
+                let hi1 = (hmask[pos / 8] >> (pos % 8)) & 0x1;
+                let q3  = (lo2 | (hi1 << 2)) as i32;
+                out.push(dl * (q3 - 4) as f32);
+            }
+        }
+    }
+
+    out
+}
+
+/// IQ4_NL dequantization.
+///
+/// Block layout (18 bytes per 32 elements — identical to Q4_0):
+///   [f16 d] [qs u8×16]
+///
+/// Uses a fixed 16-entry non-linear lookup table instead of a linear scale.
+fn dequantize_iq4_nl(data: &[u8], n_elements: usize) -> Vec<f32> {
+    const BLOCK_SIZE: usize = 32;
+    const BLOCK_BYTES: usize = 18;
+    const KVALUES: [i8; 16] = [
+        -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
+    ];
+
+    let n_blocks = n_elements.div_ceil(BLOCK_SIZE);
+    assert!(data.len() >= n_blocks * BLOCK_BYTES);
+
+    let mut out = Vec::with_capacity(n_elements);
+
+    for block in 0..n_blocks {
+        let b = &data[block * BLOCK_BYTES..];
+        let d  = f16::from_le_bytes([b[0], b[1]]).to_f32();
+        let qs = &b[2..18];
+        let remaining = (n_elements - block * BLOCK_SIZE).min(BLOCK_SIZE);
+
+        for i in 0..remaining {
+            let byte   = qs[i / 2];
+            let nibble = if i % 2 == 0 { (byte & 0x0F) as usize } else { (byte >> 4) as usize };
+            out.push(d * KVALUES[nibble] as f32);
+        }
+    }
+
     out
 }
 

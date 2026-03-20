@@ -99,7 +99,10 @@ impl QuantizedTensor {
             GgmlType::Q4_0 => dispatch_q4_0(&self.data, self.rows, self.cols, vec),
             GgmlType::Q4K  => dispatch_q4_k(&self.data, self.rows, self.cols, vec),
             GgmlType::Q5K  => dispatch_q5_k(&self.data, self.rows, self.cols, vec),
-            GgmlType::Q6K  => dispatch_q6_k(&self.data, self.rows, self.cols, vec),
+            GgmlType::Q6K   => dispatch_q6_k(&self.data, self.rows, self.cols, vec),
+            GgmlType::Q2K   => dispatch_q2_k(&self.data, self.rows, self.cols, vec),
+            GgmlType::Q3K   => dispatch_q3_k(&self.data, self.rows, self.cols, vec),
+            GgmlType::IQ4NL => dispatch_iq4_nl(&self.data, self.rows, self.cols, vec),
             _ => matvec_fallback(&self.data, self.ggml_type, self.rows, self.cols, vec),
         };
         Tensor::from_vec(out, &[self.rows])
@@ -403,6 +406,142 @@ fn matvec_q6_k_scalar(data: &[u8], rows: usize, cols: usize, vec: &[f32]) -> Vec
                         acc += d * sc4 * q3 * vec[x_group + l + 64];
                         acc += d * sc6 * q4 * vec[x_group + l + 96];
                     }
+                }
+            }
+            acc
+        })
+        .collect()
+}
+
+fn dispatch_q2_k(data: &[u8], rows: usize, cols: usize, vec: &[f32]) -> Vec<f32> {
+    matvec_q2_k_scalar(data, rows, cols, vec)
+}
+
+fn dispatch_q3_k(data: &[u8], rows: usize, cols: usize, vec: &[f32]) -> Vec<f32> {
+    matvec_q3_k_scalar(data, rows, cols, vec)
+}
+
+fn dispatch_iq4_nl(data: &[u8], rows: usize, cols: usize, vec: &[f32]) -> Vec<f32> {
+    matvec_iq4_nl_scalar(data, rows, cols, vec)
+}
+
+/// Q2_K matrix-vector multiply (scalar, rayon-parallel over rows).
+///
+/// Super-block layout (84 bytes per 256 elements):
+///   [scales u8×16] [qs u8×64] [f16 d] [f16 dmin]
+fn matvec_q2_k_scalar(data: &[u8], rows: usize, cols: usize, vec: &[f32]) -> Vec<f32> {
+    const SUPER_BLOCK: usize = 256;
+    const BLOCK_BYTES: usize = 84;
+
+    let n_super = cols / SUPER_BLOCK;
+    let bytes_per_row = n_super * BLOCK_BYTES;
+
+    (0..rows)
+        .into_par_iter()
+        .map(|r| {
+            let mut acc = 0.0f32;
+            let row = &data[r * bytes_per_row..];
+            for sb in 0..n_super {
+                let b = &row[sb * BLOCK_BYTES..];
+                let scales = &b[0..16];
+                let qs     = &b[16..80];
+                let d    = f16::from_le_bytes([b[80], b[81]]).to_f32();
+                let dmin = f16::from_le_bytes([b[82], b[83]]).to_f32();
+                let x_base = sb * SUPER_BLOCK;
+                for j in 0..16_usize {
+                    let d_sc = d * (scales[j] & 0x0F) as f32;
+                    let d_mn = dmin * (scales[j] >> 4) as f32;
+                    for l in 0..16_usize {
+                        let pos = j * 16 + l;
+                        let q2 = ((qs[pos / 4] >> ((pos % 4) * 2)) & 0x3) as f32;
+                        acc += (d_sc * q2 - d_mn) * vec[x_base + pos];
+                    }
+                }
+            }
+            acc
+        })
+        .collect()
+}
+
+/// Q3_K matrix-vector multiply (scalar, rayon-parallel over rows).
+///
+/// Super-block layout (110 bytes per 256 elements):
+///   [hmask u8×32] [qs u8×64] [scales u8×12] [f16 d]
+fn matvec_q3_k_scalar(data: &[u8], rows: usize, cols: usize, vec: &[f32]) -> Vec<f32> {
+    const SUPER_BLOCK: usize = 256;
+    const BLOCK_BYTES: usize = 110;
+
+    let n_super = cols / SUPER_BLOCK;
+    let bytes_per_row = n_super * BLOCK_BYTES;
+
+    (0..rows)
+        .into_par_iter()
+        .map(|r| {
+            let mut acc = 0.0f32;
+            let row = &data[r * bytes_per_row..];
+            for sb in 0..n_super {
+                let b = &row[sb * BLOCK_BYTES..];
+                let hmask  = &b[0..32];
+                let qs     = &b[32..96];
+                let sc_raw = &b[96..108];
+                let d = f16::from_le_bytes([b[108], b[109]]).to_f32();
+                let x_base = sb * SUPER_BLOCK;
+
+                let mut lscales = [0i32; 16];
+                for j in 0..16_usize {
+                    let g = j / 4;
+                    let k = j % 4;
+                    let low4  = (sc_raw[3 * g + k / 2] >> ((k % 2) * 4)) & 0xF;
+                    let high2 = (sc_raw[3 * g + 2] >> (k * 2)) & 0x3;
+                    lscales[j] = (low4 | (high2 << 4)) as i32 - 32;
+                }
+
+                for j in 0..16_usize {
+                    let dl = d * lscales[j] as f32;
+                    for l in 0..16_usize {
+                        let pos = j * 16 + l;
+                        let lo2 = (qs[pos / 4] >> ((pos % 4) * 2)) & 0x3;
+                        let hi1 = (hmask[pos / 8] >> (pos % 8)) & 0x1;
+                        let q3  = (lo2 | (hi1 << 2)) as i32;
+                        acc += dl * (q3 - 4) as f32 * vec[x_base + pos];
+                    }
+                }
+            }
+            acc
+        })
+        .collect()
+}
+
+/// IQ4_NL matrix-vector multiply (scalar, rayon-parallel over rows).
+///
+/// Block layout (18 bytes per 32 elements):
+///   [f16 d] [qs u8×16]
+///
+/// Non-linear lookup table replaces the linear scale of Q4_0.
+fn matvec_iq4_nl_scalar(data: &[u8], rows: usize, cols: usize, vec: &[f32]) -> Vec<f32> {
+    const BLOCK_SIZE: usize = 32;
+    const BLOCK_BYTES: usize = 18;
+    const KVALUES: [i8; 16] = [
+        -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
+    ];
+
+    let n_blocks = cols / BLOCK_SIZE;
+    let bytes_per_row = n_blocks * BLOCK_BYTES;
+
+    (0..rows)
+        .into_par_iter()
+        .map(|r| {
+            let mut acc = 0.0f32;
+            let row = &data[r * bytes_per_row..];
+            for bi in 0..n_blocks {
+                let b = &row[bi * BLOCK_BYTES..];
+                let d  = f16::from_le_bytes([b[0], b[1]]).to_f32();
+                let qs = &b[2..18];
+                let x_base = bi * BLOCK_SIZE;
+                for i in 0..BLOCK_SIZE {
+                    let byte   = qs[i / 2];
+                    let nibble = if i % 2 == 0 { (byte & 0x0F) as usize } else { (byte >> 4) as usize };
+                    acc += d * KVALUES[nibble] as f32 * vec[x_base + i];
                 }
             }
             acc
@@ -800,6 +939,109 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Q2_K: verify scalar kernel matches dequantize-then-dot.
+    ///
+    /// d=1, dmin=0, all scales low-nibble=1, high-nibble=0; qs=0x55 → q2=1 for all.
+    /// Each element = 1*1 - 0 = 1. Expected sum = 256.
+    #[test]
+    fn test_q2_k_matvec_matches_dequantize() {
+        use crate::tensor::dequantize::dequantize;
+        use crate::model::gguf::GgmlType;
+
+        let mut block = vec![0u8; 84];
+        // scales[0..16]: low nibble=1 (sc=1), high nibble=0 (mn=0)
+        for i in 0..16 { block[i] = 0x01; }
+        // qs[16..80]: 0x55 → bits [1:0]=1, [3:2]=1, [5:4]=1, [7:6]=1 → q2=1 for all
+        for i in 16..80 { block[i] = 0x55; }
+        // d=1.0, dmin=0.0
+        block[80..82].copy_from_slice(&half::f16::from_f32(1.0).to_le_bytes());
+        // dmin stays 0.0 (already zero)
+
+        let input = vec![1.0f32; 256];
+        let deq = dequantize(&block, GgmlType::Q2K, 256);
+        let expected: f32 = deq.iter().zip(&input).map(|(a, b)| a * b).sum();
+
+        let result = matvec_q2_k_scalar(&block, 1, 256, &input);
+        assert!(
+            (result[0] - expected).abs() < 0.5,
+            "Q2_K matvec: got {}, expected {}", result[0], expected
+        );
+        assert!(
+            (result[0] - 256.0).abs() < 1.0,
+            "Q2_K expected ≈256, got {}", result[0]
+        );
+    }
+
+    /// Q3_K: verify scalar kernel matches dequantize-then-dot.
+    ///
+    /// d=1, all raw6 scale=36 (→ signed=4), qs=0xAA → lo2=2 for all, hmask=0xFF → hi1=1 for all.
+    /// q3 = 2 | (1<<2) = 6; value = 1 * 4 * (6-4) = 8. Expected sum = 256*8 = 2048.
+    #[test]
+    fn test_q3_k_matvec_matches_dequantize() {
+        use crate::tensor::dequantize::dequantize;
+        use crate::model::gguf::GgmlType;
+
+        let mut block = vec![0u8; 110];
+        // hmask[0..32]: all 0xFF → hi1=1 for all elements
+        for i in 0..32 { block[i] = 0xFF; }
+        // qs[32..96]: 0xAA = 0b10101010 → bits[1:0]=2, [3:2]=2, [5:4]=2, [7:6]=2
+        for i in 32..96 { block[i] = 0xAA; }
+        // scales[96..108]: encode raw6=36 for all 16 sub-groups (signed=+4)
+        // Group g (0..3), 4 values per group, packed into 3 bytes:
+        //   low4 = 36 & 0xF = 4, high2 = (36 >> 4) & 0x3 = 2
+        //   sc_raw[3g+0] = (4) | (4<<4) = 0x44  (scales 4g+0 and 4g+1 low nibbles)
+        //   sc_raw[3g+1] = (4) | (4<<4) = 0x44  (scales 4g+2 and 4g+3 low nibbles)
+        //   sc_raw[3g+2] = 2 | (2<<2) | (2<<4) | (2<<6) = 0b10101010 = 0xAA
+        for g in 0..4_usize {
+            block[96 + 3*g]     = 0x44;
+            block[96 + 3*g + 1] = 0x44;
+            block[96 + 3*g + 2] = 0xAA;
+        }
+        // d=1.0
+        block[108..110].copy_from_slice(&half::f16::from_f32(1.0).to_le_bytes());
+
+        let input = vec![1.0f32; 256];
+        let deq = dequantize(&block, GgmlType::Q3K, 256);
+        let expected: f32 = deq.iter().zip(&input).map(|(a, b)| a * b).sum();
+
+        let result = matvec_q3_k_scalar(&block, 1, 256, &input);
+        assert!(
+            (result[0] - expected).abs() < 0.5,
+            "Q3_K matvec: got {}, expected {}", result[0], expected
+        );
+        assert!(
+            (result[0] - 2048.0).abs() < 1.0,
+            "Q3_K expected ≈2048, got {}", result[0]
+        );
+    }
+
+    /// IQ4_NL: verify scalar kernel matches dequantize-then-dot.
+    ///
+    /// d=1, all qs=0x88 → all nibbles=8 → KVALUES[8]=1. Expected sum = 32*1 = 32.
+    #[test]
+    fn test_iq4_nl_matvec_matches_dequantize() {
+        use crate::tensor::dequantize::dequantize;
+        use crate::model::gguf::GgmlType;
+
+        let mut block = vec![0u8; 18];
+        block[0..2].copy_from_slice(&half::f16::from_f32(1.0).to_le_bytes());
+        for i in 2..18 { block[i] = 0x88; } // nibble=8 → KVALUES[8]=1
+
+        let input = vec![1.0f32; 32];
+        let deq = dequantize(&block, GgmlType::IQ4NL, 32);
+        let expected: f32 = deq.iter().zip(&input).map(|(a, b)| a * b).sum();
+
+        let result = matvec_iq4_nl_scalar(&block, 1, 32, &input);
+        assert!(
+            (result[0] - expected).abs() < 0.1,
+            "IQ4_NL matvec: got {}, expected {}", result[0], expected
+        );
+        assert!(
+            (result[0] - 32.0).abs() < 0.1,
+            "IQ4_NL expected 32.0, got {}", result[0]
+        );
     }
 
     /// Verify SIMD and scalar Q4_0 kernels produce the same output.

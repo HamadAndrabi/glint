@@ -19,6 +19,13 @@ pub struct ModelConfig {
     pub rope_freq_base: Option<f32>,
     /// Raw Jinja chat template from GGUF metadata (`tokenizer.chat_template`).
     pub chat_template: Option<String>,
+    /// Sliding window attention size (Mistral, some Qwen2 variants).
+    /// When set, each token attends to at most this many past positions.
+    pub sliding_window: Option<u32>,
+    /// RoPE scaling factor for extended-context models (Phi-3, Qwen2-long).
+    pub rope_scaling_factor: Option<f32>,
+    /// Partial rotary factor — fraction of head_dim to apply RoPE to (Phi-3).
+    pub partial_rotary_factor: Option<f32>,
 }
 
 impl ModelConfig {
@@ -55,6 +62,10 @@ impl ModelConfig {
         let feed_forward_length = get_u32("feed_forward_length");
         let rms_norm_eps = get_f32("attention.layer_norm_rms_epsilon").unwrap_or(1e-5);
         let rope_freq_base = get_f32("rope.freq_base");
+        let sliding_window = get_u32("sliding_window");
+        let rope_scaling_factor = get_f32("rope_scaling.factor")
+            .or_else(|| get_f32("rope.scaling.factor"));
+        let partial_rotary_factor = get_f32("partial_rotary_factor");
 
         let chat_template = metadata
             .get("tokenizer.chat_template")
@@ -73,6 +84,9 @@ impl ModelConfig {
             rms_norm_eps,
             rope_freq_base,
             chat_template,
+            sliding_window,
+            rope_scaling_factor,
+            partial_rotary_factor,
         })
     }
 
@@ -98,6 +112,12 @@ impl std::fmt::Display for ModelConfig {
         writeln!(f, "RMSNorm epsilon:    {:.0e}", self.rms_norm_eps)?;
         if let Some(base) = self.rope_freq_base {
             writeln!(f, "RoPE freq base:     {base}")?;
+        }
+        if let Some(w) = self.sliding_window {
+            writeln!(f, "Sliding window:     {w}")?;
+        }
+        if let Some(sf) = self.rope_scaling_factor {
+            writeln!(f, "RoPE scale factor:  {sf}")?;
         }
         Ok(())
     }

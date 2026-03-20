@@ -74,8 +74,12 @@ fn attention(
 
     // Apply RoPE to Q and K for current position
     let freq_base = config.rope_freq_base.unwrap_or(10000.0);
-    let q_all = tensor::rope(&q_all, pos, head_dim, freq_base);
-    let k_cur = tensor::rope(&k_cur, pos, head_dim, freq_base);
+    let rope_scaling = config.rope_scaling_factor.unwrap_or(1.0);
+    let rot_dim = config.partial_rotary_factor
+        .map(|f| (head_dim as f32 * f) as usize & !1)
+        .unwrap_or(head_dim);
+    let q_all = tensor::rope(&q_all, pos, head_dim, freq_base, rope_scaling, rot_dim);
+    let k_cur = tensor::rope(&k_cur, pos, head_dim, freq_base, rope_scaling, rot_dim);
 
     // Compute K and V for all positions we need to attend to (0..=pos)
     // In the no-cache version, we recompute K/V for all previous positions too
@@ -86,7 +90,7 @@ fn attention(
         let normed_p = tensor::rms_norm(hidden, &layer.attn_norm, config.rms_norm_eps);
         let k_p = layer.attn_k.matvec(normed_p.data());
         let v_p = layer.attn_v.matvec(normed_p.data());
-        k_cache.push(tensor::rope(&k_p, p, head_dim, freq_base));
+        k_cache.push(tensor::rope(&k_p, p, head_dim, freq_base, rope_scaling, rot_dim));
         v_cache.push(v_p);
     }
     k_cache.push(k_cur);
@@ -297,13 +301,21 @@ fn attention_cached(
 
     // Apply RoPE to Q and K
     let freq_base = config.rope_freq_base.unwrap_or(10000.0);
-    let q_all = tensor::rope(&q_all, pos, head_dim, freq_base);
-    let k_cur = tensor::rope(&k_cur, pos, head_dim, freq_base);
+    let rope_scaling = config.rope_scaling_factor.unwrap_or(1.0);
+    let rot_dim = config.partial_rotary_factor
+        .map(|f| (head_dim as f32 * f) as usize & !1)
+        .unwrap_or(head_dim);
+    let q_all = tensor::rope(&q_all, pos, head_dim, freq_base, rope_scaling, rot_dim);
+    let k_cur = tensor::rope(&k_cur, pos, head_dim, freq_base, rope_scaling, rot_dim);
 
     // Write current K/V into cache (before reading, so pos is included in the loop)
     cache.write(layer_idx, pos, k_cur.data(), v_cur.data());
 
-    let seq_len = pos + 1; // attend to positions 0..=pos
+    // For sliding-window attention (Mistral, some Qwen2), limit the lookback.
+    let window_start = config.sliding_window
+        .map(|w| (pos as i64 - w as i64 + 1).max(0) as usize)
+        .unwrap_or(0);
+    let attend_len = pos + 1 - window_start;
     let scale = 1.0 / (head_dim as f32).sqrt();
 
     let mut attn_output = vec![0.0f32; embed_dim];
@@ -318,7 +330,8 @@ fn attention_cached(
             cache,
             layer_idx,
             kv_h,
-            seq_len,
+            window_start,
+            attend_len,
             head_dim,
             scale,
             &mut attn_output[q_offset..q_offset + head_dim],
@@ -503,6 +516,9 @@ mod tests {
             rms_norm_eps: 1e-5,
             rope_freq_base: Some(10000.0),
             chat_template: None,
+            sliding_window: None,
+            rope_scaling_factor: None,
+            partial_rotary_factor: None,
         };
         // Use QuantizedTensor::from_f32 which encodes as F32 bytes — exact round-trip.
         let weights = TransformerWeights {

@@ -18,19 +18,22 @@ const BLOCK_SIZE: usize = 32;
 /// single tiled pass with no heap allocations.
 ///
 /// # Arguments
-/// * `q`        — query vector for this head, length `head_dim`
-/// * `cache`    — KV cache for all layers
-/// * `layer`    — transformer layer index
-/// * `kv_h`     — KV head index (for GQA/MQA, each Q head maps to one KV head)
-/// * `seq_len`  — number of positions to attend to (pos + 1)
-/// * `head_dim` — per-head dimension
-/// * `scale`    — pre-computed `1 / sqrt(head_dim)`
-/// * `out`      — output slice of length `head_dim`; **must be pre-zeroed**
+/// * `q`         — query vector for this head, length `head_dim`
+/// * `cache`     — KV cache for all layers
+/// * `layer`     — transformer layer index
+/// * `kv_h`      — KV head index (for GQA/MQA, each Q head maps to one KV head)
+/// * `start_pos` — first absolute cache position to attend to (0 for full attention,
+///                 `pos - window + 1` for sliding-window attention)
+/// * `seq_len`   — number of positions to attend to
+/// * `head_dim`  — per-head dimension
+/// * `scale`     — pre-computed `1 / sqrt(head_dim)`
+/// * `out`       — output slice of length `head_dim`; **must be pre-zeroed**
 pub fn flash_attn_1d(
     q: &[f32],
     cache: &KvCache,
     layer: usize,
     kv_h: usize,
+    start_pos: usize,
     seq_len: usize,
     head_dim: usize,
     scale: f32,
@@ -54,7 +57,7 @@ pub fn flash_attn_1d(
 
         // Phase 1 — Q · K scores for each position in the block
         for i in 0..block_len {
-            let k_row = cache.k_at(layer, start + i);
+            let k_row = cache.k_at(layer, start_pos + start + i);
             let k_head = &k_row[kv_h * head_dim..(kv_h + 1) * head_dim];
             let mut dot = 0.0f32;
             for d in 0..head_dim {
@@ -84,7 +87,7 @@ pub fn flash_attn_1d(
         // Phase 3 — incorporate this block's V contributions
         for i in 0..block_len {
             let e = (scores[i] - m_new).exp(); // always ≤ 1.0, no overflow
-            let v_row = cache.v_at(layer, start + i);
+            let v_row = cache.v_at(layer, start_pos + start + i);
             let v_head = &v_row[kv_h * head_dim..(kv_h + 1) * head_dim];
             for d in 0..head_dim {
                 out[d] += e * v_head[d];
@@ -183,7 +186,7 @@ mod tests {
         let expected = standard_attn(&q, &cache, 0, kv_h, seq_len, head_dim, scale);
 
         let mut got = vec![0.0f32; head_dim];
-        flash_attn_1d(&q, &cache, 0, kv_h, seq_len, head_dim, scale, &mut got);
+        flash_attn_1d(&q, &cache, 0, kv_h, 0, seq_len, head_dim, scale, &mut got);
 
         for d in 0..head_dim {
             let diff = (expected[d] - got[d]).abs();
