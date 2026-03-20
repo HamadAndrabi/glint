@@ -13,7 +13,8 @@
 
 use std::convert::Infallible;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::Ordering;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -91,6 +92,29 @@ pub async fn health() -> impl IntoResponse {
     Json(serde_json::json!({ "status": "ok" }))
 }
 
+// ── GET /v1/metrics ──────────────────────────────────────────────────────────
+
+/// Runtime metrics — requests, token throughput, average latency, uptime.
+pub async fn server_metrics(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let requests = state.metrics.requests_total.load(Ordering::Relaxed);
+    let tokens = state.metrics.tokens_generated.load(Ordering::Relaxed);
+    let total_ms = state.metrics.total_latency_ms.load(Ordering::Relaxed);
+    let uptime_secs = state.metrics.started_at.elapsed().as_secs();
+
+    let avg_latency_ms = if requests > 0 {
+        total_ms as f64 / requests as f64
+    } else {
+        0.0
+    };
+
+    Json(serde_json::json!({
+        "requests_total":  requests,
+        "tokens_generated": tokens,
+        "avg_latency_ms":  avg_latency_ms,
+        "uptime_secs":     uptime_secs,
+    }))
+}
+
 // ── GET /v1/models ────────────────────────────────────────────────────────────
 
 /// List the loaded model.
@@ -160,6 +184,7 @@ async fn non_streaming_completion(
     let weights = Arc::clone(&state.weights);
     let config = Arc::clone(&state.config);
 
+    let t0 = Instant::now();
     let result = tokio::task::spawn_blocking(move || {
         let mut sampler = Sampler::new(sampler_cfg);
         generate_cached(&weights, &config, &prompt_tokens, max_tokens, &mut sampler, eos)
@@ -169,10 +194,12 @@ async fn non_streaming_completion(
     match result {
         Err(_) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "Inference task panicked"),
         Ok(output_tokens) => {
+            let elapsed_ms = t0.elapsed().as_millis() as u64;
             let generated = &output_tokens[prompt_len..];
             // Re-clone tokenizer to decode (we moved it into spawn_blocking)
             let text = state.tokenizer.decode(generated);
             let completion_tokens = generated.len();
+            state.metrics.record(completion_tokens as u64, elapsed_ms);
 
             Json(CompletionResponse {
                 id: gen_id(),
@@ -209,9 +236,11 @@ async fn streaming_completion(
     // Spawn inference on the blocking thread pool
     let weights = Arc::clone(&state.weights);
     let config = Arc::clone(&state.config);
+    let prompt_len = prompt_tokens.len();
+    let state_m = Arc::clone(&state);
     tokio::task::spawn_blocking(move || {
         let mut sampler = Sampler::new(sampler_cfg);
-        generate_streaming(
+        let output = generate_streaming(
             &weights,
             &config,
             &prompt_tokens,
@@ -223,6 +252,8 @@ async fn streaming_completion(
                 tx.blocking_send(token_id).is_ok()
             },
         );
+        let n_gen = output.len().saturating_sub(prompt_len);
+        state_m.metrics.record(n_gen as u64, 0);
     });
 
     // Wrap the receiver in a Stream and map each token_id to an SSE Event
@@ -307,6 +338,7 @@ pub async fn chat_completions(
         let weights = Arc::clone(&state.weights);
         let config = Arc::clone(&state.config);
 
+        let t0 = Instant::now();
         let result = tokio::task::spawn_blocking(move || {
             let mut sampler = Sampler::new(sampler_cfg);
             generate_cached(&weights, &config, &prompt_tokens, max_tokens, &mut sampler, eos)
@@ -316,9 +348,11 @@ pub async fn chat_completions(
         match result {
             Err(_) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "Inference task panicked"),
             Ok(output_tokens) => {
+                let elapsed_ms = t0.elapsed().as_millis() as u64;
                 let generated = &output_tokens[prompt_len..];
                 let text = state.tokenizer.decode(generated);
                 let completion_tokens = generated.len();
+                state.metrics.record(completion_tokens as u64, elapsed_ms);
 
                 Json(ChatCompletionResponse {
                     id: gen_id(),

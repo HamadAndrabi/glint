@@ -12,7 +12,7 @@ use glint::model::gguf::GgufModel;
 use glint::model::pull::{pull_model, search_huggingface};
 use glint::model::tokenizer::Tokenizer;
 use glint::sampling::{Sampler, SamplerConfig};
-use glint::server::AppState;
+use glint::server::{AppState, Metrics};
 use glint::transformer::{TransformerWeights, generate_cached, generate_greedy_cached, generate_streaming};
 
 #[derive(Parser)]
@@ -670,6 +670,7 @@ async fn serve_model(path: &PathBuf, host: &str, port: u16) {
         config: Arc::new(config),
         model_name,
         chat_template,
+        metrics: Metrics::new(),
     };
 
     glint::server::run_server(state, host, port).await;

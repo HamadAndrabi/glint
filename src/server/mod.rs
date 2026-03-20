@@ -3,6 +3,7 @@
 //! Exposes these endpoints:
 //!   GET  /health                    — health check (returns 200 OK)
 //!   GET  /v1/models                 — list the loaded model
+//!   GET  /v1/metrics                — runtime metrics (requests, tokens, latency, uptime)
 //!   POST /v1/completions            — text completion (streaming or not)
 //!   POST /v1/chat/completions       — chat completion (streaming or not)
 //!   POST /v1/embeddings             — text embedding (mean-pooled hidden states)
@@ -15,7 +16,7 @@ mod routes;
 mod state;
 mod types;
 
-pub use state::AppState;
+pub use state::{AppState, Metrics};
 
 use std::sync::Arc;
 
@@ -41,6 +42,7 @@ pub async fn run_server(state: AppState, host: &str, port: u16) {
     let app = Router::new()
         .route("/health", get(routes::health))
         .route("/v1/models", get(routes::list_models))
+        .route("/v1/metrics", get(routes::server_metrics))
         .route("/v1/completions", post(routes::completions))
         .route("/v1/chat/completions", post(routes::chat_completions))
         .route("/v1/embeddings", post(routes::embeddings))
@@ -51,6 +53,7 @@ pub async fn run_server(state: AppState, host: &str, port: u16) {
     eprintln!("Glint server listening on http://{addr}");
     eprintln!("  GET  http://{addr}/health");
     eprintln!("  GET  http://{addr}/v1/models");
+    eprintln!("  GET  http://{addr}/v1/metrics");
     eprintln!("  POST http://{addr}/v1/completions");
     eprintln!("  POST http://{addr}/v1/chat/completions");
     eprintln!("  POST http://{addr}/v1/embeddings");
