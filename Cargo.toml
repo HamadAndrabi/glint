@@ -5,6 +5,15 @@ edition = "2021"
 description = "A production-grade LLM inference engine built from scratch in Rust"
 license = "MIT"
 
+[lib]
+name = "glint"
+crate-type = ["rlib"]  # maturin adds cdylib automatically when building the Python extension
+
+[features]
+# Enable PyO3 Python extension module. Build with: cargo build --features python
+# or let maturin handle it via pyproject.toml.
+python = ["pyo3/extension-module"]
+
 [dependencies]
 # Memory-mapped file I/O — lets us map the GGUF file directly into virtual memory
 # instead of reading it all into the heap. The OS handles paging data in/out.
@@ -51,6 +60,9 @@ indicatif = "0.17"
 
 # Cross-platform user/cache directory paths (e.g. ~/.cache or %LOCALAPPDATA%).
 dirs = "5"
+
+# Python bindings — only compiled when the `python` feature is enabled.
+pyo3 = { version = "0.22", optional = true }
 
 [dev-dependencies]
 # Creates temporary files/directories for tests that auto-clean on drop.

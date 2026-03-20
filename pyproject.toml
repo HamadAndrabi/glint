@@ -1,0 +1,16 @@
+[build-system]
+requires = ["maturin>=1.4,<2"]
+build-backend = "maturin"
+
+[project]
+name = "glint"
+version = "0.1.0"
+description = "CPU-based LLM inference engine — Python bindings for Glint"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+
+[tool.maturin]
+# Rust feature that enables the PyO3 extension-module linker flag
+features = ["python"]
+# The Python module init function lives in src/python.rs (#[pymodule] fn glint)
+module-name = "glint"
