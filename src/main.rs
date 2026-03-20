@@ -13,7 +13,7 @@ use glint::model::pull::{pull_model, search_huggingface};
 use glint::model::tokenizer::Tokenizer;
 use glint::sampling::{Sampler, SamplerConfig};
 use glint::server::{AppState, Metrics};
-use glint::transformer::{TransformerWeights, generate_cached, generate_greedy_cached, generate_streaming};
+use glint::transformer::{TransformerWeights, generate_cached, generate_greedy_cached, generate_streaming, speculative_decode};
 
 #[derive(Parser)]
 #[command(name = "glint")]
@@ -73,6 +73,14 @@ enum Commands {
         /// Random seed for reproducible sampling.
         #[arg(long)]
         seed: Option<u64>,
+
+        /// Path to a small draft model for speculative decoding (optional).
+        #[arg(long)]
+        draft_model: Option<PathBuf>,
+
+        /// Number of tokens the draft model generates per verification round.
+        #[arg(long, default_value_t = 4)]
+        lookahead: usize,
     },
 
     /// Generate tokens from raw token IDs (for debugging).
@@ -177,9 +185,11 @@ async fn main() {
             top_p,
             repeat_penalty,
             seed,
+            draft_model,
+            lookahead,
         } => {
             let file = maybe_download(&file).await;
-            run_model(&file, &prompt, max_tokens, temperature, top_k, top_p, repeat_penalty, seed);
+            run_model(&file, &prompt, max_tokens, temperature, top_k, top_p, repeat_penalty, seed, draft_model.as_deref(), lookahead);
         }
         Commands::Generate {
             file,
@@ -307,6 +317,8 @@ fn run_model(
     top_p: f32,
     repeat_penalty: f32,
     seed: Option<u64>,
+    draft_path: Option<&Path>,
+    lookahead: usize,
 ) {
     let model = match GgufModel::load(path) {
         Ok(m) => m,
@@ -354,7 +366,28 @@ fn run_model(
     eprintln!("Generating...\n");
     let start = Instant::now();
 
-    let output = if use_sampling {
+    let output = if let Some(draft_path) = draft_path {
+        // Speculative decoding path
+        let draft_model = match GgufModel::load(draft_path) {
+            Ok(m) => m,
+            Err(e) => { eprintln!("Error loading draft model: {e}"); std::process::exit(1); }
+        };
+        let draft_config = match ModelConfig::from_metadata(&draft_model.metadata) {
+            Some(c) => c,
+            None => { eprintln!("Error: could not extract draft model config"); std::process::exit(1); }
+        };
+        let draft_weights = match TransformerWeights::load(&draft_model, &draft_config) {
+            Ok(w) => w,
+            Err(e) => { eprintln!("Error loading draft weights: {e}"); std::process::exit(1); }
+        };
+        eprintln!("Speculative decoding: lookahead={lookahead}");
+        speculative_decode(
+            &draft_weights, &draft_config,
+            &weights, &config,
+            &prompt_tokens, max_tokens, lookahead, temperature,
+            tokenizer.eos_token_id,
+        )
+    } else if use_sampling {
         let mut sampler = Sampler::new(SamplerConfig {
             temperature,
             top_k,
