@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Glint — In-Browser LLM Inference</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:      #0f1117;
+      --surface: #1a1d27;
+      --border:  #2a2d3a;
+      --accent:  #6c8fff;
+      --text:    #e2e8f0;
+      --muted:   #64748b;
+      --green:   #4ade80;
+      --red:     #f87171;
+      font-family: 'Inter', system-ui, sans-serif;
+    }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 2rem 1rem;
+    }
+
+    header {
+      text-align: center;
+      margin-bottom: 2rem;
+    }
+    header h1 { font-size: 2rem; letter-spacing: -0.5px; }
+    header h1 span { color: var(--accent); }
+    header p  { color: var(--muted); margin-top: 0.4rem; font-size: 0.95rem; }
+
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 1.5rem;
+      width: 100%;
+      max-width: 720px;
+      margin-bottom: 1rem;
+    }
+
+    label { display: block; font-size: 0.85rem; color: var(--muted); margin-bottom: 0.4rem; }
+
+    .file-row {
+      display: flex;
+      gap: 0.75rem;
+      align-items: center;
+    }
+    .file-row input[type="file"] { flex: 1; color: var(--muted); font-size: 0.9rem; }
+    #load-status {
+      font-size: 0.85rem;
+      padding: 0.3rem 0.7rem;
+      border-radius: 6px;
+      background: var(--border);
+      white-space: nowrap;
+    }
+    #load-status.ok  { color: var(--green); }
+    #load-status.err { color: var(--red); }
+
+    .params {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1rem;
+      margin-top: 1rem;
+    }
+    .param-group input[type="range"] { width: 100%; accent-color: var(--accent); }
+    .param-group .row { display: flex; justify-content: space-between; }
+    .param-group .row span { font-size: 0.8rem; color: var(--accent); }
+
+    textarea {
+      width: 100%;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      color: var(--text);
+      font-size: 0.95rem;
+      padding: 0.75rem;
+      resize: vertical;
+      outline: none;
+      font-family: inherit;
+    }
+    textarea:focus { border-color: var(--accent); }
+
+    button {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.4rem;
+      background: var(--accent);
+      color: #fff;
+      border: none;
+      border-radius: 8px;
+      padding: 0.6rem 1.4rem;
+      font-size: 0.95rem;
+      cursor: pointer;
+      transition: opacity .15s;
+      font-weight: 500;
+    }
+    button:hover   { opacity: 0.88; }
+    button:active  { opacity: 0.75; }
+    button:disabled { opacity: 0.4; cursor: not-allowed; }
+
+    #output-box {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 0.75rem;
+      min-height: 120px;
+      font-size: 0.95rem;
+      white-space: pre-wrap;
+      word-break: break-word;
+      color: var(--text);
+    }
+    #output-box .prompt-text { color: var(--muted); }
+    #output-box .gen-text    { color: var(--green); }
+
+    .stats { font-size: 0.8rem; color: var(--muted); margin-top: 0.5rem; }
+
+    footer {
+      margin-top: 2rem;
+      font-size: 0.8rem;
+      color: var(--muted);
+      text-align: center;
+    }
+    footer a { color: var(--accent); text-decoration: none; }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1><span>Glint</span> — In-Browser LLM</h1>
+  <p>100% client-side inference · no server · powered by WebAssembly</p>
+</header>
+
+<!-- Step 1: Load model -->
+<div class="card">
+  <label>1 · Load a GGUF model file</label>
+  <div class="file-row">
+    <input type="file" id="model-file" accept=".gguf" />
+    <span id="load-status">no model loaded</span>
+  </div>
+  <p style="margin-top:.6rem;font-size:.8rem;color:var(--muted)">
+    Tip: use a small quantized model like <code>SmolLM2-135M-Q8_0.gguf</code>
+    (~135 MB) for fast loading.  The file never leaves your browser.
+  </p>
+</div>
+
+<!-- Step 2: Configure & generate -->
+<div class="card">
+  <label>2 · Prompt</label>
+  <textarea id="prompt" rows="4" placeholder="The meaning of life is">The capital of France is</textarea>
+
+  <div class="params">
+    <div class="param-group">
+      <div class="row">
+        <label>Max tokens</label>
+        <span id="max-tokens-val">64</span>
+      </div>
+      <input type="range" id="max-tokens" min="8" max="512" step="8" value="64"
+             oninput="document.getElementById('max-tokens-val').textContent=this.value" />
+    </div>
+    <div class="param-group">
+      <div class="row">
+        <label>Temperature</label>
+        <span id="temperature-val">0.80</span>
+      </div>
+      <input type="range" id="temperature" min="0" max="2" step="0.05" value="0.80"
+             oninput="document.getElementById('temperature-val').textContent=parseFloat(this.value).toFixed(2)" />
+    </div>
+  </div>
+
+  <div style="margin-top:1rem">
+    <button id="run-btn" disabled onclick="runGenerate()">&#9654; Generate</button>
+  </div>
+</div>
+
+<!-- Output -->
+<div class="card">
+  <label>Output</label>
+  <div id="output-box"><span style="color:var(--muted)">Output will appear here…</span></div>
+  <div class="stats" id="stats"></div>
+</div>
+
+<footer>
+  Built with <a href="https://github.com/rustwasm/wasm-bindgen">wasm-bindgen</a> ·
+  Source: <a href="https://github.com/">glint</a>
+</footer>
+
+<script type="module">
+  import init, { GlintModel, init_panic_hook } from './pkg/glint.js';
+
+  let model = null;
+
+  // Initialise the WASM module on page load
+  await init();
+  init_panic_hook();
+
+  // File picker → load model bytes → parse
+  document.getElementById('model-file').addEventListener('change', async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+
+    const status = document.getElementById('load-status');
+    const btn    = document.getElementById('run-btn');
+    status.textContent = 'Loading…';
+    status.className   = '';
+    btn.disabled       = true;
+
+    try {
+      const buf   = await file.arrayBuffer();
+      const bytes = new Uint8Array(buf);
+      const t0    = performance.now();
+      model       = new GlintModel(bytes);
+      const ms    = (performance.now() - t0).toFixed(0);
+      status.textContent = `✓ loaded in ${ms} ms`;
+      status.className   = 'ok';
+      btn.disabled       = false;
+    } catch (err) {
+      status.textContent = `✗ ${err}`;
+      status.className   = 'err';
+    }
+  });
+
+  window.runGenerate = function () {
+    if (!model) return;
+
+    const prompt      = document.getElementById('prompt').value;
+    const maxTokens   = parseInt(document.getElementById('max-tokens').value);
+    const temperature = parseFloat(document.getElementById('temperature').value);
+    const outBox      = document.getElementById('output-box');
+    const statsEl     = document.getElementById('stats');
+
+    outBox.innerHTML = `<span class="prompt-text">${escHtml(prompt)}</span>`;
+    statsEl.textContent = 'Generating…';
+
+    // Run inference off the main thread via setTimeout to let the UI update
+    setTimeout(() => {
+      try {
+        const t0  = performance.now();
+        const out = model.generate(prompt, maxTokens, temperature);
+        const ms  = performance.now() - t0;
+        const tps = (out.split(/\s+/).length / (ms / 1000)).toFixed(1);
+
+        outBox.innerHTML =
+          `<span class="prompt-text">${escHtml(prompt)}</span>` +
+          `<span class="gen-text">${escHtml(out)}</span>`;
+        statsEl.textContent = `${out.length} chars · ${ms.toFixed(0)} ms · ~${tps} words/s`;
+      } catch (err) {
+        outBox.innerHTML = `<span style="color:var(--red)">Error: ${escHtml(String(err))}</span>`;
+        statsEl.textContent = '';
+      }
+    }, 10);
+  };
+
+  function escHtml(str) {
+    return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  }
+</script>
+
+</body>
+</html>
