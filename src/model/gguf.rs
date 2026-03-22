@@ -563,9 +563,26 @@ impl<'a> Cursor<'a> {
 const GGUF_MAGIC: u32 = 0x4655_4747; // 'G','G','U','F' as little-endian u32
 const DEFAULT_ALIGNMENT: u64 = 32;
 
-/// A loaded GGUF model backed by memory-mapped I/O.
+/// Backing storage for a `GgufModel` — either memory-mapped (native) or
+/// heap-owned (WASM / in-memory usage via `GgufModel::from_bytes`).
+enum GgufData {
+    Mmap(Mmap),
+    Owned(Box<[u8]>),
+}
+
+impl GgufData {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            GgufData::Mmap(m)  => m,
+            GgufData::Owned(b) => b,
+        }
+    }
+}
+
+/// A loaded GGUF model.  Backed by a memory map on native platforms or
+/// heap-owned bytes when loaded via `GgufModel::from_bytes` (e.g. WASM).
 pub struct GgufModel {
-    mmap: Mmap,
+    data: GgufData,
     pub metadata: HashMap<String, MetadataValue>,
     pub tensor_infos: Vec<TensorInfo>,
     tensor_index: HashMap<String, usize>,
@@ -577,7 +594,7 @@ impl std::fmt::Debug for GgufModel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GgufModel")
             .field("version", &self.version)
-            .field("file_size", &self.mmap.len())
+            .field("data_size", &self.data.as_slice().len())
             .field("tensor_count", &self.tensor_infos.len())
             .field("metadata_count", &self.metadata.len())
             .field("tensor_data_offset", &self.tensor_data_offset)
@@ -586,13 +603,10 @@ impl std::fmt::Debug for GgufModel {
 }
 
 impl GgufModel {
-    /// Load and parse a GGUF model file.
-    pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let file = File::open(path.as_ref())?;
-        let mmap = unsafe { Mmap::map(&file)? };
-        let mut cursor = Cursor::new(&mmap);
+    /// Shared header + metadata + tensor-info parsing from any byte slice.
+    fn parse(bytes: &[u8]) -> Result<(u32, HashMap<String, MetadataValue>, Vec<TensorInfo>, HashMap<String, usize>, usize)> {
+        let mut cursor = Cursor::new(bytes);
 
-        // Header
         let magic = cursor.read_u32()?;
         if magic != GGUF_MAGIC {
             return Err(GgufError::InvalidMagic(magic));
@@ -603,17 +617,15 @@ impl GgufModel {
             return Err(GgufError::UnsupportedVersion(version));
         }
 
-        let tensor_count = cursor.read_u64()? as usize;
+        let tensor_count      = cursor.read_u64()? as usize;
         let metadata_kv_count = cursor.read_u64()? as usize;
 
-        // Metadata KV pairs
         let mut metadata = HashMap::with_capacity(metadata_kv_count);
         for _ in 0..metadata_kv_count {
             let (key, value) = cursor.read_metadata_kv()?;
             metadata.insert(key, value);
         }
 
-        // Tensor info directory
         let mut tensor_infos = Vec::with_capacity(tensor_count);
         let mut tensor_index = HashMap::with_capacity(tensor_count);
         for i in 0..tensor_count {
@@ -622,21 +634,39 @@ impl GgufModel {
             tensor_infos.push(info);
         }
 
-        // Tensor data starts at the next alignment boundary after header+metadata+tensor_infos
         let alignment = metadata
             .get("general.alignment")
             .and_then(|v| v.as_u32())
             .unwrap_or(DEFAULT_ALIGNMENT as u32) as u64;
 
         let tensor_data_offset = align_offset(cursor.pos as u64, alignment) as usize;
+        Ok((version, metadata, tensor_infos, tensor_index, tensor_data_offset))
+    }
 
+    /// Load and parse a GGUF model file via memory-mapped I/O (zero-copy).
+    pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let file = File::open(path.as_ref())?;
+        let mmap = unsafe { Mmap::map(&file)? };
+        let (version, metadata, tensor_infos, tensor_index, tensor_data_offset) =
+            Self::parse(&mmap)?;
         Ok(Self {
-            mmap,
-            metadata,
-            tensor_infos,
-            tensor_index,
-            tensor_data_offset,
-            version,
+            data: GgufData::Mmap(mmap),
+            metadata, tensor_infos, tensor_index, tensor_data_offset, version,
+        })
+    }
+
+    /// Parse a GGUF model from an in-memory byte buffer.
+    ///
+    /// Use this on WASM where filesystem access is unavailable: fetch the
+    /// `.gguf` file as an `ArrayBuffer` in JS, pass it to Rust as `Vec<u8>`.
+    ///
+    /// The data is moved into the model struct — no extra copy is made.
+    pub fn from_bytes(bytes: Vec<u8>) -> Result<Self> {
+        let (version, metadata, tensor_infos, tensor_index, tensor_data_offset) =
+            Self::parse(&bytes)?;
+        Ok(Self {
+            data: GgufData::Owned(bytes.into_boxed_slice()),
+            metadata, tensor_infos, tensor_index, tensor_data_offset, version,
         })
     }
 
@@ -669,15 +699,16 @@ impl GgufModel {
         let size = info.data_size();
         let end = start + size;
 
-        if end > self.mmap.len() {
+        let raw = self.data.as_slice();
+        if end > raw.len() {
             return Err(GgufError::UnexpectedEof {
                 offset: start,
                 needed: size,
-                available: self.mmap.len() - start,
+                available: raw.len() - start,
             });
         }
 
-        Ok(&self.mmap[start..end])
+        Ok(&raw[start..end])
     }
 
     pub fn tensor_count(&self) -> usize {

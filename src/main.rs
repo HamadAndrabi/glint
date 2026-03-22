@@ -85,6 +85,10 @@ enum Commands {
         /// Path to a LoRA adapter GGUF file (optional).
         #[arg(long)]
         lora: Option<PathBuf>,
+
+        /// Use GPU acceleration (requires `vulkan` feature).
+        #[arg(long, default_value_t = false)]
+        gpu: bool,
     },
 
     /// Generate tokens from raw token IDs (for debugging).
@@ -139,6 +143,10 @@ enum Commands {
         /// Path to a LoRA adapter GGUF file (optional).
         #[arg(long)]
         lora: Option<PathBuf>,
+
+        /// Use GPU acceleration (requires `vulkan` feature).
+        #[arg(long, default_value_t = false)]
+        gpu: bool,
     },
 
     /// Start the OpenAI-compatible HTTP inference server.
@@ -154,6 +162,10 @@ enum Commands {
         /// Host/IP to bind to. Use 0.0.0.0 to accept external connections.
         #[arg(long, default_value = "127.0.0.1")]
         host: String,
+
+        /// Use GPU acceleration (requires `vulkan` feature).
+        #[arg(long, default_value_t = false)]
+        gpu: bool,
     },
 
     /// Download a GGUF model from HuggingFace Hub.
@@ -196,9 +208,10 @@ async fn main() {
             draft_model,
             lookahead,
             lora,
+            gpu,
         } => {
             let file = maybe_download(&file).await;
-            run_model(&file, &prompt, max_tokens, temperature, top_k, top_p, repeat_penalty, seed, draft_model.as_deref(), lookahead, lora.as_deref());
+            run_model(&file, &prompt, max_tokens, temperature, top_k, top_p, repeat_penalty, seed, draft_model.as_deref(), lookahead, lora.as_deref(), gpu);
         }
         Commands::Generate {
             file,
@@ -208,14 +221,14 @@ async fn main() {
             generate_tokens(&file, &tokens, max_tokens);
         }
         Commands::Chat {
-            file, system, max_tokens, temperature, top_k, top_p, repeat_penalty, seed, lora,
+            file, system, max_tokens, temperature, top_k, top_p, repeat_penalty, seed, lora, gpu,
         } => {
             let file = maybe_download(&file).await;
-            chat_model(&file, system.as_deref(), max_tokens, temperature, top_k, top_p, repeat_penalty, seed, lora.as_deref());
+            chat_model(&file, system.as_deref(), max_tokens, temperature, top_k, top_p, repeat_penalty, seed, lora.as_deref(), gpu);
         }
-        Commands::Serve { file, port, host } => {
+        Commands::Serve { file, port, host, gpu } => {
             let file = maybe_download(&file).await;
-            serve_model(&file, &host, port).await;
+            serve_model(&file, &host, port, gpu).await;
         }
         Commands::Pull { repo, file, dir } => {
             pull_model_cmd(&repo, &file, dir.as_deref()).await;
@@ -316,6 +329,39 @@ fn inspect_model(path: &PathBuf, show_metadata: bool, show_tensors: bool) {
     }
 }
 
+/// Initialize GPU backend if requested and the `vulkan` feature is enabled.
+///
+/// Returns `Some(GpuBackend)` with weights uploaded, or `None` if GPU is not
+/// requested / not available. Prints a warning if `--gpu` is passed without
+/// the `vulkan` feature compiled in.
+fn init_gpu(use_gpu: bool, _weights: &mut TransformerWeights) -> Option<glint::backend::GpuBackend> {
+    if !use_gpu {
+        return None;
+    }
+
+    #[cfg(feature = "vulkan")]
+    {
+        match glint::backend::GpuBackend::new() {
+            Ok(mut gpu) => {
+                _weights.upload_all_to_gpu(&mut gpu);
+                eprintln!("GPU backend initialized.");
+                Some(gpu)
+            }
+            Err(e) => {
+                eprintln!("Warning: GPU initialization failed ({e}), falling back to CPU.");
+                None
+            }
+        }
+    }
+
+    #[cfg(not(feature = "vulkan"))]
+    {
+        eprintln!("Warning: --gpu requires the `vulkan` feature. Build with: cargo build --features vulkan");
+        eprintln!("Continuing on CPU.");
+        None
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_model(
     path: &PathBuf,
@@ -329,6 +375,7 @@ fn run_model(
     draft_path: Option<&Path>,
     lookahead: usize,
     lora_path: Option<&Path>,
+    use_gpu: bool,
 ) {
     let model = match GgufModel::load(path) {
         Ok(m) => m,
@@ -362,13 +409,17 @@ fn run_model(
         Ok(w) => w,
         Err(e) => { eprintln!("Error: {e}"); std::process::exit(1); }
     };
-    let weights = if let Some(lp) = lora_path {
+    let mut weights = if let Some(lp) = lora_path {
         let lora_model = match GgufModel::load(lp) {
             Ok(m) => m,
             Err(e) => { eprintln!("Error loading LoRA file: {e}"); std::process::exit(1); }
         };
         weights.with_lora(&lora_model)
     } else { weights };
+
+    // GPU initialization
+    let mut gpu_backend = init_gpu(use_gpu, &mut weights);
+    let mut gpu: Option<&mut glint::backend::GpuBackend> = gpu_backend.as_mut();
 
     let use_sampling = temperature > 0.0;
     if use_sampling {
@@ -403,6 +454,7 @@ fn run_model(
             &weights, &config,
             &prompt_tokens, max_tokens, lookahead, temperature,
             tokenizer.eos_token_id,
+            &mut gpu,
         )
     } else if use_sampling {
         let mut sampler = Sampler::new(SamplerConfig {
@@ -413,9 +465,9 @@ fn run_model(
             seed,
             ..Default::default()
         });
-        generate_cached(&weights, &config, &prompt_tokens, max_tokens, &mut sampler, tokenizer.eos_token_id)
+        generate_cached(&weights, &config, &prompt_tokens, max_tokens, &mut sampler, tokenizer.eos_token_id, &mut gpu)
     } else {
-        generate_greedy_cached(&weights, &config, &prompt_tokens, max_tokens)
+        generate_greedy_cached(&weights, &config, &prompt_tokens, max_tokens, &mut gpu)
     };
 
     let elapsed = start.elapsed();
@@ -462,7 +514,7 @@ fn generate_tokens(path: &PathBuf, tokens_str: &str, max_tokens: usize) {
     };
 
     eprintln!("Generating...");
-    let output = generate_greedy_cached(&weights, &config, &prompt_tokens, max_tokens);
+    let output = generate_greedy_cached(&weights, &config, &prompt_tokens, max_tokens, &mut None);
 
     println!("\n═══ Output Tokens ═══");
     println!("{:?}", output);
@@ -507,7 +559,7 @@ fn summarize_messages(
         ..Default::default()
     });
     let output = generate_cached(
-        weights, config, &prompt_tokens, gen_tokens, &mut sampler, tokenizer.eos_token_id,
+        weights, config, &prompt_tokens, gen_tokens, &mut sampler, tokenizer.eos_token_id, &mut None,
     );
     tokenizer.decode(&output[prompt_tokens.len()..]).trim().to_string()
 }
@@ -523,6 +575,7 @@ fn chat_model(
     repeat_penalty: f32,
     seed: Option<u64>,
     lora_path: Option<&Path>,
+    use_gpu: bool,
 ) {
     let model = match GgufModel::load(path) {
         Ok(m) => m,
@@ -549,13 +602,16 @@ fn chat_model(
         Ok(w) => w,
         Err(e) => { eprintln!("Error: {e}"); std::process::exit(1); }
     };
-    let weights = if let Some(lp) = lora_path {
+    let mut weights = if let Some(lp) = lora_path {
         let lora_model = match GgufModel::load(lp) {
             Ok(m) => m,
             Err(e) => { eprintln!("Error loading LoRA file: {e}"); std::process::exit(1); }
         };
         weights.with_lora(&lora_model)
     } else { weights };
+
+    let mut gpu_backend = init_gpu(use_gpu, &mut weights);
+    let mut gpu: Option<&mut glint::backend::GpuBackend> = gpu_backend.as_mut();
 
     let chat_template = config.chat_template.as_deref()
         .map(ChatTemplate::detect)
@@ -669,6 +725,7 @@ fn chat_model(
                 io::stdout().flush().ok();
                 true
             },
+            &mut gpu,
         );
         println!();
 
@@ -681,7 +738,7 @@ fn chat_model(
     eprintln!("\nGoodbye!");
 }
 
-async fn serve_model(path: &PathBuf, host: &str, port: u16) {
+async fn serve_model(path: &PathBuf, host: &str, port: u16, use_gpu: bool) {
     let model = match GgufModel::load(path) {
         Ok(m) => m,
         Err(e) => {
@@ -709,6 +766,9 @@ async fn serve_model(path: &PathBuf, host: &str, port: u16) {
     };
     eprintln!("Weights loaded.");
 
+    let mut weights = weights; // make mutable for GPU upload
+    let gpu_backend = init_gpu(use_gpu, &mut weights);
+
     // Derive a model name from the file stem (e.g. "smollm-135m-instruct.Q8_0")
     let model_name = path
         .file_stem()
@@ -729,6 +789,7 @@ async fn serve_model(path: &PathBuf, host: &str, port: u16) {
         model_name,
         chat_template,
         metrics: Metrics::new(),
+        gpu: gpu_backend.map(|g| Arc::new(std::sync::Mutex::new(g))),
     };
 
     glint::server::run_server(state, host, port).await;

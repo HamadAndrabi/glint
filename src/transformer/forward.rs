@@ -1,13 +1,74 @@
 //! Decoder-only transformer forward pass (LLaMA-style).
 
+#[cfg(feature = "rayon")]
 use rayon::prelude::*;
 
+use crate::backend::GpuBackend;
 use crate::cache::{KvCache, KvCacheQ8, KvStore};
 use crate::model::config::ModelConfig;
 use crate::model::lora::LoraLayerAdapters;
 use crate::sampling::Sampler;
-use crate::tensor::{self, Tensor};
+use crate::tensor::{self, QuantizedTensor, Tensor};
 use super::weights::{LayerWeights, TransformerWeights};
+
+// ── GPU dispatch helpers ──────────────────────────────────────────────────────
+
+/// Reborrow `Option<&mut GpuBackend>` so it can be used multiple times.
+fn reborrow<'a>(gpu: &'a mut Option<&mut GpuBackend>) -> Option<&'a mut GpuBackend> {
+    gpu.as_mut().map(|g| &mut **g)
+}
+
+/// Matvec that dispatches to GPU when available, CPU otherwise.
+fn matvec_maybe_gpu(
+    qt: &QuantizedTensor,
+    input: &[f32],
+    gpu: Option<&mut GpuBackend>,
+) -> Tensor {
+    #[cfg(feature = "vulkan")]
+    if let Some(g) = gpu {
+        return qt.matvec_gpu(input, g);
+    }
+    let _ = gpu;
+    qt.matvec(input)
+}
+
+/// RMS normalization — GPU when available, CPU otherwise.
+#[cfg(feature = "vulkan")]
+fn rms_norm_maybe_gpu(
+    x: &Tensor,
+    weight: &Tensor,
+    eps: f32,
+    gpu: Option<&GpuBackend>,
+) -> Tensor {
+    if let Some(g) = gpu {
+        if let Ok(data) = g.rms_norm(x.data(), weight.data(), eps) {
+            return Tensor::from_vec(data, x.shape());
+        }
+    }
+    tensor::rms_norm(x, weight, eps)
+}
+
+/// Element-wise add — GPU when available, CPU otherwise.
+#[cfg(feature = "vulkan")]
+fn add_maybe_gpu(a: &Tensor, b: &Tensor, gpu: Option<&GpuBackend>) -> Tensor {
+    if let Some(g) = gpu {
+        if let Ok(data) = g.add(a.data(), b.data()) {
+            return Tensor::from_vec(data, a.shape());
+        }
+    }
+    tensor::add(a, b)
+}
+
+/// SiLU(gate) * up — GPU when available, CPU otherwise.
+#[cfg(feature = "vulkan")]
+fn silu_mul_maybe_gpu(gate: &Tensor, up: &Tensor, gpu: Option<&GpuBackend>) -> Tensor {
+    if let Some(g) = gpu {
+        if let Ok(data) = g.silu_mul(gate.data(), up.data()) {
+            return Tensor::from_vec(data, gate.shape());
+        }
+    }
+    tensor::mul(&tensor::silu(gate), up)
+}
 
 /// Run a full forward pass: token_ids → logits.
 ///
@@ -31,7 +92,7 @@ pub fn forward(
             let attn_out = attention(&normed, &hidden_states, layer, config, pos);
             let after_attn = tensor::add(&hidden_states[pos], &attn_out);
             let normed_ffn = tensor::rms_norm(&after_attn, &layer.ffn_norm, config.rms_norm_eps);
-            let ffn_out = feed_forward(&normed_ffn, layer, None);
+            let ffn_out = feed_forward(&normed_ffn, layer, None, &mut None);
             new_hidden_states.push(tensor::add(&after_attn, &ffn_out));
         }
         hidden_states = new_hidden_states;
@@ -107,15 +168,23 @@ fn attention(
 }
 
 /// SwiGLU feed-forward: `down(silu(gate(x)) * up(x))`.
-fn feed_forward(x: &Tensor, layer: &LayerWeights, lora: Option<&LoraLayerAdapters>) -> Tensor {
-    let mut gate = layer.ffn_gate.matvec(x.data());
-    let mut up   = layer.ffn_up.matvec(x.data());
+fn feed_forward(
+    x: &Tensor,
+    layer: &LayerWeights,
+    lora: Option<&LoraLayerAdapters>,
+    gpu: &mut Option<&mut GpuBackend>,
+) -> Tensor {
+    let mut gate = matvec_maybe_gpu(&layer.ffn_gate, x.data(), reborrow(gpu));
+    let mut up   = matvec_maybe_gpu(&layer.ffn_up, x.data(), reborrow(gpu));
     if let Some(ll) = lora {
         if let Some(a) = &ll.ffn_gate { a.apply(x.data(), gate.data_mut()); }
         if let Some(a) = &ll.ffn_up   { a.apply(x.data(),   up.data_mut()); }
     }
+    #[cfg(feature = "vulkan")]
+    let hidden = silu_mul_maybe_gpu(&gate, &up, gpu.as_deref());
+    #[cfg(not(feature = "vulkan"))]
     let hidden = tensor::mul(&tensor::silu(&gate), &up);
-    let mut out = layer.ffn_down.matvec(hidden.data());
+    let mut out = matvec_maybe_gpu(&layer.ffn_down, hidden.data(), reborrow(gpu));
     if let Some(ll) = lora {
         if let Some(a) = &ll.ffn_down { a.apply(hidden.data(), out.data_mut()); }
     }
@@ -141,7 +210,7 @@ pub fn embed(
             let attn_out = attention(&normed, &hidden_states, layer, config, pos);
             let after_attn = tensor::add(&hidden_states[pos], &attn_out);
             let normed_ffn = tensor::rms_norm(&after_attn, &layer.ffn_norm, config.rms_norm_eps);
-            let ffn_out = feed_forward(&normed_ffn, layer, None);
+            let ffn_out = feed_forward(&normed_ffn, layer, None, &mut None);
             new_hs.push(tensor::add(&after_attn, &ffn_out));
         }
         hidden_states = new_hs;
@@ -187,22 +256,38 @@ pub fn forward_one(
     token_id: u32,
     pos: usize,
     cache: &mut dyn KvStore,
+    gpu: &mut Option<&mut GpuBackend>,
 ) -> Tensor {
     let mut hidden = weights.token_embedding.row_as_f32(token_id as usize);
 
     for (layer_idx, layer) in weights.layers.iter().enumerate() {
         let lora_layer = weights.lora.as_ref().and_then(|l| l.layers.get(layer_idx));
+        #[cfg(feature = "vulkan")]
+        let normed = rms_norm_maybe_gpu(&hidden, &layer.attn_norm, config.rms_norm_eps, gpu.as_deref());
+        #[cfg(not(feature = "vulkan"))]
         let normed = tensor::rms_norm(&hidden, &layer.attn_norm, config.rms_norm_eps);
-        let attn_out = attention_cached(&normed, layer, lora_layer, config, pos, layer_idx, cache);
+        let attn_out = attention_cached(&normed, layer, lora_layer, config, pos, layer_idx, cache, gpu);
+        #[cfg(feature = "vulkan")]
+        let after_attn = add_maybe_gpu(&hidden, &attn_out, gpu.as_deref());
+        #[cfg(not(feature = "vulkan"))]
         let after_attn = tensor::add(&hidden, &attn_out);
+        #[cfg(feature = "vulkan")]
+        let normed_ffn = rms_norm_maybe_gpu(&after_attn, &layer.ffn_norm, config.rms_norm_eps, gpu.as_deref());
+        #[cfg(not(feature = "vulkan"))]
         let normed_ffn = tensor::rms_norm(&after_attn, &layer.ffn_norm, config.rms_norm_eps);
-        let ffn_out = feed_forward(&normed_ffn, layer, lora_layer);
-        hidden = tensor::add(&after_attn, &ffn_out);
+        let ffn_out = feed_forward(&normed_ffn, layer, lora_layer, gpu);
+        #[cfg(feature = "vulkan")]
+        { hidden = add_maybe_gpu(&after_attn, &ffn_out, gpu.as_deref()); }
+        #[cfg(not(feature = "vulkan"))]
+        { hidden = tensor::add(&after_attn, &ffn_out); }
     }
 
     cache.advance();
+    #[cfg(feature = "vulkan")]
+    let normed = rms_norm_maybe_gpu(&hidden, &weights.output_norm, config.rms_norm_eps, gpu.as_deref());
+    #[cfg(not(feature = "vulkan"))]
     let normed = tensor::rms_norm(&hidden, &weights.output_norm, config.rms_norm_eps);
-    weights.output.matvec(normed.data())
+    matvec_maybe_gpu(&weights.output, normed.data(), reborrow(gpu))
 }
 
 fn attention_cached(
@@ -213,6 +298,7 @@ fn attention_cached(
     pos: usize,
     layer_idx: usize,
     cache: &mut dyn KvStore,
+    gpu: &mut Option<&mut GpuBackend>,
 ) -> Tensor {
     let embed_dim = config.embedding_length as usize;
     let n_heads = config.head_count as usize;
@@ -225,9 +311,9 @@ fn attention_cached(
         .map(|f| (head_dim as f32 * f) as usize & !1)
         .unwrap_or(head_dim);
 
-    let mut q_all = layer.attn_q.matvec(x.data());
-    let mut k_cur = layer.attn_k.matvec(x.data());
-    let mut v_cur = layer.attn_v.matvec(x.data());
+    let mut q_all = matvec_maybe_gpu(&layer.attn_q, x.data(), reborrow(gpu));
+    let mut k_cur = matvec_maybe_gpu(&layer.attn_k, x.data(), reborrow(gpu));
+    let mut v_cur = matvec_maybe_gpu(&layer.attn_v, x.data(), reborrow(gpu));
     if let Some(ll) = lora {
         if let Some(a) = &ll.attn_q { a.apply(x.data(), q_all.data_mut()); }
         if let Some(a) = &ll.attn_k { a.apply(x.data(), k_cur.data_mut()); }
@@ -258,7 +344,7 @@ fn attention_cached(
     }
 
     let attn_vec = Tensor::from_vec(attn_output, &[embed_dim]);
-    let mut out = layer.attn_output.matvec(attn_vec.data());
+    let mut out = matvec_maybe_gpu(&layer.attn_output, attn_vec.data(), reborrow(gpu));
     if let Some(ll) = lora {
         if let Some(a) = &ll.attn_output { a.apply(attn_vec.data(), out.data_mut()); }
     }
@@ -281,8 +367,9 @@ pub fn forward_prefill(
     token_ids: &[u32],
     cache: &mut dyn KvStore,
     pos_offset: usize,
+    gpu: &mut Option<&mut GpuBackend>,
 ) -> Tensor {
-    let all = forward_prefill_inner(weights, config, token_ids, cache, pos_offset);
+    let all = forward_prefill_inner(weights, config, token_ids, cache, pos_offset, gpu);
     all.into_iter().last()
         .unwrap_or_else(|| Tensor::zeros(&[config.vocab_size as usize]))
 }
@@ -297,8 +384,9 @@ pub fn forward_prefill_all(
     token_ids: &[u32],
     cache: &mut dyn KvStore,
     pos_offset: usize,
+    gpu: &mut Option<&mut GpuBackend>,
 ) -> Vec<Tensor> {
-    forward_prefill_inner(weights, config, token_ids, cache, pos_offset)
+    forward_prefill_inner(weights, config, token_ids, cache, pos_offset, gpu)
 }
 
 fn forward_prefill_inner(
@@ -307,6 +395,7 @@ fn forward_prefill_inner(
     token_ids: &[u32],
     cache: &mut dyn KvStore,
     pos_offset: usize,
+    gpu: &mut Option<&mut GpuBackend>,
 ) -> Vec<Tensor> {
     let seq_len = token_ids.len();
     if seq_len == 0 { return vec![]; }
@@ -323,6 +412,13 @@ fn forward_prefill_inner(
         .unwrap_or(head_dim);
     let scale = 1.0 / (head_dim as f32).sqrt();
 
+    // Use sequential path when GPU is active (GPU parallelism replaces rayon)
+    // or when rayon is not available (e.g. wasm32 builds).
+    #[cfg(feature = "rayon")]
+    let use_sequential = gpu.is_some();
+    #[cfg(not(feature = "rayon"))]
+    let use_sequential = true;
+
     // 1. Embed all tokens
     let mut hidden: Vec<Vec<f32>> = token_ids.iter()
         .map(|&id| weights.token_embedding.row_as_f32(id as usize).data().to_vec())
@@ -332,36 +428,67 @@ fn forward_prefill_inner(
     for (layer_idx, layer) in weights.layers.iter().enumerate() {
         let lora_layer = weights.lora.as_ref().and_then(|l| l.layers.get(layer_idx));
 
-        // a. Q/K/V projections + RoPE — parallel across positions
-        let qkv: Vec<(Vec<f32>, Vec<f32>, Vec<f32>)> = hidden.par_iter()
-            .enumerate()
-            .map(|(lp, h)| {
-                let abs = pos_offset + lp;
-                let h_t    = Tensor::from_vec(h.clone(), &[embed_dim]);
-                let normed = tensor::rms_norm(&h_t, &layer.attn_norm, config.rms_norm_eps);
-                let mut q = layer.attn_q.matvec(normed.data());
-                let mut k = layer.attn_k.matvec(normed.data());
-                let mut v = layer.attn_v.matvec(normed.data());
-                if let Some(ll) = lora_layer {
-                    if let Some(a) = &ll.attn_q { a.apply(normed.data(), q.data_mut()); }
-                    if let Some(a) = &ll.attn_k { a.apply(normed.data(), k.data_mut()); }
-                    if let Some(a) = &ll.attn_v { a.apply(normed.data(), v.data_mut()); }
-                }
-                let q = tensor::rope(&q, abs, head_dim, freq_base, rope_scale, rot_dim);
-                let k = tensor::rope(&k, abs, head_dim, freq_base, rope_scale, rot_dim);
-                (q.data().to_vec(), k.data().to_vec(), v.data().to_vec())
-            })
-            .collect();
+        // a. Q/K/V projections + RoPE
+        // When GPU is active, run sequentially (GPU parallelism replaces rayon).
+        let qkv: Vec<(Vec<f32>, Vec<f32>, Vec<f32>)> = if use_sequential {
+            hidden.iter()
+                .enumerate()
+                .map(|(lp, h)| {
+                    let abs = pos_offset + lp;
+                    let h_t    = Tensor::from_vec(h.clone(), &[embed_dim]);
+                    #[cfg(feature = "vulkan")]
+                    let normed = rms_norm_maybe_gpu(&h_t, &layer.attn_norm, config.rms_norm_eps, gpu.as_deref());
+                    #[cfg(not(feature = "vulkan"))]
+                    let normed = tensor::rms_norm(&h_t, &layer.attn_norm, config.rms_norm_eps);
+                    let mut q = matvec_maybe_gpu(&layer.attn_q, normed.data(), reborrow(gpu));
+                    let mut k = matvec_maybe_gpu(&layer.attn_k, normed.data(), reborrow(gpu));
+                    let mut v = matvec_maybe_gpu(&layer.attn_v, normed.data(), reborrow(gpu));
+                    if let Some(ll) = lora_layer {
+                        if let Some(a) = &ll.attn_q { a.apply(normed.data(), q.data_mut()); }
+                        if let Some(a) = &ll.attn_k { a.apply(normed.data(), k.data_mut()); }
+                        if let Some(a) = &ll.attn_v { a.apply(normed.data(), v.data_mut()); }
+                    }
+                    let q = tensor::rope(&q, abs, head_dim, freq_base, rope_scale, rot_dim);
+                    let k = tensor::rope(&k, abs, head_dim, freq_base, rope_scale, rot_dim);
+                    (q.data().to_vec(), k.data().to_vec(), v.data().to_vec())
+                })
+                .collect()
+        } else {
+            #[cfg(feature = "rayon")]
+            {
+                hidden.par_iter()
+                    .enumerate()
+                    .map(|(lp, h)| {
+                        let abs = pos_offset + lp;
+                        let h_t    = Tensor::from_vec(h.clone(), &[embed_dim]);
+                        let normed = tensor::rms_norm(&h_t, &layer.attn_norm, config.rms_norm_eps);
+                        let mut q = layer.attn_q.matvec(normed.data());
+                        let mut k = layer.attn_k.matvec(normed.data());
+                        let mut v = layer.attn_v.matvec(normed.data());
+                        if let Some(ll) = lora_layer {
+                            if let Some(a) = &ll.attn_q { a.apply(normed.data(), q.data_mut()); }
+                            if let Some(a) = &ll.attn_k { a.apply(normed.data(), k.data_mut()); }
+                            if let Some(a) = &ll.attn_v { a.apply(normed.data(), v.data_mut()); }
+                        }
+                        let q = tensor::rope(&q, abs, head_dim, freq_base, rope_scale, rot_dim);
+                        let k = tensor::rope(&k, abs, head_dim, freq_base, rope_scale, rot_dim);
+                        (q.data().to_vec(), k.data().to_vec(), v.data().to_vec())
+                    })
+                    .collect()
+            }
+            #[cfg(not(feature = "rayon"))]
+            unreachable!()
+        };
 
         // b. Write all K/V (sequential — must finish before reads below)
         for (lp, kv) in qkv.iter().enumerate() {
             cache.write(layer_idx, pos_offset + lp, &kv.1, &kv.2);
         }
 
-        // c. Attention — parallel across positions (cache is read-only now)
+        // c. Attention + output projection
         let cache_ro: &dyn KvStore = &*cache;
-        let attn_outs: Vec<Vec<f32>> = (0..seq_len).into_par_iter()
-            .map(|lp| {
+        let attn_outs: Vec<Vec<f32>> = if use_sequential {
+            (0..seq_len).map(|lp| {
                 let abs = pos_offset + lp;
                 let window = config.sliding_window
                     .map(|w| (abs as i64 - w as i64 + 1).max(0) as usize)
@@ -379,26 +506,86 @@ fn forward_prefill_inner(
                     );
                 }
                 let attn_vec = Tensor::from_vec(out, &[embed_dim]);
-                let mut proj = layer.attn_output.matvec(attn_vec.data());
+                let mut proj = matvec_maybe_gpu(&layer.attn_output, attn_vec.data(), reborrow(gpu));
                 if let Some(ll) = lora_layer {
                     if let Some(a) = &ll.attn_output { a.apply(attn_vec.data(), proj.data_mut()); }
                 }
                 proj.data().to_vec()
-            })
-            .collect();
+            }).collect()
+        } else {
+            #[cfg(feature = "rayon")]
+            {
+                (0..seq_len).into_par_iter()
+                    .map(|lp| {
+                        let abs = pos_offset + lp;
+                        let window = config.sliding_window
+                            .map(|w| (abs as i64 - w as i64 + 1).max(0) as usize)
+                            .unwrap_or(0);
+                        let attend_len = abs + 1 - window;
+                        let mut out = vec![0.0f32; embed_dim];
+                        for h in 0..n_heads {
+                            let kv_h = h / kv_group;
+                            let q_off = h * head_dim;
+                            tensor::flash_attn_1d(
+                                &qkv[lp].0[q_off..q_off + head_dim],
+                                cache_ro, layer_idx, kv_h,
+                                window, attend_len, head_dim, scale,
+                                &mut out[q_off..q_off + head_dim],
+                            );
+                        }
+                        let attn_vec = Tensor::from_vec(out, &[embed_dim]);
+                        let mut proj = layer.attn_output.matvec(attn_vec.data());
+                        if let Some(ll) = lora_layer {
+                            if let Some(a) = &ll.attn_output { a.apply(attn_vec.data(), proj.data_mut()); }
+                        }
+                        proj.data().to_vec()
+                    })
+                    .collect()
+            }
+            #[cfg(not(feature = "rayon"))]
+            unreachable!()
+        };
 
-        // d. Residual + FFN — parallel across positions
-        hidden = hidden.into_par_iter()
-            .zip(attn_outs.into_par_iter())
-            .map(|(h, ao)| {
-                let h_t        = Tensor::from_vec(h,  &[embed_dim]);
-                let a_t        = Tensor::from_vec(ao, &[embed_dim]);
-                let after_attn = tensor::add(&h_t, &a_t);
-                let nf         = tensor::rms_norm(&after_attn, &layer.ffn_norm, config.rms_norm_eps);
-                let ffn_out    = feed_forward(&nf, layer, lora_layer);
-                tensor::add(&after_attn, &ffn_out).data().to_vec()
-            })
-            .collect();
+        // d. Residual + FFN
+        if use_sequential {
+            hidden = hidden.into_iter()
+                .zip(attn_outs.into_iter())
+                .map(|(h, ao)| {
+                    let h_t        = Tensor::from_vec(h,  &[embed_dim]);
+                    let a_t        = Tensor::from_vec(ao, &[embed_dim]);
+                    #[cfg(feature = "vulkan")]
+                    let after_attn = add_maybe_gpu(&h_t, &a_t, gpu.as_deref());
+                    #[cfg(not(feature = "vulkan"))]
+                    let after_attn = tensor::add(&h_t, &a_t);
+                    #[cfg(feature = "vulkan")]
+                    let nf = rms_norm_maybe_gpu(&after_attn, &layer.ffn_norm, config.rms_norm_eps, gpu.as_deref());
+                    #[cfg(not(feature = "vulkan"))]
+                    let nf = tensor::rms_norm(&after_attn, &layer.ffn_norm, config.rms_norm_eps);
+                    let ffn_out = feed_forward(&nf, layer, lora_layer, gpu);
+                    #[cfg(feature = "vulkan")]
+                    { add_maybe_gpu(&after_attn, &ffn_out, gpu.as_deref()).data().to_vec() }
+                    #[cfg(not(feature = "vulkan"))]
+                    { tensor::add(&after_attn, &ffn_out).data().to_vec() }
+                })
+                .collect();
+        } else {
+            #[cfg(feature = "rayon")]
+            {
+                hidden = hidden.into_par_iter()
+                    .zip(attn_outs.into_par_iter())
+                    .map(|(h, ao)| {
+                        let h_t        = Tensor::from_vec(h,  &[embed_dim]);
+                        let a_t        = Tensor::from_vec(ao, &[embed_dim]);
+                        let after_attn = tensor::add(&h_t, &a_t);
+                        let nf         = tensor::rms_norm(&after_attn, &layer.ffn_norm, config.rms_norm_eps);
+                        let ffn_out    = feed_forward(&nf, layer, lora_layer, &mut None);
+                        tensor::add(&after_attn, &ffn_out).data().to_vec()
+                    })
+                    .collect();
+            }
+            #[cfg(not(feature = "rayon"))]
+            unreachable!();
+        }
     }
 
     // Advance cache seq_len positions
@@ -408,8 +595,11 @@ fn forward_prefill_inner(
     hidden.iter()
         .map(|h| {
             let h_t    = Tensor::from_vec(h.clone(), &[embed_dim]);
+            #[cfg(feature = "vulkan")]
+            let normed = rms_norm_maybe_gpu(&h_t, &weights.output_norm, config.rms_norm_eps, gpu.as_deref());
+            #[cfg(not(feature = "vulkan"))]
             let normed = tensor::rms_norm(&h_t, &weights.output_norm, config.rms_norm_eps);
-            weights.output.matvec(normed.data())
+            matvec_maybe_gpu(&weights.output, normed.data(), reborrow(gpu))
         })
         .collect()
 }
@@ -422,6 +612,7 @@ pub fn generate_greedy_cached(
     config: &ModelConfig,
     prompt_tokens: &[u32],
     max_new_tokens: usize,
+    gpu: &mut Option<&mut GpuBackend>,
 ) -> Vec<u32> {
     let mut cache = KvCache::new(
         config.block_count as usize, config.context_length as usize,
@@ -429,7 +620,7 @@ pub fn generate_greedy_cached(
     );
     let mut tokens = prompt_tokens.to_vec();
     eprintln!("Prefill: {} tokens", prompt_tokens.len());
-    let mut last_logits = forward_prefill(weights, config, prompt_tokens, &mut cache, 0);
+    let mut last_logits = forward_prefill(weights, config, prompt_tokens, &mut cache, 0, gpu);
     for step in 0..max_new_tokens {
         let next = last_logits.data().iter().enumerate()
             .max_by(|(_, a), (_, b)| a.total_cmp(b))
@@ -437,7 +628,7 @@ pub fn generate_greedy_cached(
         eprintln!("  Decode {}/{}: token {next}", step + 1, max_new_tokens);
         tokens.push(next);
         if next == 2 { break; }
-        last_logits = forward_one(weights, config, next, tokens.len() - 1, &mut cache);
+        last_logits = forward_one(weights, config, next, tokens.len() - 1, &mut cache, gpu);
     }
     tokens
 }
@@ -450,12 +641,13 @@ pub fn generate_cached(
     max_new_tokens: usize,
     sampler: &mut Sampler,
     eos_token: u32,
+    gpu: &mut Option<&mut GpuBackend>,
 ) -> Vec<u32> {
     let mut cache = KvCache::new(
         config.block_count as usize, config.context_length as usize,
         config.head_count_kv as usize, config.head_dim() as usize,
     );
-    generate_with_cache(weights, config, prompt_tokens, max_new_tokens, sampler, eos_token, &mut cache)
+    generate_with_cache(weights, config, prompt_tokens, max_new_tokens, sampler, eos_token, &mut cache, gpu)
 }
 
 /// Sampler-based generation with a Q8_0-compressed KV-cache (~3.8× less RAM).
@@ -469,12 +661,13 @@ pub fn generate_cached_q8(
     max_new_tokens: usize,
     sampler: &mut Sampler,
     eos_token: u32,
+    gpu: &mut Option<&mut GpuBackend>,
 ) -> Vec<u32> {
     let mut cache = KvCacheQ8::new(
         config.block_count as usize, config.context_length as usize,
         config.head_count_kv as usize, config.head_dim() as usize,
     );
-    generate_with_cache(weights, config, prompt_tokens, max_new_tokens, sampler, eos_token, &mut cache)
+    generate_with_cache(weights, config, prompt_tokens, max_new_tokens, sampler, eos_token, &mut cache, gpu)
 }
 
 fn generate_with_cache(
@@ -485,16 +678,17 @@ fn generate_with_cache(
     sampler: &mut Sampler,
     eos_token: u32,
     cache: &mut dyn KvStore,
+    gpu: &mut Option<&mut GpuBackend>,
 ) -> Vec<u32> {
     let mut tokens = prompt_tokens.to_vec();
     eprintln!("Prefill: {} tokens", prompt_tokens.len());
-    let mut last_logits = forward_prefill(weights, config, prompt_tokens, cache, 0);
+    let mut last_logits = forward_prefill(weights, config, prompt_tokens, cache, 0, gpu);
     for step in 0..max_new_tokens {
         let next = sampler.sample(last_logits.data(), &tokens);
         eprintln!("  Decode {}/{}: token {next}", step + 1, max_new_tokens);
         tokens.push(next);
         if next == eos_token { break; }
-        last_logits = forward_one(weights, config, next, tokens.len() - 1, cache);
+        last_logits = forward_one(weights, config, next, tokens.len() - 1, cache, gpu);
     }
     tokens
 }
@@ -511,18 +705,19 @@ pub fn generate_streaming(
     sampler: &mut Sampler,
     eos_token: u32,
     on_token: impl Fn(u32) -> bool,
+    gpu: &mut Option<&mut GpuBackend>,
 ) -> Vec<u32> {
     let mut cache = KvCache::new(
         config.block_count as usize, config.context_length as usize,
         config.head_count_kv as usize, config.head_dim() as usize,
     );
     let mut tokens = prompt_tokens.to_vec();
-    let mut last_logits = forward_prefill(weights, config, prompt_tokens, &mut cache, 0);
+    let mut last_logits = forward_prefill(weights, config, prompt_tokens, &mut cache, 0, gpu);
     for _ in 0..max_new_tokens {
         let next = sampler.sample(last_logits.data(), &tokens);
         tokens.push(next);
         if !on_token(next) || next == eos_token { break; }
-        last_logits = forward_one(weights, config, next, tokens.len() - 1, &mut cache);
+        last_logits = forward_one(weights, config, next, tokens.len() - 1, &mut cache, gpu);
     }
     tokens
 }
@@ -584,7 +779,7 @@ mod tests {
         );
         let mut logits_cached = Tensor::zeros(&[1]);
         for (pos, &tok) in token_ids.iter().enumerate() {
-            logits_cached = forward_one(&weights, &config, tok, pos, &mut cache);
+            logits_cached = forward_one(&weights, &config, tok, pos, &mut cache, &mut None);
         }
         assert_eq!(logits_uncached.shape(), logits_cached.shape());
         for (i, (&a, &b)) in logits_uncached.data().iter().zip(logits_cached.data()).enumerate() {
@@ -604,7 +799,7 @@ mod tests {
         );
         let mut logits_seq = Tensor::zeros(&[1]);
         for (pos, &tok) in token_ids.iter().enumerate() {
-            logits_seq = forward_one(&weights, &config, tok, pos, &mut cache_seq);
+            logits_seq = forward_one(&weights, &config, tok, pos, &mut cache_seq, &mut None);
         }
 
         // Batched prefill
@@ -612,7 +807,7 @@ mod tests {
             config.block_count as usize, config.context_length as usize,
             config.head_count_kv as usize, config.head_dim() as usize,
         );
-        let logits_batch = forward_prefill(&weights, &config, &token_ids, &mut cache_batch, 0);
+        let logits_batch = forward_prefill(&weights, &config, &token_ids, &mut cache_batch, 0, &mut None);
 
         for (i, (&a, &b)) in logits_seq.data().iter().zip(logits_batch.data()).enumerate() {
             assert!((a - b).abs() < 1e-4, "index {i}: sequential={a:.6}, prefill={b:.6}");
@@ -628,13 +823,13 @@ mod tests {
             config.block_count as usize, config.context_length as usize,
             config.head_count_kv as usize, config.head_dim() as usize,
         );
-        let l_f32 = forward_prefill(&weights, &config, &token_ids, &mut c_f32, 0);
+        let l_f32 = forward_prefill(&weights, &config, &token_ids, &mut c_f32, 0, &mut None);
 
         let mut c_q8 = KvCacheQ8::new(
             config.block_count as usize, config.context_length as usize,
             config.head_count_kv as usize, config.head_dim() as usize,
         );
-        let l_q8 = forward_prefill(&weights, &config, &token_ids, &mut c_q8, 0);
+        let l_q8 = forward_prefill(&weights, &config, &token_ids, &mut c_q8, 0, &mut None);
 
         for (i, (&a, &b)) in l_f32.data().iter().zip(l_q8.data()).enumerate() {
             assert!((a - b).abs() < 0.05, "index {i}: f32={a:.4}, q8={b:.4}");
@@ -655,6 +850,6 @@ mod tests {
             ffn_down:    QuantizedTensor::from_f32(&vec![0.0f32; 32], 4, 8),
         };
         let x = Tensor::from_vec(vec![1.0, 2.0, 3.0, 4.0], &[4]);
-        assert_eq!(feed_forward(&x, &layer, None).shape(), &[4]);
+        assert_eq!(feed_forward(&x, &layer, None, &mut None).shape(), &[4]);
     }
 }

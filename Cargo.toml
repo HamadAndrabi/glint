@@ -10,9 +10,20 @@ name = "glint"
 crate-type = ["rlib"]  # maturin adds cdylib automatically when building the Python extension
 
 [features]
+default = ["rayon"]
+rayon = ["dep:rayon"]
+
 # Enable PyO3 Python extension module. Build with: cargo build --features python
 # or let maturin handle it via pyproject.toml.
 python = ["pyo3/extension-module"]
+
+# Enable wasm-bindgen JS bindings. Build with:
+#   wasm-pack build --target web --features wasm
+wasm = ["dep:wasm-bindgen", "dep:js-sys", "dep:console_error_panic_hook"]
+
+# Enable GPU compute backend via wgpu (Vulkan/Metal/DX12). Build with:
+#   cargo build --release --features vulkan
+vulkan = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
 
 [dependencies]
 # Memory-mapped file I/O — lets us map the GGUF file directly into virtual memory
@@ -34,7 +45,8 @@ clap = { version = "4", features = ["derive"] }
 thiserror = "2"
 
 # Data parallelism — work-stealing thread pool for parallelizing matmul across rows.
-rayon = "1.10"
+# Optional so the wasm32 target (single-threaded) can exclude it.
+rayon = { version = "1.10", optional = true }
 
 # HTTP server framework built on tokio — handler-based routing, SSE streaming.
 axum = { version = "0.8", features = ["macros"] }
@@ -63,6 +75,16 @@ dirs = "5"
 
 # Python bindings — only compiled when the `python` feature is enabled.
 pyo3 = { version = "0.22", optional = true }
+
+# WASM / browser bindings — only compiled when the `wasm` feature is enabled.
+wasm-bindgen           = { version = "0.2",  optional = true }
+js-sys                 = { version = "0.3",  optional = true }
+console_error_panic_hook = { version = "0.1", optional = true }
+
+# GPU compute via wgpu — Vulkan/Metal/DX12 backend for accelerated inference.
+wgpu     = { version = "24",  optional = true }
+pollster = { version = "0.4", optional = true }
+bytemuck = { version = "1",   features = ["derive"], optional = true }
 
 [dev-dependencies]
 # Creates temporary files/directories for tests that auto-clean on drop.

@@ -4,10 +4,11 @@
 //! to the same memory. The inference weights are read-only after loading, so
 //! there's no need for a mutex.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
+use crate::backend::GpuBackend;
 use crate::model::chat_template::ChatTemplate;
 use crate::model::config::ModelConfig;
 use crate::model::tokenizer::Tokenizer;
@@ -58,4 +59,6 @@ pub struct AppState {
     pub chat_template: ChatTemplate,
     /// Runtime metrics — request counts, token throughput, latency.
     pub metrics: Metrics,
+    /// Optional GPU backend — `None` when running CPU-only.
+    pub gpu: Option<Arc<Mutex<GpuBackend>>>,
 }

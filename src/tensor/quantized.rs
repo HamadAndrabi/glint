@@ -10,11 +10,23 @@
 //! cache utilization — more of the model fits in L2/L3 during matmul.
 
 use half::f16;
+#[cfg(feature = "rayon")]
 use rayon::prelude::*;
 
 use crate::error::GlintError;
 use crate::model::gguf::{GgmlType, GgufModel};
 use super::tensor::Tensor;
+
+/// Parallel row iterator when rayon is available, sequential otherwise.
+#[cfg(feature = "rayon")]
+fn par_rows(rows: usize) -> rayon::range::Iter<usize> {
+    (0..rows).into_par_iter()
+}
+
+#[cfg(not(feature = "rayon"))]
+fn par_rows(rows: usize) -> std::ops::Range<usize> {
+    0..rows
+}
 use super::dequantize::{dequantize, get_scale_min_q4k};
 
 /// A weight matrix stored in its original quantized format.
@@ -31,6 +43,9 @@ pub struct QuantizedTensor {
     cols: usize,
     /// Original quantization format.
     ggml_type: GgmlType,
+    /// GPU buffer name (set after `upload_to_gpu`).
+    #[cfg(feature = "vulkan")]
+    gpu_buf_name: Option<String>,
 }
 
 impl QuantizedTensor {
@@ -63,12 +78,18 @@ impl QuantizedTensor {
             rows,
             cols,
             ggml_type: info.ggml_type,
+            #[cfg(feature = "vulkan")]
+            gpu_buf_name: None,
         })
     }
 
     /// Build from raw quantized bytes. Used for benchmarks and testing.
     pub fn from_raw(data: Vec<u8>, rows: usize, cols: usize, ggml_type: GgmlType) -> Self {
-        Self { data, rows, cols, ggml_type }
+        Self {
+            data, rows, cols, ggml_type,
+            #[cfg(feature = "vulkan")]
+            gpu_buf_name: None,
+        }
     }
 
     /// Build from a flat f32 slice (re-encoded as F32 bytes). Used in tests.
@@ -78,7 +99,11 @@ impl QuantizedTensor {
         for &v in values {
             data.extend_from_slice(&v.to_le_bytes());
         }
-        Self { data, rows, cols, ggml_type: GgmlType::F32 }
+        Self {
+            data, rows, cols, ggml_type: GgmlType::F32,
+            #[cfg(feature = "vulkan")]
+            gpu_buf_name: None,
+        }
     }
 
     pub fn rows(&self) -> usize { self.rows }
@@ -124,6 +149,54 @@ impl QuantizedTensor {
         let f32_data = dequantize(row_bytes, self.ggml_type, n_elements);
         Tensor::from_vec(f32_data, &[n_elements])
     }
+
+    /// Raw quantized bytes (for GPU upload).
+    pub fn raw_data(&self) -> &[u8] {
+        &self.data
+    }
+
+    /// Quantization format.
+    pub fn ggml_type(&self) -> GgmlType {
+        self.ggml_type
+    }
+
+    // ── GPU methods (only when `vulkan` feature is enabled) ──────────
+
+    /// Upload this tensor's raw quantized bytes to the GPU.
+    ///
+    /// After calling this, `matvec_gpu()` can dispatch on the GPU.
+    #[cfg(feature = "vulkan")]
+    pub fn upload_to_gpu(&mut self, gpu: &mut crate::backend::gpu::GpuBackend, name: &str) {
+        gpu.upload_buffer(name, &self.data);
+        self.gpu_buf_name = Some(name.to_string());
+    }
+
+    /// GPU-accelerated matrix-vector multiply.
+    ///
+    /// Falls back to CPU `matvec()` if weights have not been uploaded or
+    /// the quantization format has no GPU kernel yet.
+    #[cfg(feature = "vulkan")]
+    pub fn matvec_gpu(
+        &self,
+        vec: &[f32],
+        gpu: &mut crate::backend::gpu::GpuBackend,
+    ) -> Tensor {
+        if let Some(ref buf_name) = self.gpu_buf_name {
+            let result = match self.ggml_type {
+                GgmlType::Q8_0 => gpu.matvec_q8_0(buf_name, vec, self.rows as u32, self.cols as u32),
+                GgmlType::Q4_0 => gpu.matvec_q4_0(buf_name, vec, self.rows as u32, self.cols as u32),
+                GgmlType::F32  => gpu.matvec_f32(buf_name, vec, self.rows as u32, self.cols as u32),
+                // Formats without GPU kernels fall through to CPU
+                _ => return self.matvec(vec),
+            };
+            match result {
+                Ok(data) => Tensor::from_vec(data, &[self.rows]),
+                Err(_) => self.matvec(vec), // GPU error → CPU fallback
+            }
+        } else {
+            self.matvec(vec) // not uploaded → CPU
+        }
+    }
 }
 
 // ── Dispatch ─────────────────────────────────────────────────────────────────
@@ -131,7 +204,7 @@ impl QuantizedTensor {
 // Runtime CPU feature detection → SIMD if available, scalar fallback otherwise.
 
 fn dispatch_q8_0(data: &[u8], rows: usize, cols: usize, vec: &[f32]) -> Vec<f32> {
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", feature = "rayon"))]
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
             // SAFETY: we just verified AVX2+FMA are available.
@@ -142,7 +215,7 @@ fn dispatch_q8_0(data: &[u8], rows: usize, cols: usize, vec: &[f32]) -> Vec<f32>
 }
 
 fn dispatch_q4_k(data: &[u8], rows: usize, cols: usize, vec: &[f32]) -> Vec<f32> {
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", feature = "rayon"))]
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
             return unsafe { crate::tensor::simd::matvec_q4_k_avx2(data, rows, cols, vec) };
@@ -152,7 +225,7 @@ fn dispatch_q4_k(data: &[u8], rows: usize, cols: usize, vec: &[f32]) -> Vec<f32>
 }
 
 fn dispatch_q5_k(data: &[u8], rows: usize, cols: usize, vec: &[f32]) -> Vec<f32> {
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", feature = "rayon"))]
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
             return unsafe { crate::tensor::simd::matvec_q5_k_avx2(data, rows, cols, vec) };
@@ -162,7 +235,7 @@ fn dispatch_q5_k(data: &[u8], rows: usize, cols: usize, vec: &[f32]) -> Vec<f32>
 }
 
 fn dispatch_q6_k(data: &[u8], rows: usize, cols: usize, vec: &[f32]) -> Vec<f32> {
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", feature = "rayon"))]
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
             return unsafe { crate::tensor::simd::matvec_q6_k_avx2(data, rows, cols, vec) };
@@ -172,7 +245,7 @@ fn dispatch_q6_k(data: &[u8], rows: usize, cols: usize, vec: &[f32]) -> Vec<f32>
 }
 
 fn dispatch_q4_0(data: &[u8], rows: usize, cols: usize, vec: &[f32]) -> Vec<f32> {
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", feature = "rayon"))]
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
             return unsafe { crate::tensor::simd::matvec_q4_0_avx2(data, rows, cols, vec) };
@@ -197,8 +270,7 @@ pub(crate) fn matvec_q8_0_scalar(data: &[u8], rows: usize, cols: usize, vec: &[f
     let n_blocks = cols / BLOCK_ELEMS;
     let bytes_per_row = n_blocks * BLOCK_BYTES;
 
-    (0..rows)
-        .into_par_iter()
+    par_rows(rows)
         .map(|i| {
             let row_start = i * bytes_per_row;
             let mut sum = 0.0f32;
@@ -229,8 +301,7 @@ pub(crate) fn matvec_q4_0_scalar(data: &[u8], rows: usize, cols: usize, vec: &[f
     let n_blocks = cols / BLOCK_ELEMS;
     let bytes_per_row = n_blocks * BLOCK_BYTES;
 
-    (0..rows)
-        .into_par_iter()
+    par_rows(rows)
         .map(|i| {
             let row_start = i * bytes_per_row;
             let mut sum = 0.0f32;
@@ -269,8 +340,7 @@ fn matvec_q4_k_scalar(data: &[u8], rows: usize, cols: usize, vec: &[f32]) -> Vec
     let n_super = cols / SUPER_BLOCK;
     let bytes_per_row = n_super * BLOCK_BYTES;
 
-    (0..rows)
-        .into_par_iter()
+    par_rows(rows)
         .map(|r| {
             let mut acc = 0.0f32;
             let row = &data[r * bytes_per_row..];
@@ -315,8 +385,7 @@ fn matvec_q5_k_scalar(data: &[u8], rows: usize, cols: usize, vec: &[f32]) -> Vec
     let n_super = cols / SUPER_BLOCK;
     let bytes_per_row = n_super * BLOCK_BYTES;
 
-    (0..rows)
-        .into_par_iter()
+    par_rows(rows)
         .map(|r| {
             let mut acc = 0.0f32;
             let row = &data[r * bytes_per_row..];
@@ -369,8 +438,7 @@ fn matvec_q6_k_scalar(data: &[u8], rows: usize, cols: usize, vec: &[f32]) -> Vec
     let n_super = cols / SUPER_BLOCK;
     let bytes_per_row = n_super * BLOCK_BYTES;
 
-    (0..rows)
-        .into_par_iter()
+    par_rows(rows)
         .map(|r| {
             let mut acc = 0.0f32;
             let row = &data[r * bytes_per_row..];
@@ -436,8 +504,7 @@ fn matvec_q2_k_scalar(data: &[u8], rows: usize, cols: usize, vec: &[f32]) -> Vec
     let n_super = cols / SUPER_BLOCK;
     let bytes_per_row = n_super * BLOCK_BYTES;
 
-    (0..rows)
-        .into_par_iter()
+    par_rows(rows)
         .map(|r| {
             let mut acc = 0.0f32;
             let row = &data[r * bytes_per_row..];
@@ -474,8 +541,7 @@ fn matvec_q3_k_scalar(data: &[u8], rows: usize, cols: usize, vec: &[f32]) -> Vec
     let n_super = cols / SUPER_BLOCK;
     let bytes_per_row = n_super * BLOCK_BYTES;
 
-    (0..rows)
-        .into_par_iter()
+    par_rows(rows)
         .map(|r| {
             let mut acc = 0.0f32;
             let row = &data[r * bytes_per_row..];
@@ -528,8 +594,7 @@ fn matvec_iq4_nl_scalar(data: &[u8], rows: usize, cols: usize, vec: &[f32]) -> V
     let n_blocks = cols / BLOCK_SIZE;
     let bytes_per_row = n_blocks * BLOCK_BYTES;
 
-    (0..rows)
-        .into_par_iter()
+    par_rows(rows)
         .map(|r| {
             let mut acc = 0.0f32;
             let row = &data[r * bytes_per_row..];
@@ -565,8 +630,7 @@ fn matvec_fallback(
     let n_blocks = cols.div_ceil(block_size);
     let bytes_per_row = n_blocks * type_size;
 
-    (0..rows)
-        .into_par_iter()
+    par_rows(rows)
         .map(|i| {
             let row_bytes = &data[i * bytes_per_row..(i + 1) * bytes_per_row];
             let row_f32 = dequantize(row_bytes, ggml_type, cols);
@@ -595,7 +659,11 @@ mod tests {
         data.extend(make_q8_0_block(1.0, (0..32).map(|i| i as i8).collect()));
         data.extend(make_q8_0_block(2.0, (0..32).map(|i| -(i as i8)).collect()));
 
-        let qt = QuantizedTensor { data, rows: 2, cols: 32, ggml_type: GgmlType::Q8_0 };
+        let qt = QuantizedTensor {
+            data, rows: 2, cols: 32, ggml_type: GgmlType::Q8_0,
+            #[cfg(feature = "vulkan")]
+            gpu_buf_name: None,
+        };
         let input: Vec<f32> = (0..32).map(|i| i as f32).collect();
 
         let result = qt.matvec(&input);
@@ -623,6 +691,8 @@ mod tests {
             rows: 1,
             cols: 32,
             ggml_type: GgmlType::Q8_0,
+            #[cfg(feature = "vulkan")]
+            gpu_buf_name: None,
         };
 
         let row = qt.row_as_f32(0);
@@ -640,7 +710,11 @@ mod tests {
         // Q8_0: 34 bytes per 32 elements
         // F32:  128 bytes per 32 elements
         let block = make_q8_0_block(1.0, vec![1i8; 32]);
-        let qt = QuantizedTensor { data: block, rows: 1, cols: 32, ggml_type: GgmlType::Q8_0 };
+        let qt = QuantizedTensor {
+            data: block, rows: 1, cols: 32, ggml_type: GgmlType::Q8_0,
+            #[cfg(feature = "vulkan")]
+            gpu_buf_name: None,
+        };
         let f32_equivalent_bytes = qt.rows * qt.cols * 4;
         assert!(qt.data.len() < f32_equivalent_bytes,
             "Quantized {} bytes should be less than f32 {} bytes",

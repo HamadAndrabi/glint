@@ -18,6 +18,7 @@
 use std::arch::x86_64::*;
 
 use half::f16;
+#[cfg(feature = "rayon")]
 use rayon::prelude::*;
 
 use super::dequantize::get_scale_min_q4k;

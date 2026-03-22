@@ -184,10 +184,14 @@ async fn non_streaming_completion(
     let weights = Arc::clone(&state.weights);
     let config = Arc::clone(&state.config);
 
+    let gpu_arc = state.gpu.clone();
+
     let t0 = Instant::now();
     let result = tokio::task::spawn_blocking(move || {
         let mut sampler = Sampler::new(sampler_cfg);
-        generate_cached(&weights, &config, &prompt_tokens, max_tokens, &mut sampler, eos)
+        let mut gpu_lock = gpu_arc.as_ref().map(|g| g.lock().unwrap());
+        let mut gpu: Option<&mut crate::backend::GpuBackend> = gpu_lock.as_deref_mut();
+        generate_cached(&weights, &config, &prompt_tokens, max_tokens, &mut sampler, eos, &mut gpu)
     })
     .await;
 
@@ -236,10 +240,13 @@ async fn streaming_completion(
     // Spawn inference on the blocking thread pool
     let weights = Arc::clone(&state.weights);
     let config = Arc::clone(&state.config);
+    let gpu_arc = state.gpu.clone();
     let prompt_len = prompt_tokens.len();
     let state_m = Arc::clone(&state);
     tokio::task::spawn_blocking(move || {
         let mut sampler = Sampler::new(sampler_cfg);
+        let mut gpu_lock = gpu_arc.as_ref().map(|g| g.lock().unwrap());
+        let mut gpu: Option<&mut crate::backend::GpuBackend> = gpu_lock.as_deref_mut();
         let output = generate_streaming(
             &weights,
             &config,
@@ -251,6 +258,7 @@ async fn streaming_completion(
                 // blocking_send returns Err if the receiver is dropped (client disconnected)
                 tx.blocking_send(token_id).is_ok()
             },
+            &mut gpu,
         );
         let n_gen = output.len().saturating_sub(prompt_len);
         state_m.metrics.record(n_gen as u64, 0);
@@ -337,11 +345,14 @@ pub async fn chat_completions(
     } else {
         let weights = Arc::clone(&state.weights);
         let config = Arc::clone(&state.config);
+        let gpu_arc = state.gpu.clone();
 
         let t0 = Instant::now();
         let result = tokio::task::spawn_blocking(move || {
             let mut sampler = Sampler::new(sampler_cfg);
-            generate_cached(&weights, &config, &prompt_tokens, max_tokens, &mut sampler, eos)
+            let mut gpu_lock = gpu_arc.as_ref().map(|g| g.lock().unwrap());
+            let mut gpu: Option<&mut crate::backend::GpuBackend> = gpu_lock.as_deref_mut();
+            generate_cached(&weights, &config, &prompt_tokens, max_tokens, &mut sampler, eos, &mut gpu)
         })
         .await;
 
