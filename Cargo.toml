@@ -10,6 +10,9 @@ name = "glint"
 crate-type = ["rlib"]  # maturin adds cdylib automatically when building the Python extension
 
 [features]
+default = ["rayon"]
+rayon = ["dep:rayon"]
+
 # Enable PyO3 Python extension module. Build with: cargo build --features python
 # or let maturin handle it via pyproject.toml.
 python = ["pyo3/extension-module"]
@@ -42,7 +45,8 @@ clap = { version = "4", features = ["derive"] }
 thiserror = "2"
 
 # Data parallelism — work-stealing thread pool for parallelizing matmul across rows.
-rayon = "1.10"
+# Optional so the wasm32 target (single-threaded) can exclude it.
+rayon = { version = "1.10", optional = true }
 
 # HTTP server framework built on tokio — handler-based routing, SSE streaming.
 axum = { version = "0.8", features = ["macros"] }

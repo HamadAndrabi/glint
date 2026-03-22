@@ -108,11 +108,11 @@ impl GlintModel {
             });
             generate_cached(
                 &self.weights, &self.config, &tokens,
-                max_tokens, &mut sampler, self.tokenizer.eos_token_id,
+                max_tokens, &mut sampler, self.tokenizer.eos_token_id, &mut None,
             )
         } else {
             generate_greedy_cached(
-                &self.weights, &self.config, &tokens, max_tokens,
+                &self.weights, &self.config, &tokens, max_tokens, &mut None,
             )
         };
 

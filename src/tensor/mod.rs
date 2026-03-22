@@ -5,7 +5,7 @@ mod tensor;
 mod ops;
 mod dequantize;
 mod quantized;
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", feature = "rayon"))]
 mod simd;
 pub mod flash;
 

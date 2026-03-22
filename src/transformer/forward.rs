@@ -1,5 +1,6 @@
 //! Decoder-only transformer forward pass (LLaMA-style).
 
+#[cfg(feature = "rayon")]
 use rayon::prelude::*;
 
 use crate::backend::GpuBackend;
@@ -411,7 +412,12 @@ fn forward_prefill_inner(
         .unwrap_or(head_dim);
     let scale = 1.0 / (head_dim as f32).sqrt();
 
-    let use_gpu = gpu.is_some();
+    // Use sequential path when GPU is active (GPU parallelism replaces rayon)
+    // or when rayon is not available (e.g. wasm32 builds).
+    #[cfg(feature = "rayon")]
+    let use_sequential = gpu.is_some();
+    #[cfg(not(feature = "rayon"))]
+    let use_sequential = true;
 
     // 1. Embed all tokens
     let mut hidden: Vec<Vec<f32>> = token_ids.iter()
@@ -424,7 +430,7 @@ fn forward_prefill_inner(
 
         // a. Q/K/V projections + RoPE
         // When GPU is active, run sequentially (GPU parallelism replaces rayon).
-        let qkv: Vec<(Vec<f32>, Vec<f32>, Vec<f32>)> = if use_gpu {
+        let qkv: Vec<(Vec<f32>, Vec<f32>, Vec<f32>)> = if use_sequential {
             hidden.iter()
                 .enumerate()
                 .map(|(lp, h)| {
@@ -448,25 +454,30 @@ fn forward_prefill_inner(
                 })
                 .collect()
         } else {
-            hidden.par_iter()
-                .enumerate()
-                .map(|(lp, h)| {
-                    let abs = pos_offset + lp;
-                    let h_t    = Tensor::from_vec(h.clone(), &[embed_dim]);
-                    let normed = tensor::rms_norm(&h_t, &layer.attn_norm, config.rms_norm_eps);
-                    let mut q = layer.attn_q.matvec(normed.data());
-                    let mut k = layer.attn_k.matvec(normed.data());
-                    let mut v = layer.attn_v.matvec(normed.data());
-                    if let Some(ll) = lora_layer {
-                        if let Some(a) = &ll.attn_q { a.apply(normed.data(), q.data_mut()); }
-                        if let Some(a) = &ll.attn_k { a.apply(normed.data(), k.data_mut()); }
-                        if let Some(a) = &ll.attn_v { a.apply(normed.data(), v.data_mut()); }
-                    }
-                    let q = tensor::rope(&q, abs, head_dim, freq_base, rope_scale, rot_dim);
-                    let k = tensor::rope(&k, abs, head_dim, freq_base, rope_scale, rot_dim);
-                    (q.data().to_vec(), k.data().to_vec(), v.data().to_vec())
-                })
-                .collect()
+            #[cfg(feature = "rayon")]
+            {
+                hidden.par_iter()
+                    .enumerate()
+                    .map(|(lp, h)| {
+                        let abs = pos_offset + lp;
+                        let h_t    = Tensor::from_vec(h.clone(), &[embed_dim]);
+                        let normed = tensor::rms_norm(&h_t, &layer.attn_norm, config.rms_norm_eps);
+                        let mut q = layer.attn_q.matvec(normed.data());
+                        let mut k = layer.attn_k.matvec(normed.data());
+                        let mut v = layer.attn_v.matvec(normed.data());
+                        if let Some(ll) = lora_layer {
+                            if let Some(a) = &ll.attn_q { a.apply(normed.data(), q.data_mut()); }
+                            if let Some(a) = &ll.attn_k { a.apply(normed.data(), k.data_mut()); }
+                            if let Some(a) = &ll.attn_v { a.apply(normed.data(), v.data_mut()); }
+                        }
+                        let q = tensor::rope(&q, abs, head_dim, freq_base, rope_scale, rot_dim);
+                        let k = tensor::rope(&k, abs, head_dim, freq_base, rope_scale, rot_dim);
+                        (q.data().to_vec(), k.data().to_vec(), v.data().to_vec())
+                    })
+                    .collect()
+            }
+            #[cfg(not(feature = "rayon"))]
+            unreachable!()
         };
 
         // b. Write all K/V (sequential — must finish before reads below)
@@ -476,7 +487,7 @@ fn forward_prefill_inner(
 
         // c. Attention + output projection
         let cache_ro: &dyn KvStore = &*cache;
-        let attn_outs: Vec<Vec<f32>> = if use_gpu {
+        let attn_outs: Vec<Vec<f32>> = if use_sequential {
             (0..seq_len).map(|lp| {
                 let abs = pos_offset + lp;
                 let window = config.sliding_window
@@ -502,36 +513,41 @@ fn forward_prefill_inner(
                 proj.data().to_vec()
             }).collect()
         } else {
-            (0..seq_len).into_par_iter()
-                .map(|lp| {
-                    let abs = pos_offset + lp;
-                    let window = config.sliding_window
-                        .map(|w| (abs as i64 - w as i64 + 1).max(0) as usize)
-                        .unwrap_or(0);
-                    let attend_len = abs + 1 - window;
-                    let mut out = vec![0.0f32; embed_dim];
-                    for h in 0..n_heads {
-                        let kv_h = h / kv_group;
-                        let q_off = h * head_dim;
-                        tensor::flash_attn_1d(
-                            &qkv[lp].0[q_off..q_off + head_dim],
-                            cache_ro, layer_idx, kv_h,
-                            window, attend_len, head_dim, scale,
-                            &mut out[q_off..q_off + head_dim],
-                        );
-                    }
-                    let attn_vec = Tensor::from_vec(out, &[embed_dim]);
-                    let mut proj = layer.attn_output.matvec(attn_vec.data());
-                    if let Some(ll) = lora_layer {
-                        if let Some(a) = &ll.attn_output { a.apply(attn_vec.data(), proj.data_mut()); }
-                    }
-                    proj.data().to_vec()
-                })
-                .collect()
+            #[cfg(feature = "rayon")]
+            {
+                (0..seq_len).into_par_iter()
+                    .map(|lp| {
+                        let abs = pos_offset + lp;
+                        let window = config.sliding_window
+                            .map(|w| (abs as i64 - w as i64 + 1).max(0) as usize)
+                            .unwrap_or(0);
+                        let attend_len = abs + 1 - window;
+                        let mut out = vec![0.0f32; embed_dim];
+                        for h in 0..n_heads {
+                            let kv_h = h / kv_group;
+                            let q_off = h * head_dim;
+                            tensor::flash_attn_1d(
+                                &qkv[lp].0[q_off..q_off + head_dim],
+                                cache_ro, layer_idx, kv_h,
+                                window, attend_len, head_dim, scale,
+                                &mut out[q_off..q_off + head_dim],
+                            );
+                        }
+                        let attn_vec = Tensor::from_vec(out, &[embed_dim]);
+                        let mut proj = layer.attn_output.matvec(attn_vec.data());
+                        if let Some(ll) = lora_layer {
+                            if let Some(a) = &ll.attn_output { a.apply(attn_vec.data(), proj.data_mut()); }
+                        }
+                        proj.data().to_vec()
+                    })
+                    .collect()
+            }
+            #[cfg(not(feature = "rayon"))]
+            unreachable!()
         };
 
         // d. Residual + FFN
-        if use_gpu {
+        if use_sequential {
             hidden = hidden.into_iter()
                 .zip(attn_outs.into_iter())
                 .map(|(h, ao)| {
@@ -553,17 +569,22 @@ fn forward_prefill_inner(
                 })
                 .collect();
         } else {
-            hidden = hidden.into_par_iter()
-                .zip(attn_outs.into_par_iter())
-                .map(|(h, ao)| {
-                    let h_t        = Tensor::from_vec(h,  &[embed_dim]);
-                    let a_t        = Tensor::from_vec(ao, &[embed_dim]);
-                    let after_attn = tensor::add(&h_t, &a_t);
-                    let nf         = tensor::rms_norm(&after_attn, &layer.ffn_norm, config.rms_norm_eps);
-                    let ffn_out    = feed_forward(&nf, layer, lora_layer, &mut None);
-                    tensor::add(&after_attn, &ffn_out).data().to_vec()
-                })
-                .collect();
+            #[cfg(feature = "rayon")]
+            {
+                hidden = hidden.into_par_iter()
+                    .zip(attn_outs.into_par_iter())
+                    .map(|(h, ao)| {
+                        let h_t        = Tensor::from_vec(h,  &[embed_dim]);
+                        let a_t        = Tensor::from_vec(ao, &[embed_dim]);
+                        let after_attn = tensor::add(&h_t, &a_t);
+                        let nf         = tensor::rms_norm(&after_attn, &layer.ffn_norm, config.rms_norm_eps);
+                        let ffn_out    = feed_forward(&nf, layer, lora_layer, &mut None);
+                        tensor::add(&after_attn, &ffn_out).data().to_vec()
+                    })
+                    .collect();
+            }
+            #[cfg(not(feature = "rayon"))]
+            unreachable!();
         }
     }
 

@@ -10,11 +10,23 @@
 //! cache utilization — more of the model fits in L2/L3 during matmul.
 
 use half::f16;
+#[cfg(feature = "rayon")]
 use rayon::prelude::*;
 
 use crate::error::GlintError;
 use crate::model::gguf::{GgmlType, GgufModel};
 use super::tensor::Tensor;
+
+/// Parallel row iterator when rayon is available, sequential otherwise.
+#[cfg(feature = "rayon")]
+fn par_rows(rows: usize) -> rayon::range::Iter<usize> {
+    (0..rows).into_par_iter()
+}
+
+#[cfg(not(feature = "rayon"))]
+fn par_rows(rows: usize) -> std::ops::Range<usize> {
+    0..rows
+}
 use super::dequantize::{dequantize, get_scale_min_q4k};
 
 /// A weight matrix stored in its original quantized format.
@@ -192,7 +204,7 @@ impl QuantizedTensor {
 // Runtime CPU feature detection → SIMD if available, scalar fallback otherwise.
 
 fn dispatch_q8_0(data: &[u8], rows: usize, cols: usize, vec: &[f32]) -> Vec<f32> {
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", feature = "rayon"))]
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
             // SAFETY: we just verified AVX2+FMA are available.
@@ -203,7 +215,7 @@ fn dispatch_q8_0(data: &[u8], rows: usize, cols: usize, vec: &[f32]) -> Vec<f32>
 }
 
 fn dispatch_q4_k(data: &[u8], rows: usize, cols: usize, vec: &[f32]) -> Vec<f32> {
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", feature = "rayon"))]
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
             return unsafe { crate::tensor::simd::matvec_q4_k_avx2(data, rows, cols, vec) };
@@ -213,7 +225,7 @@ fn dispatch_q4_k(data: &[u8], rows: usize, cols: usize, vec: &[f32]) -> Vec<f32>
 }
 
 fn dispatch_q5_k(data: &[u8], rows: usize, cols: usize, vec: &[f32]) -> Vec<f32> {
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", feature = "rayon"))]
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
             return unsafe { crate::tensor::simd::matvec_q5_k_avx2(data, rows, cols, vec) };
@@ -223,7 +235,7 @@ fn dispatch_q5_k(data: &[u8], rows: usize, cols: usize, vec: &[f32]) -> Vec<f32>
 }
 
 fn dispatch_q6_k(data: &[u8], rows: usize, cols: usize, vec: &[f32]) -> Vec<f32> {
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", feature = "rayon"))]
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
             return unsafe { crate::tensor::simd::matvec_q6_k_avx2(data, rows, cols, vec) };
@@ -233,7 +245,7 @@ fn dispatch_q6_k(data: &[u8], rows: usize, cols: usize, vec: &[f32]) -> Vec<f32>
 }
 
 fn dispatch_q4_0(data: &[u8], rows: usize, cols: usize, vec: &[f32]) -> Vec<f32> {
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", feature = "rayon"))]
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
             return unsafe { crate::tensor::simd::matvec_q4_0_avx2(data, rows, cols, vec) };
@@ -258,8 +270,7 @@ pub(crate) fn matvec_q8_0_scalar(data: &[u8], rows: usize, cols: usize, vec: &[f
     let n_blocks = cols / BLOCK_ELEMS;
     let bytes_per_row = n_blocks * BLOCK_BYTES;
 
-    (0..rows)
-        .into_par_iter()
+    par_rows(rows)
         .map(|i| {
             let row_start = i * bytes_per_row;
             let mut sum = 0.0f32;
@@ -290,8 +301,7 @@ pub(crate) fn matvec_q4_0_scalar(data: &[u8], rows: usize, cols: usize, vec: &[f
     let n_blocks = cols / BLOCK_ELEMS;
     let bytes_per_row = n_blocks * BLOCK_BYTES;
 
-    (0..rows)
-        .into_par_iter()
+    par_rows(rows)
         .map(|i| {
             let row_start = i * bytes_per_row;
             let mut sum = 0.0f32;
@@ -330,8 +340,7 @@ fn matvec_q4_k_scalar(data: &[u8], rows: usize, cols: usize, vec: &[f32]) -> Vec
     let n_super = cols / SUPER_BLOCK;
     let bytes_per_row = n_super * BLOCK_BYTES;
 
-    (0..rows)
-        .into_par_iter()
+    par_rows(rows)
         .map(|r| {
             let mut acc = 0.0f32;
             let row = &data[r * bytes_per_row..];
@@ -376,8 +385,7 @@ fn matvec_q5_k_scalar(data: &[u8], rows: usize, cols: usize, vec: &[f32]) -> Vec
     let n_super = cols / SUPER_BLOCK;
     let bytes_per_row = n_super * BLOCK_BYTES;
 
-    (0..rows)
-        .into_par_iter()
+    par_rows(rows)
         .map(|r| {
             let mut acc = 0.0f32;
             let row = &data[r * bytes_per_row..];
@@ -430,8 +438,7 @@ fn matvec_q6_k_scalar(data: &[u8], rows: usize, cols: usize, vec: &[f32]) -> Vec
     let n_super = cols / SUPER_BLOCK;
     let bytes_per_row = n_super * BLOCK_BYTES;
 
-    (0..rows)
-        .into_par_iter()
+    par_rows(rows)
         .map(|r| {
             let mut acc = 0.0f32;
             let row = &data[r * bytes_per_row..];
@@ -497,8 +504,7 @@ fn matvec_q2_k_scalar(data: &[u8], rows: usize, cols: usize, vec: &[f32]) -> Vec
     let n_super = cols / SUPER_BLOCK;
     let bytes_per_row = n_super * BLOCK_BYTES;
 
-    (0..rows)
-        .into_par_iter()
+    par_rows(rows)
         .map(|r| {
             let mut acc = 0.0f32;
             let row = &data[r * bytes_per_row..];
@@ -535,8 +541,7 @@ fn matvec_q3_k_scalar(data: &[u8], rows: usize, cols: usize, vec: &[f32]) -> Vec
     let n_super = cols / SUPER_BLOCK;
     let bytes_per_row = n_super * BLOCK_BYTES;
 
-    (0..rows)
-        .into_par_iter()
+    par_rows(rows)
         .map(|r| {
             let mut acc = 0.0f32;
             let row = &data[r * bytes_per_row..];
@@ -589,8 +594,7 @@ fn matvec_iq4_nl_scalar(data: &[u8], rows: usize, cols: usize, vec: &[f32]) -> V
     let n_blocks = cols / BLOCK_SIZE;
     let bytes_per_row = n_blocks * BLOCK_BYTES;
 
-    (0..rows)
-        .into_par_iter()
+    par_rows(rows)
         .map(|r| {
             let mut acc = 0.0f32;
             let row = &data[r * bytes_per_row..];
@@ -626,8 +630,7 @@ fn matvec_fallback(
     let n_blocks = cols.div_ceil(block_size);
     let bytes_per_row = n_blocks * type_size;
 
-    (0..rows)
-        .into_par_iter()
+    par_rows(rows)
         .map(|i| {
             let row_bytes = &data[i * bytes_per_row..(i + 1) * bytes_per_row];
             let row_f32 = dequantize(row_bytes, ggml_type, cols);
