@@ -22,6 +22,18 @@ pub enum GlintError {
     MissingVocabulary,
     /// The GGUF metadata does not contain a recognised model architecture.
     MissingModelConfig,
+    /// No compatible GPU adapter was found (Vulkan/Metal/DX12).
+    #[cfg(feature = "vulkan")]
+    GpuAdapterNotFound,
+    /// Failed to obtain a GPU device or queue.
+    #[cfg(feature = "vulkan")]
+    GpuDeviceError(String),
+    /// A GPU buffer operation (upload, download, map) failed.
+    #[cfg(feature = "vulkan")]
+    GpuBufferError(String),
+    /// A GPU compute shader failed to compile or execute.
+    #[cfg(feature = "vulkan")]
+    GpuShaderError(String),
 }
 
 impl fmt::Display for GlintError {
@@ -49,6 +61,16 @@ impl fmt::Display for GlintError {
             Self::MissingModelConfig => {
                 write!(f, "could not extract model configuration from GGUF metadata")
             }
+            #[cfg(feature = "vulkan")]
+            Self::GpuAdapterNotFound => {
+                write!(f, "no compatible GPU adapter found (need Vulkan, Metal, or DX12)")
+            }
+            #[cfg(feature = "vulkan")]
+            Self::GpuDeviceError(msg) => write!(f, "GPU device error: {msg}"),
+            #[cfg(feature = "vulkan")]
+            Self::GpuBufferError(msg) => write!(f, "GPU buffer error: {msg}"),
+            #[cfg(feature = "vulkan")]
+            Self::GpuShaderError(msg) => write!(f, "GPU shader error: {msg}"),
         }
     }
 }

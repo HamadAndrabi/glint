@@ -18,6 +18,10 @@ python = ["pyo3/extension-module"]
 #   wasm-pack build --target web --features wasm
 wasm = ["dep:wasm-bindgen", "dep:js-sys", "dep:console_error_panic_hook"]
 
+# Enable GPU compute backend via wgpu (Vulkan/Metal/DX12). Build with:
+#   cargo build --release --features vulkan
+vulkan = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
+
 [dependencies]
 # Memory-mapped file I/O — lets us map the GGUF file directly into virtual memory
 # instead of reading it all into the heap. The OS handles paging data in/out.
@@ -72,6 +76,11 @@ pyo3 = { version = "0.22", optional = true }
 wasm-bindgen           = { version = "0.2",  optional = true }
 js-sys                 = { version = "0.3",  optional = true }
 console_error_panic_hook = { version = "0.1", optional = true }
+
+# GPU compute via wgpu — Vulkan/Metal/DX12 backend for accelerated inference.
+wgpu     = { version = "24",  optional = true }
+pollster = { version = "0.4", optional = true }
+bytemuck = { version = "1",   features = ["derive"], optional = true }
 
 [dev-dependencies]
 # Creates temporary files/directories for tests that auto-clean on drop.

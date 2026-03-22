@@ -13,6 +13,7 @@
 //! If rejected, sample from the residual distribution `max(0, p(x) - q(x)) / Z`.
 //! If all `k` accepted, sample one extra token from target logits.
 
+use crate::backend::GpuBackend;
 use crate::cache::{KvCache, KvStore};
 use crate::model::config::ModelConfig;
 use crate::tensor::{softmax, Tensor};
@@ -43,6 +44,7 @@ pub fn speculative_decode(
     lookahead: usize,
     temperature: f32,
     eos_token: u32,
+    gpu: &mut Option<&mut GpuBackend>,
 ) -> Vec<u32> {
     let lookahead = lookahead.max(1);
 
@@ -61,8 +63,9 @@ pub fn speculative_decode(
     );
 
     // Prefill both caches with the prompt
-    forward_prefill_all(draft_weights,  draft_config,  prompt_tokens, &mut draft_cache,  0);
-    forward_prefill_all(target_weights, target_config, prompt_tokens, &mut target_cache, 0);
+    // Draft model always runs on CPU; target model uses GPU if available.
+    forward_prefill_all(draft_weights,  draft_config,  prompt_tokens, &mut draft_cache,  0, &mut None);
+    forward_prefill_all(target_weights, target_config, prompt_tokens, &mut target_cache, 0, gpu);
 
     let mut tokens = prompt_tokens.to_vec();
     let mut rng = rand_seed(42);
@@ -83,7 +86,7 @@ pub fn speculative_decode(
 
         let mut draft_pos = current_len;
         for _ in 0..k {
-            let logits = forward_one(draft_weights, draft_config, *tokens.last().unwrap_or(&0), draft_pos - 1, &mut draft_cache);
+            let logits = forward_one(draft_weights, draft_config, *tokens.last().unwrap_or(&0), draft_pos - 1, &mut draft_cache, &mut None);
             // Draft uses temperature sampling to get probabilities
             let probs = softmax_with_temp(logits.data(), temperature);
             let sampled = sample_from_probs(&probs, &mut rng);
@@ -110,6 +113,7 @@ pub fn speculative_decode(
             &draft_tokens,
             &mut target_cache,
             current_len,
+            gpu,
         );
 
         // 3. Acceptance-rejection sampling
@@ -166,8 +170,8 @@ pub fn speculative_decode(
         // Re-prefill both caches with the newly accepted tokens
         let new_tokens = &tokens[current_len..new_len];
         if !new_tokens.is_empty() {
-            forward_prefill_all(draft_weights,  draft_config,  new_tokens, &mut draft_cache,  current_len);
-            forward_prefill_all(target_weights, target_config, new_tokens, &mut target_cache, current_len);
+            forward_prefill_all(draft_weights,  draft_config,  new_tokens, &mut draft_cache,  current_len, &mut None);
+            forward_prefill_all(target_weights, target_config, new_tokens, &mut target_cache, current_len, gpu);
         }
 
         if tokens.last() == Some(&eos_token) { break; }

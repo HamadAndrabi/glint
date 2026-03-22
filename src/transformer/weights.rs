@@ -86,6 +86,29 @@ impl TransformerWeights {
         Ok(Self { token_embedding, layers, output_norm, output, lora: None })
     }
 
+    /// Upload all quantized weight tensors to the GPU.
+    ///
+    /// After this call, `matvec_gpu()` on any weight tensor will dispatch to
+    /// the GPU instead of the CPU. Call once at startup before inference.
+    #[cfg(feature = "vulkan")]
+    pub fn upload_all_to_gpu(&mut self, gpu: &mut crate::backend::GpuBackend) {
+        eprintln!("Uploading weights to GPU...");
+        self.token_embedding.upload_to_gpu(gpu, "token_embd");
+        self.output.upload_to_gpu(gpu, "output");
+        let n_layers = self.layers.len();
+        for (i, layer) in self.layers.iter_mut().enumerate() {
+            eprint!("\r  Layer {}/{}...", i + 1, n_layers);
+            layer.attn_q.upload_to_gpu(gpu, &format!("blk.{i}.attn_q"));
+            layer.attn_k.upload_to_gpu(gpu, &format!("blk.{i}.attn_k"));
+            layer.attn_v.upload_to_gpu(gpu, &format!("blk.{i}.attn_v"));
+            layer.attn_output.upload_to_gpu(gpu, &format!("blk.{i}.attn_output"));
+            layer.ffn_gate.upload_to_gpu(gpu, &format!("blk.{i}.ffn_gate"));
+            layer.ffn_up.upload_to_gpu(gpu, &format!("blk.{i}.ffn_up"));
+            layer.ffn_down.upload_to_gpu(gpu, &format!("blk.{i}.ffn_down"));
+        }
+        eprintln!("\r  Uploaded all layers.       ");
+    }
+
     /// Attach LoRA adapters loaded from a separate GGUF file.
     ///
     /// Returns `Self` unchanged if the file contains no LoRA tensors.

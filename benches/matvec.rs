@@ -198,6 +198,123 @@ fn bench_comparison(c: &mut Criterion) {
     group.finish();
 }
 
+// ── GPU benchmarks (only when `vulkan` feature is enabled) ────────────────
+
+#[cfg(feature = "vulkan")]
+fn bench_gpu_vs_cpu(c: &mut Criterion) {
+    use glint::backend::GpuBackend;
+
+    let mut gpu = match GpuBackend::new() {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("GPU unavailable, skipping GPU benchmarks: {e}");
+            return;
+        }
+    };
+
+    let mut group = c.benchmark_group("gpu_vs_cpu_4096");
+    let (rows, cols) = (4096, 4096);
+    let input = make_input(cols);
+
+    group.throughput(Throughput::Elements((rows * cols) as u64));
+
+    // Q8_0 — CPU (AVX2+FMA)
+    let qt_q8 = make_matrix(rows, cols, GgmlType::Q8_0);
+    group.bench_function("Q8_0_cpu", |b| {
+        b.iter(|| { black_box(qt_q8.matvec(black_box(&input))); });
+    });
+
+    // Q8_0 — GPU
+    gpu.upload_buffer("bench_q8", qt_q8.raw_data());
+    group.bench_function("Q8_0_gpu", |b| {
+        b.iter(|| {
+            black_box(
+                gpu.matvec_q8_0("bench_q8", black_box(&input), rows as u32, cols as u32)
+                    .unwrap(),
+            );
+        });
+    });
+
+    // Q4_0 — CPU
+    let qt_q4 = make_matrix(rows, cols, GgmlType::Q4_0);
+    group.bench_function("Q4_0_cpu", |b| {
+        b.iter(|| { black_box(qt_q4.matvec(black_box(&input))); });
+    });
+
+    // Q4_0 — GPU
+    gpu.upload_buffer("bench_q4", qt_q4.raw_data());
+    group.bench_function("Q4_0_gpu", |b| {
+        b.iter(|| {
+            black_box(
+                gpu.matvec_q4_0("bench_q4", black_box(&input), rows as u32, cols as u32)
+                    .unwrap(),
+            );
+        });
+    });
+
+    group.finish();
+}
+
+/// GPU vs CPU at multiple sizes — shows where GPU crossover happens.
+#[cfg(feature = "vulkan")]
+fn bench_gpu_scaling(c: &mut Criterion) {
+    use glint::backend::GpuBackend;
+
+    let mut gpu = match GpuBackend::new() {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("GPU unavailable, skipping scaling benchmarks: {e}");
+            return;
+        }
+    };
+
+    let mut group = c.benchmark_group("gpu_scaling_Q8_0");
+
+    for &(rows, cols) in SIZES {
+        let qt = make_q8_0(rows, cols);
+        let input = make_input(cols);
+
+        group.throughput(Throughput::Elements((rows * cols) as u64));
+
+        group.bench_with_input(
+            BenchmarkId::new("cpu", format!("{rows}x{cols}")),
+            &(&qt, &input),
+            |b, (qt, input)| { b.iter(|| { black_box(qt.matvec(black_box(input))); }); },
+        );
+
+        let buf_name = format!("scale_{rows}x{cols}");
+        gpu.upload_buffer(&buf_name, qt.raw_data());
+        group.bench_with_input(
+            BenchmarkId::new("gpu", format!("{rows}x{cols}")),
+            &input,
+            |b, input| {
+                b.iter(|| {
+                    black_box(
+                        gpu.matvec_q8_0(&buf_name, black_box(input), rows as u32, cols as u32)
+                            .unwrap(),
+                    );
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
+#[cfg(feature = "vulkan")]
+criterion_group!(
+    benches,
+    bench_q8_0,
+    bench_q4_0,
+    bench_q4_k,
+    bench_q5_k,
+    bench_q6_k,
+    bench_comparison,
+    bench_gpu_vs_cpu,
+    bench_gpu_scaling,
+);
+
+#[cfg(not(feature = "vulkan"))]
 criterion_group!(
     benches,
     bench_q8_0,
@@ -207,4 +324,5 @@ criterion_group!(
     bench_q6_k,
     bench_comparison,
 );
+
 criterion_main!(benches);
