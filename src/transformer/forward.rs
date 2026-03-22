@@ -332,18 +332,56 @@ fn attention_cached(
     let mut attn_output = vec![0.0f32; embed_dim];
 
     let cache_ro: &dyn KvStore = &*cache;
-    for h in 0..n_heads {
-        let kv_h = h / kv_group_size;
-        let q_offset = h * head_dim;
-        tensor::flash_attn_1d(
-            &q_all.data()[q_offset..q_offset + head_dim],
-            cache_ro, layer_idx, kv_h,
-            window_start, attend_len, head_dim, scale,
-            &mut attn_output[q_offset..q_offset + head_dim],
-        );
-    }
 
-    let attn_vec = Tensor::from_vec(attn_output, &[embed_dim]);
+    // ── GPU attention path ──────────────────────────────────────────────────
+    // Extract K/V from the cache into flat CPU buffers, then dispatch all
+    // query heads to the GPU in one call. Falls back to CPU flash attention
+    // if the GPU path is unavailable or seq_len exceeds the shader's MAX_SEQ.
+    #[cfg(feature = "vulkan")]
+    let gpu_attn: Option<Tensor> = {
+        if let Some(ref mut g) = *gpu {
+            if attend_len <= 4096 {
+                let kv_stride = n_kv_heads * head_dim;
+                let mut k_flat = vec![0.0f32; attend_len * kv_stride];
+                let mut v_flat = vec![0.0f32; attend_len * kv_stride];
+                for i in 0..attend_len {
+                    for kv_h in 0..n_kv_heads {
+                        let off = i * kv_stride + kv_h * head_dim;
+                        cache_ro.read_k_head(layer_idx, window_start + i, kv_h, head_dim, &mut k_flat[off..off + head_dim]);
+                        cache_ro.read_v_head(layer_idx, window_start + i, kv_h, head_dim, &mut v_flat[off..off + head_dim]);
+                    }
+                }
+                g.attention(
+                    q_all.data(), &k_flat, &v_flat,
+                    n_heads as u32, n_kv_heads as u32,
+                    head_dim as u32, attend_len as u32, scale,
+                ).ok().map(|data| Tensor::from_vec(data, &[embed_dim]))
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+    #[cfg(not(feature = "vulkan"))]
+    let gpu_attn: Option<Tensor> = None;
+
+    let attn_vec = if let Some(t) = gpu_attn {
+        t
+    } else {
+        // CPU flash attention (tiled online softmax, O(1) extra memory per head)
+        for h in 0..n_heads {
+            let kv_h = h / kv_group_size;
+            let q_offset = h * head_dim;
+            tensor::flash_attn_1d(
+                &q_all.data()[q_offset..q_offset + head_dim],
+                cache_ro, layer_idx, kv_h,
+                window_start, attend_len, head_dim, scale,
+                &mut attn_output[q_offset..q_offset + head_dim],
+            );
+        }
+        Tensor::from_vec(attn_output, &[embed_dim])
+    };
     let mut out = matvec_maybe_gpu(&layer.attn_output, attn_vec.data(), reborrow(gpu));
     if let Some(ll) = lora {
         if let Some(a) = &ll.attn_output { a.apply(attn_vec.data(), out.data_mut()); }

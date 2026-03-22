@@ -14,6 +14,7 @@ pub enum PipelineKind {
     MatvecQ5K,
     MatvecQ6K,
     MatvecF32,
+    Attention,
     RmsNorm,
     SiluMul,
     Rope,
@@ -83,6 +84,11 @@ impl Pipeline {
             (
                 PipelineKind::Add,
                 include_str!("shaders/add.wgsl"),
+                "main",
+            ),
+            (
+                PipelineKind::Attention,
+                include_str!("shaders/attention.wgsl"),
                 "main",
             ),
         ];

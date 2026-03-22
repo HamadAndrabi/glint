@@ -63,6 +63,9 @@ impl GpuBackend {
         let required_limits = wgpu::Limits {
             max_storage_buffer_binding_size: 1 << 30, // 1 GiB
             max_buffer_size: 2 << 30,                 // 2 GiB
+            // Attention shader uses 16 384 B (scores) + 512 B (partial) = 16 896 B
+            // of workgroup memory — above the 16 384 B WebGPU baseline.
+            max_compute_workgroup_storage_size: 32768, // 32 KiB; supported by all Vulkan/DX12/Metal GPUs
             ..wgpu::Limits::downlevel_defaults()
         };
 
@@ -246,6 +249,120 @@ impl GpuBackend {
         cols: u32,
     ) -> Result<Vec<f32>, GlintError> {
         self.dispatch_matvec(PipelineKind::MatvecQ6K, weight_buf, input, rows, cols)
+    }
+
+    /// Dispatch single-query multi-head attention for the decode step.
+    ///
+    /// * `q`          — flat query [n_heads * head_dim]
+    /// * `k`          — flat keys  [seq_len * n_kv_heads * head_dim]
+    /// * `v`          — flat values[seq_len * n_kv_heads * head_dim]
+    /// * Returns      — flat attention output [n_heads * head_dim]
+    ///
+    /// Falls back (returns `Err`) if seq_len > 4096 (shader's MAX_SEQ).
+    pub fn attention(
+        &mut self,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        n_heads: u32,
+        n_kv_heads: u32,
+        head_dim: u32,
+        seq_len: u32,
+        scale: f32,
+    ) -> Result<Vec<f32>, GlintError> {
+        const MAX_SEQ: u32 = 4096;
+        if seq_len > MAX_SEQ {
+            return Err(GlintError::GpuShaderError(format!(
+                "attention: seq_len {seq_len} > MAX_SEQ {MAX_SEQ}"
+            )));
+        }
+
+        let pipeline = self
+            .pipelines
+            .get(&PipelineKind::Attention)
+            .ok_or_else(|| GlintError::GpuShaderError("Attention pipeline not found".into()))?;
+
+        // Params: [n_heads, n_kv_heads, head_dim, seq_len, scale_bits]
+        let params_data: [u32; 5] = [n_heads, n_kv_heads, head_dim, seq_len, scale.to_bits()];
+        let params_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("attn-params"),
+            contents: bytemuck::cast_slice(&params_data),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+
+        let q_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("attn-q"),
+            contents: bytemuck::cast_slice(q),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let k_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("attn-k"),
+            contents: bytemuck::cast_slice(k),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let v_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("attn-v"),
+            contents: bytemuck::cast_slice(v),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+
+        let output_size = (n_heads as usize * head_dim as usize) * std::mem::size_of::<f32>();
+        let out_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("attn-out"),
+            size: output_size as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("attn-bg"),
+            layout: &pipeline.pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: params_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: q_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: k_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: v_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: out_buf.as_entire_binding() },
+            ],
+        });
+
+        // One workgroup per query head
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("attn-dispatch"),
+        });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("attention"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&pipeline.pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(n_heads, 1, 1);
+        }
+
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("attn-staging"),
+            size: output_size as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        encoder.copy_buffer_to_buffer(&out_buf, 0, &staging, 0, output_size as u64);
+        self.queue.submit(std::iter::once(encoder.finish()));
+
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| { tx.send(r).ok(); });
+        self.device.poll(wgpu::Maintain::Wait);
+        rx.recv()
+            .map_err(|e| GlintError::GpuBufferError(format!("channel: {e}")))?
+            .map_err(|e| GlintError::GpuBufferError(format!("map: {e}")))?;
+
+        let data = slice.get_mapped_range();
+        let result: Vec<f32> = bytemuck::cast_slice(&data).to_vec();
+        drop(data);
+        staging.unmap();
+
+        Ok(result)
     }
 
     /// Dispatch an f32 matvec.
