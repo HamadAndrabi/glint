@@ -10,6 +10,9 @@ use std::collections::HashMap;
 pub enum PipelineKind {
     MatvecQ8_0,
     MatvecQ4_0,
+    MatvecQ4K,
+    MatvecQ5K,
+    MatvecQ6K,
     MatvecF32,
     RmsNorm,
     SiluMul,
@@ -35,6 +38,21 @@ impl Pipeline {
             (
                 PipelineKind::MatvecQ4_0,
                 include_str!("shaders/matvec_q4_0.wgsl"),
+                "main",
+            ),
+            (
+                PipelineKind::MatvecQ4K,
+                include_str!("shaders/matvec_q4_k.wgsl"),
+                "main",
+            ),
+            (
+                PipelineKind::MatvecQ5K,
+                include_str!("shaders/matvec_q5_k.wgsl"),
+                "main",
+            ),
+            (
+                PipelineKind::MatvecQ6K,
+                include_str!("shaders/matvec_q6_k.wgsl"),
                 "main",
             ),
             (

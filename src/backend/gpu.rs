@@ -215,6 +215,39 @@ impl GpuBackend {
         self.dispatch_matvec(PipelineKind::MatvecQ4_0, weight_buf, input, rows, cols)
     }
 
+    /// Dispatch a quantized matvec (Q4_K, 256-element super-blocks).
+    pub fn matvec_q4_k(
+        &mut self,
+        weight_buf: &str,
+        input: &[f32],
+        rows: u32,
+        cols: u32,
+    ) -> Result<Vec<f32>, GlintError> {
+        self.dispatch_matvec(PipelineKind::MatvecQ4K, weight_buf, input, rows, cols)
+    }
+
+    /// Dispatch a quantized matvec (Q5_K, 256-element super-blocks).
+    pub fn matvec_q5_k(
+        &mut self,
+        weight_buf: &str,
+        input: &[f32],
+        rows: u32,
+        cols: u32,
+    ) -> Result<Vec<f32>, GlintError> {
+        self.dispatch_matvec(PipelineKind::MatvecQ5K, weight_buf, input, rows, cols)
+    }
+
+    /// Dispatch a quantized matvec (Q6_K, 256-element super-blocks).
+    pub fn matvec_q6_k(
+        &mut self,
+        weight_buf: &str,
+        input: &[f32],
+        rows: u32,
+        cols: u32,
+    ) -> Result<Vec<f32>, GlintError> {
+        self.dispatch_matvec(PipelineKind::MatvecQ6K, weight_buf, input, rows, cols)
+    }
+
     /// Dispatch an f32 matvec.
     pub fn matvec_f32(
         &mut self,

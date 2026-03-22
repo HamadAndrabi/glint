@@ -185,8 +185,11 @@ impl QuantizedTensor {
             let result = match self.ggml_type {
                 GgmlType::Q8_0 => gpu.matvec_q8_0(buf_name, vec, self.rows as u32, self.cols as u32),
                 GgmlType::Q4_0 => gpu.matvec_q4_0(buf_name, vec, self.rows as u32, self.cols as u32),
+                GgmlType::Q4K  => gpu.matvec_q4_k(buf_name, vec, self.rows as u32, self.cols as u32),
+                GgmlType::Q5K  => gpu.matvec_q5_k(buf_name, vec, self.rows as u32, self.cols as u32),
+                GgmlType::Q6K  => gpu.matvec_q6_k(buf_name, vec, self.rows as u32, self.cols as u32),
                 GgmlType::F32  => gpu.matvec_f32(buf_name, vec, self.rows as u32, self.cols as u32),
-                // Formats without GPU kernels fall through to CPU
+                // Remaining formats fall through to CPU
                 _ => return self.matvec(vec),
             };
             match result {
