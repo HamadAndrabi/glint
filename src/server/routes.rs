@@ -21,13 +21,12 @@ use axum::http::StatusCode;
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 
 use crate::model::chat_template::Message;
-use crate::sampling::{Sampler, SamplerConfig};
-use crate::transformer::{embed, generate_cached, generate_streaming};
+use crate::sampling::SamplerConfig;
+use crate::transformer::embed;
 
 use super::state::AppState;
 use super::types::*;
@@ -180,50 +179,40 @@ async fn non_streaming_completion(
     eos: u32,
     model_name: String,
 ) -> Response {
-    // Clone Arcs so the blocking closure can own them
-    let weights = Arc::clone(&state.weights);
-    let config = Arc::clone(&state.config);
-
-    let gpu_arc = state.gpu.clone();
+    let rx = match state.engine.submit(prompt_tokens, max_tokens, sampler_cfg, eos) {
+        Some(rx) => rx,
+        None => return api_error(StatusCode::SERVICE_UNAVAILABLE, "Inference engine unavailable"),
+    };
 
     let t0 = Instant::now();
-    let result = tokio::task::spawn_blocking(move || {
-        let mut sampler = Sampler::new(sampler_cfg);
-        let mut gpu_lock = gpu_arc.as_ref().map(|g| g.lock().unwrap());
-        let mut gpu: Option<&mut crate::backend::GpuBackend> = gpu_lock.as_deref_mut();
-        generate_cached(&weights, &config, &prompt_tokens, max_tokens, &mut sampler, eos, &mut gpu)
-    })
-    .await;
-
-    match result {
-        Err(_) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "Inference task panicked"),
-        Ok(output_tokens) => {
-            let elapsed_ms = t0.elapsed().as_millis() as u64;
-            let generated = &output_tokens[prompt_len..];
-            // Re-clone tokenizer to decode (we moved it into spawn_blocking)
-            let text = state.tokenizer.decode(generated);
-            let completion_tokens = generated.len();
-            state.metrics.record(completion_tokens as u64, elapsed_ms);
-
-            Json(CompletionResponse {
-                id: gen_id(),
-                object: "text_completion",
-                created: now_secs(),
-                model: model_name,
-                choices: vec![CompletionChoice {
-                    text,
-                    index: 0,
-                    finish_reason: "stop",
-                }],
-                usage: UsageInfo {
-                    prompt_tokens: prompt_len,
-                    completion_tokens,
-                    total_tokens: prompt_len + completion_tokens,
-                },
-            })
-            .into_response()
-        }
+    let mut stream = ReceiverStream::new(rx);
+    let mut generated_ids: Vec<u32> = Vec::new();
+    while let Some(token_id) = stream.next().await {
+        generated_ids.push(token_id);
     }
+
+    let elapsed_ms = t0.elapsed().as_millis() as u64;
+    let text = state.tokenizer.decode(&generated_ids);
+    let completion_tokens = generated_ids.len();
+    state.metrics.record(completion_tokens as u64, elapsed_ms);
+
+    Json(CompletionResponse {
+        id: gen_id(),
+        object: "text_completion",
+        created: now_secs(),
+        model: model_name,
+        choices: vec![CompletionChoice {
+            text,
+            index: 0,
+            finish_reason: "stop",
+        }],
+        usage: UsageInfo {
+            prompt_tokens: prompt_len,
+            completion_tokens,
+            total_tokens: prompt_len + completion_tokens,
+        },
+    })
+    .into_response()
 }
 
 async fn streaming_completion(
@@ -234,37 +223,11 @@ async fn streaming_completion(
     eos: u32,
     model_name: String,
 ) -> Response {
-    // Channel: blocking inference thread sends token IDs; async handler reads them
-    let (tx, rx) = mpsc::channel::<u32>(64);
+    let rx = match state.engine.submit(prompt_tokens, max_tokens, sampler_cfg, eos) {
+        Some(rx) => rx,
+        None => return api_error(StatusCode::SERVICE_UNAVAILABLE, "Inference engine unavailable"),
+    };
 
-    // Spawn inference on the blocking thread pool
-    let weights = Arc::clone(&state.weights);
-    let config = Arc::clone(&state.config);
-    let gpu_arc = state.gpu.clone();
-    let prompt_len = prompt_tokens.len();
-    let state_m = Arc::clone(&state);
-    tokio::task::spawn_blocking(move || {
-        let mut sampler = Sampler::new(sampler_cfg);
-        let mut gpu_lock = gpu_arc.as_ref().map(|g| g.lock().unwrap());
-        let mut gpu: Option<&mut crate::backend::GpuBackend> = gpu_lock.as_deref_mut();
-        let output = generate_streaming(
-            &weights,
-            &config,
-            &prompt_tokens,
-            max_tokens,
-            &mut sampler,
-            eos,
-            |token_id| {
-                // blocking_send returns Err if the receiver is dropped (client disconnected)
-                tx.blocking_send(token_id).is_ok()
-            },
-            &mut gpu,
-        );
-        let n_gen = output.len().saturating_sub(prompt_len);
-        state_m.metrics.record(n_gen as u64, 0);
-    });
-
-    // Wrap the receiver in a Stream and map each token_id to an SSE Event
     let tokenizer = Arc::clone(&state.tokenizer);
     let id = gen_id();
     let created = now_secs();
@@ -286,7 +249,6 @@ async fn streaming_completion(
         Ok::<Event, Infallible>(Event::default().data(data))
     });
 
-    // Append the final [DONE] sentinel
     let done_stream = stream.chain(tokio_stream::once(Ok::<Event, Infallible>(
         Event::default().data("[DONE]"),
     )));
@@ -343,50 +305,43 @@ pub async fn chat_completions(
         // For streaming chat, reuse the completions streaming path
         streaming_completion(state, prompt_tokens, max_tokens, sampler_cfg, eos, model_name).await
     } else {
-        let weights = Arc::clone(&state.weights);
-        let config = Arc::clone(&state.config);
-        let gpu_arc = state.gpu.clone();
+        let rx = match state.engine.submit(prompt_tokens, max_tokens, sampler_cfg, eos) {
+            Some(rx) => rx,
+            None => return api_error(StatusCode::SERVICE_UNAVAILABLE, "Inference engine unavailable"),
+        };
 
         let t0 = Instant::now();
-        let result = tokio::task::spawn_blocking(move || {
-            let mut sampler = Sampler::new(sampler_cfg);
-            let mut gpu_lock = gpu_arc.as_ref().map(|g| g.lock().unwrap());
-            let mut gpu: Option<&mut crate::backend::GpuBackend> = gpu_lock.as_deref_mut();
-            generate_cached(&weights, &config, &prompt_tokens, max_tokens, &mut sampler, eos, &mut gpu)
-        })
-        .await;
-
-        match result {
-            Err(_) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "Inference task panicked"),
-            Ok(output_tokens) => {
-                let elapsed_ms = t0.elapsed().as_millis() as u64;
-                let generated = &output_tokens[prompt_len..];
-                let text = state.tokenizer.decode(generated);
-                let completion_tokens = generated.len();
-                state.metrics.record(completion_tokens as u64, elapsed_ms);
-
-                Json(ChatCompletionResponse {
-                    id: gen_id(),
-                    object: "chat.completion",
-                    created: now_secs(),
-                    model: model_name,
-                    choices: vec![ChatChoice {
-                        index: 0,
-                        message: ChatMessageOut {
-                            role: "assistant",
-                            content: text,
-                        },
-                        finish_reason: "stop",
-                    }],
-                    usage: UsageInfo {
-                        prompt_tokens: prompt_len,
-                        completion_tokens,
-                        total_tokens: prompt_len + completion_tokens,
-                    },
-                })
-                .into_response()
-            }
+        let mut stream = ReceiverStream::new(rx);
+        let mut generated_ids: Vec<u32> = Vec::new();
+        while let Some(token_id) = stream.next().await {
+            generated_ids.push(token_id);
         }
+
+        let elapsed_ms = t0.elapsed().as_millis() as u64;
+        let text = state.tokenizer.decode(&generated_ids);
+        let completion_tokens = generated_ids.len();
+        state.metrics.record(completion_tokens as u64, elapsed_ms);
+
+        Json(ChatCompletionResponse {
+            id: gen_id(),
+            object: "chat.completion",
+            created: now_secs(),
+            model: model_name,
+            choices: vec![ChatChoice {
+                index: 0,
+                message: ChatMessageOut {
+                    role: "assistant",
+                    content: text,
+                },
+                finish_reason: "stop",
+            }],
+            usage: UsageInfo {
+                prompt_tokens: prompt_len,
+                completion_tokens,
+                total_tokens: prompt_len + completion_tokens,
+            },
+        })
+        .into_response()
     }
 }
 

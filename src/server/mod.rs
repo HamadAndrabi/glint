@@ -12,10 +12,12 @@
 //!
 //! Start the server by calling `run_server(state, host, port).await`.
 
+mod engine;
 mod routes;
 mod state;
 mod types;
 
+pub use engine::InferenceEngine;
 pub use state::{AppState, Metrics};
 
 use std::sync::Arc;

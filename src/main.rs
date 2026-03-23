@@ -12,7 +12,7 @@ use glint::model::gguf::GgufModel;
 use glint::model::pull::{pull_model, search_huggingface};
 use glint::model::tokenizer::Tokenizer;
 use glint::sampling::{Sampler, SamplerConfig};
-use glint::server::{AppState, Metrics};
+use glint::server::{AppState, InferenceEngine, Metrics};
 use glint::transformer::{TransformerWeights, generate_cached, generate_greedy_cached, generate_streaming, speculative_decode};
 
 #[derive(Parser)]
@@ -782,14 +782,25 @@ async fn serve_model(path: &PathBuf, host: &str, port: u16, use_gpu: bool) {
         .unwrap_or(ChatTemplate::Generic);
     eprintln!("Chat template:  {}", chat_template.name());
 
+    let weights = Arc::new(weights);
+    let config_arc = Arc::new(config);
+
+    // Start the continuous-batching inference engine on a dedicated OS thread.
+    // The engine owns the GPU backend (if any) and all active KV caches.
+    let engine = Arc::new(InferenceEngine::start(
+        Arc::clone(&weights),
+        Arc::clone(&config_arc),
+        gpu_backend,
+    ));
+
     let state = AppState {
-        weights: Arc::new(weights),
+        weights,
         tokenizer: Arc::new(tokenizer),
-        config: Arc::new(config),
+        config: config_arc,
         model_name,
         chat_template,
         metrics: Metrics::new(),
-        gpu: gpu_backend.map(|g| Arc::new(std::sync::Mutex::new(g))),
+        engine,
     };
 
     glint::server::run_server(state, host, port).await;
