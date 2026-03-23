@@ -126,8 +126,7 @@ pub struct ChunkChoice {
     pub finish_reason: Option<&'static str>,
 }
 
-/// Chat streaming chunk (reserved for future per-role streaming; currently reuses CompletionChunk).
-#[allow(dead_code)]
+/// Chat streaming chunk — `object: "chat.completion.chunk"` with `delta` fields.
 #[derive(Debug, Serialize)]
 pub struct ChatChunk {
     pub id: String,

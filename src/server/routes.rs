@@ -2,18 +2,16 @@
 //!
 //! Each handler receives an `Arc<AppState>` via axum's State extractor.
 //!
-//! Inference is CPU-bound, so it runs inside `tokio::task::spawn_blocking`.
-//! This keeps the async runtime free to handle other requests while inference
-//! is running. The async runtime has a fixed pool of blocking threads
-//! (default: 512) managed by tokio.
+//! Inference runs on a dedicated engine thread (see `engine.rs`). Route handlers
+//! submit token sequences via `engine.submit()` and receive generated tokens
+//! through an mpsc channel.
 //!
-//! For streaming: we create an mpsc channel. The blocking task sends token IDs
-//! down the channel; the async handler wraps the receiver in a Stream and feeds
-//! it to axum's SSE response.
+//! For streaming: the token receiver is wrapped in a `ReceiverStream` and fed
+//! directly to axum's SSE response.
 
 use std::convert::Infallible;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use axum::extract::State;
@@ -82,6 +80,18 @@ fn api_error(status: StatusCode, msg: impl Into<String>) -> Response {
     (status, body).into_response()
 }
 
+/// Validate that the requested model matches the loaded model.
+fn validate_model(requested: &str, loaded: &str) -> Result<(), Response> {
+    if requested != loaded {
+        Err(api_error(
+            StatusCode::NOT_FOUND,
+            format!("model '{requested}' not found; available: {loaded}"),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 // ── GET /health ──────────────────────────────────────────────────────────────
 
 /// Health check — returns 200 OK with a minimal JSON body.
@@ -136,6 +146,10 @@ pub async fn completions(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CompletionRequest>,
 ) -> Response {
+    if let Err(e) = validate_model(&req.model, &state.model_name) {
+        return e;
+    }
+
     // Tokenize the prompt
     let mut prompt_tokens = state.tokenizer.encode(&req.prompt);
     prompt_tokens.insert(0, state.tokenizer.bos_token_id);
@@ -150,7 +164,7 @@ pub async fn completions(
         req.seed,
     );
     let prompt_len = prompt_tokens.len();
-    let model_name = req.model.clone();
+    let model_name = state.model_name.clone();
     let eos = state.tokenizer.eos_token_id;
 
     // Validate against context window
@@ -229,10 +243,18 @@ async fn streaming_completion(
     };
 
     let tokenizer = Arc::clone(&state.tokenizer);
+    let token_count = Arc::new(AtomicU64::new(0));
+    let t0 = Instant::now();
     let id = gen_id();
     let created = now_secs();
 
+    // Clone for the finish chunk (originals are moved into the content closure)
+    let finish_id = id.clone();
+    let finish_model = model_name.clone();
+
+    let tc = Arc::clone(&token_count);
     let stream = ReceiverStream::new(rx).map(move |token_id| {
+        tc.fetch_add(1, Ordering::Relaxed);
         let text = tokenizer.decode(&[token_id]);
         let chunk = CompletionChunk {
             id: id.clone(),
@@ -249,9 +271,131 @@ async fn streaming_completion(
         Ok::<Event, Infallible>(Event::default().data(data))
     });
 
-    let done_stream = stream.chain(tokio_stream::once(Ok::<Event, Infallible>(
-        Event::default().data("[DONE]"),
-    )));
+    // Final chunk with finish_reason: "stop", then [DONE]
+    let tc = Arc::clone(&token_count);
+    let finish_stream = tokio_stream::iter(vec![0u8, 1u8]).map(move |i| {
+        if i == 0 {
+            let chunk = CompletionChunk {
+                id: finish_id.clone(),
+                object: "text_completion",
+                created,
+                model: finish_model.clone(),
+                choices: vec![ChunkChoice {
+                    text: String::new(),
+                    index: 0,
+                    finish_reason: Some("stop"),
+                }],
+            };
+            let data = serde_json::to_string(&chunk).unwrap_or_default();
+            Ok::<Event, Infallible>(Event::default().data(data))
+        } else {
+            state.metrics.record(tc.load(Ordering::Relaxed), t0.elapsed().as_millis() as u64);
+            Ok::<Event, Infallible>(Event::default().data("[DONE]"))
+        }
+    });
+
+    let done_stream = stream.chain(finish_stream);
+
+    Sse::new(done_stream)
+        .keep_alive(axum::response::sse::KeepAlive::default())
+        .into_response()
+}
+
+async fn streaming_chat_completion(
+    state: Arc<AppState>,
+    prompt_tokens: Vec<u32>,
+    max_tokens: usize,
+    sampler_cfg: SamplerConfig,
+    eos: u32,
+    model_name: String,
+) -> Response {
+    let rx = match state.engine.submit(prompt_tokens, max_tokens, sampler_cfg, eos) {
+        Some(rx) => rx,
+        None => return api_error(StatusCode::SERVICE_UNAVAILABLE, "Inference engine unavailable"),
+    };
+
+    let tokenizer = Arc::clone(&state.tokenizer);
+    let token_count = Arc::new(AtomicU64::new(0));
+    let t0 = Instant::now();
+    let id = gen_id();
+    let created = now_secs();
+
+    // Clone for the finish chunk (originals are moved into the content closure)
+    let finish_id = id.clone();
+    let finish_model = model_name.clone();
+
+    // First chunk: send the role
+    let role_chunk = ChatChunk {
+        id: id.clone(),
+        object: "chat.completion.chunk",
+        created,
+        model: model_name.clone(),
+        choices: vec![ChatChunkChoice {
+            index: 0,
+            delta: ChatDelta {
+                role: Some("assistant"),
+                content: None,
+            },
+            finish_reason: None,
+        }],
+    };
+    let role_data = serde_json::to_string(&role_chunk).unwrap_or_default();
+    let role_event = tokio_stream::once(Ok::<Event, Infallible>(
+        Event::default().data(role_data),
+    ));
+
+    // Content chunks: one per token
+    let tc = Arc::clone(&token_count);
+    let content_stream = ReceiverStream::new(rx).map(move |token_id| {
+        tc.fetch_add(1, Ordering::Relaxed);
+        let text = tokenizer.decode(&[token_id]);
+        let chunk = ChatChunk {
+            id: id.clone(),
+            object: "chat.completion.chunk",
+            created,
+            model: model_name.clone(),
+            choices: vec![ChatChunkChoice {
+                index: 0,
+                delta: ChatDelta {
+                    role: None,
+                    content: Some(text),
+                },
+                finish_reason: None,
+            }],
+        };
+        let data = serde_json::to_string(&chunk).unwrap_or_default();
+        Ok::<Event, Infallible>(Event::default().data(data))
+    });
+
+    // Final chunk with finish_reason: "stop", then [DONE]
+    let tc = Arc::clone(&token_count);
+    let finish_stream = tokio_stream::iter(vec![0u8, 1u8]).map(move |i| {
+        if i == 0 {
+            let chunk = ChatChunk {
+                id: finish_id.clone(),
+                object: "chat.completion.chunk",
+                created,
+                model: finish_model.clone(),
+                choices: vec![ChatChunkChoice {
+                    index: 0,
+                    delta: ChatDelta {
+                        role: None,
+                        content: None,
+                    },
+                    finish_reason: Some("stop"),
+                }],
+            };
+            let data = serde_json::to_string(&chunk).unwrap_or_default();
+            Ok::<Event, Infallible>(Event::default().data(data))
+        } else {
+            state.metrics.record(tc.load(Ordering::Relaxed), t0.elapsed().as_millis() as u64);
+            Ok::<Event, Infallible>(Event::default().data("[DONE]"))
+        }
+    });
+
+    let done_stream = role_event
+        .chain(content_stream)
+        .chain(finish_stream);
 
     Sse::new(done_stream)
         .keep_alive(axum::response::sse::KeepAlive::default())
@@ -265,6 +409,10 @@ pub async fn chat_completions(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Response {
+    if let Err(e) = validate_model(&req.model, &state.model_name) {
+        return e;
+    }
+
     if req.messages.is_empty() {
         return api_error(StatusCode::BAD_REQUEST, "messages must not be empty");
     }
@@ -288,7 +436,7 @@ pub async fn chat_completions(
         req.seed,
     );
     let prompt_len = prompt_tokens.len();
-    let model_name = req.model.clone();
+    let model_name = state.model_name.clone();
     let eos = state.tokenizer.eos_token_id;
 
     // Validate against context window
@@ -302,8 +450,7 @@ pub async fn chat_completions(
     let max_tokens = max_tokens.min(context_limit - prompt_len);
 
     if stream {
-        // For streaming chat, reuse the completions streaming path
-        streaming_completion(state, prompt_tokens, max_tokens, sampler_cfg, eos, model_name).await
+        streaming_chat_completion(state, prompt_tokens, max_tokens, sampler_cfg, eos, model_name).await
     } else {
         let rx = match state.engine.submit(prompt_tokens, max_tokens, sampler_cfg, eos) {
             Some(rx) => rx,
@@ -355,6 +502,10 @@ pub async fn embeddings(
     State(state): State<Arc<AppState>>,
     Json(req): Json<EmbeddingRequest>,
 ) -> Response {
+    if let Err(e) = validate_model(&req.model, &state.model_name) {
+        return e;
+    }
+
     if req.input.is_empty() {
         return api_error(StatusCode::BAD_REQUEST, "input must not be empty");
     }
@@ -363,7 +514,7 @@ pub async fn embeddings(
     let mut tokens = state.tokenizer.encode(&req.input);
     tokens.insert(0, state.tokenizer.bos_token_id);
     let n_tokens = tokens.len();
-    let model_name = req.model.clone();
+    let model_name = state.model_name.clone();
 
     let weights = Arc::clone(&state.weights);
     let config = Arc::clone(&state.config);

@@ -107,6 +107,7 @@ impl GlintLLM {
             max_tokens,
             &mut sampler,
             eos,
+            &mut None,
         );
 
         // Return only newly generated tokens (skip the prompt)

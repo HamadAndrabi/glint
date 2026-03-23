@@ -1,4 +1,4 @@
-//! Continuous-batching inference engine.
+//! Round-robin inference engine.
 //!
 //! `InferenceEngine` runs a single dedicated OS thread that owns the model
 //! weights and (optionally) the GPU backend. Incoming requests are queued and
@@ -6,8 +6,10 @@
 //!
 //! 1. **Prefill** — for each newly arrived request, run the full prompt
 //!    through the transformer and write K/V into a fresh per-sequence cache.
-//! 2. **Batch decode** — advance every active sequence by one token, sample,
-//!    and push the token ID down the per-request channel.
+//! 2. **Round-robin decode** — advance every active sequence by one token
+//!    (each with its own `forward_one` call), sample, and push the token ID
+//!    down the per-request channel. This is fair interleaving, not true batched
+//!    inference — each sequence gets a separate forward pass.
 //! 3. **Eviction** — remove sequences that have hit EOS, exhausted their
 //!    token budget, or whose client disconnected.
 //!
@@ -144,17 +146,22 @@ fn engine_loop(
         let mut finished: Vec<usize> = Vec::new();
 
         for (i, seq) in active.iter_mut().enumerate() {
+            // Check budget *before* sampling to avoid off-by-one overrun.
+            if seq.max_remaining == 0 {
+                finished.push(i);
+                continue;
+            }
+            seq.max_remaining -= 1;
+
             let next = seq.sampler.sample(seq.last_logits.data(), &seq.tokens);
             seq.tokens.push(next);
 
             let eos_hit     = next == seq.eos_token;
-            let exhausted   = seq.max_remaining == 0;
             let disconnected = seq.tx.blocking_send(next).is_err();
 
-            if eos_hit || exhausted || disconnected {
+            if eos_hit || disconnected {
                 finished.push(i);
             } else {
-                seq.max_remaining -= 1;
                 let pos = seq.tokens.len() - 1;
                 let mut gpu_ref: Option<&mut GpuBackend> = gpu.as_mut();
                 seq.last_logits = forward_one(
