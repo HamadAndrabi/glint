@@ -6,6 +6,7 @@ pub mod model;
 pub mod backend;
 pub mod cache;
 pub mod sampling;
+#[cfg(feature = "server")]
 pub mod server;
 pub mod tensor;
 pub mod transformer;

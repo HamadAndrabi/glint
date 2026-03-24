@@ -7,18 +7,25 @@ license = "MIT"
 
 [lib]
 name = "glint"
-crate-type = ["rlib"]  # maturin adds cdylib automatically when building the Python extension
+crate-type = ["rlib", "cdylib"]  # cdylib needed for wasm-pack; maturin also expects it for Python
 
 [features]
-default = ["rayon"]
+default = ["rayon", "server"]
 rayon = ["dep:rayon"]
+
+# HTTP server + model-download CLI (axum, tokio, reqwest).
+# Excluded from wasm builds — browsers have no server or filesystem pull.
+server = [
+  "dep:axum", "dep:tokio", "dep:tower-http",
+  "dep:tokio-stream", "dep:reqwest", "dep:indicatif", "dep:dirs",
+]
 
 # Enable PyO3 Python extension module. Build with: cargo build --features python
 # or let maturin handle it via pyproject.toml.
 python = ["pyo3/extension-module"]
 
 # Enable wasm-bindgen JS bindings. Build with:
-#   wasm-pack build --target web --features wasm
+#   wasm-pack build --target web --no-default-features --features wasm
 wasm = ["dep:wasm-bindgen", "dep:js-sys", "dep:console_error_panic_hook"]
 
 # Enable GPU compute backend via wgpu (Vulkan/Metal/DX12). Build with:
@@ -49,29 +56,29 @@ thiserror = "2"
 rayon = { version = "1.10", optional = true }
 
 # HTTP server framework built on tokio — handler-based routing, SSE streaming.
-axum = { version = "0.8", features = ["macros"] }
+axum = { version = "0.8", features = ["macros"], optional = true }
 
 # Async runtime — drives the HTTP server and provides spawn_blocking for CPU work.
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["full"], optional = true }
 
 # JSON serialization/deserialization for the OpenAI-compatible API.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 # Bridges tokio mpsc channels to async streams (used for SSE token streaming).
-tokio-stream = "0.1"
+tokio-stream = { version = "0.1", optional = true }
 
 # HTTP middleware — CORS headers for browser-based API clients.
-tower-http = { version = "0.6", features = ["cors"] }
+tower-http = { version = "0.6", features = ["cors"], optional = true }
 
 # Async HTTP client with streaming body — used for downloading models from HuggingFace.
-reqwest = { version = "0.12", features = ["stream", "json"] }
+reqwest = { version = "0.12", features = ["stream", "json"], optional = true }
 
 # Terminal progress bars — used to show download progress.
-indicatif = "0.17"
+indicatif = { version = "0.17", optional = true }
 
 # Cross-platform user/cache directory paths (e.g. ~/.cache or %LOCALAPPDATA%).
-dirs = "5"
+dirs = { version = "5", optional = true }
 
 # Python bindings — only compiled when the `python` feature is enabled.
 pyo3 = { version = "0.22", optional = true }

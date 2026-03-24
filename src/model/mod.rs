@@ -4,5 +4,6 @@ pub mod chat_template;
 pub mod config;
 pub mod gguf;
 pub mod lora;
+#[cfg(feature = "server")]
 pub mod pull;
 pub mod tokenizer;

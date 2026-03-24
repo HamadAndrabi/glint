@@ -133,4 +133,53 @@ impl GlintModel {
     pub fn architecture(&self) -> String {
         self.config.architecture.clone()
     }
+
+    /// Generate text with per-token streaming.
+    ///
+    /// `on_token` is called with the decoded text of each new token as it is
+    /// generated. Designed for use in a Web Worker — calling `postMessage`
+    /// inside the callback queues messages for the main thread while inference
+    /// runs, giving the appearance of streaming.
+    ///
+    /// ```js
+    /// model.generate_streaming(prompt, 256, 0.8, (text) => {
+    ///     self.postMessage({ type: 'token', text });
+    /// });
+    /// ```
+    pub fn generate_streaming(
+        &self,
+        prompt: &str,
+        max_tokens: usize,
+        temperature: f32,
+        on_token: &js_sys::Function,
+    ) {
+        let mut tokens = self.tokenizer.encode(prompt);
+        tokens.insert(0, self.tokenizer.bos_token_id);
+
+        let mut sampler = Sampler::new(SamplerConfig {
+            temperature,
+            ..Default::default()
+        });
+
+        let eos = self.tokenizer.eos_token_id;
+        let tokenizer = &self.tokenizer;
+
+        crate::transformer::generate_streaming(
+            &self.weights,
+            &self.config,
+            &tokens,
+            max_tokens,
+            &mut sampler,
+            eos,
+            |token_id| {
+                if token_id == eos {
+                    return true;
+                }
+                let text = tokenizer.decode(&[token_id]);
+                let _ = on_token.call1(&JsValue::null(), &JsValue::from_str(&text));
+                true
+            },
+            &mut None,
+        );
+    }
 }
