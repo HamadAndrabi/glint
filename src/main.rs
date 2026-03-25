@@ -178,7 +178,7 @@ enum Commands {
         /// GGUF filename to download (e.g. "SmolLM2-135M-Instruct-Q8_0.gguf").
         file: String,
 
-        /// Directory to save the model to (default: platform cache dir / ferrite / models).
+        /// Directory to save the model to (default: platform cache dir / glint / models).
         #[arg(long)]
         dir: Option<PathBuf>,
     },
@@ -834,14 +834,14 @@ fn format_bytes(bytes: u64) -> String {
 
 /// Returns the platform-specific default model cache directory.
 ///
-/// - Windows: `%LOCALAPPDATA%\ferrite\models`
-/// - Linux/macOS: `~/.cache/ferrite/models`
+/// - Windows: `%LOCALAPPDATA%\glint\models`
+/// - Linux/macOS: `~/.cache/glint/models`
 fn default_cache_dir(override_dir: Option<&Path>) -> PathBuf {
     match override_dir {
         Some(d) => d.to_path_buf(),
         None => dirs::cache_dir()
             .unwrap_or_else(|| PathBuf::from("."))
-            .join("ferrite")
+            .join("glint")
             .join("models"),
     }
 }
