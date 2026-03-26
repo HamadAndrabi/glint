@@ -1,12 +1,13 @@
-//! HTTP inference server — OpenAI-compatible API.
+//! HTTP inference server - OpenAI-compatible API.
 //!
 //! Exposes these endpoints:
-//!   GET  /health                    — health check (returns 200 OK)
-//!   GET  /v1/models                 — list the loaded model
-//!   GET  /v1/metrics                — runtime metrics (requests, tokens, latency, uptime)
-//!   POST /v1/completions            — text completion (streaming or not)
-//!   POST /v1/chat/completions       — chat completion (streaming or not)
-//!   POST /v1/embeddings             — text embedding (mean-pooled hidden states)
+//!   GET  /health                    - health check (returns 200 OK)
+//!   GET  /v1/models                 - list the loaded model
+//!   GET  /v1/metrics                - runtime metrics (requests, tokens, latency, uptime)
+//!   POST /v1/completions            - text completion (streaming or not)
+//!   POST /v1/chat/completions       - chat completion (streaming or not)
+//!   POST /v1/responses              - text-only responses API (streaming or not)
+//!   POST /v1/embeddings             - text embedding (mean-pooled hidden states)
 //!
 //! CORS is enabled for all origins so browser-based clients work out of the box.
 //!
@@ -47,6 +48,7 @@ pub async fn run_server(state: AppState, host: &str, port: u16) {
         .route("/v1/metrics", get(routes::server_metrics))
         .route("/v1/completions", post(routes::completions))
         .route("/v1/chat/completions", post(routes::chat_completions))
+        .route("/v1/responses", post(routes::responses))
         .route("/v1/embeddings", post(routes::embeddings))
         .layer(cors)
         .with_state(shared);
@@ -58,6 +60,7 @@ pub async fn run_server(state: AppState, host: &str, port: u16) {
     eprintln!("  GET  http://{addr}/v1/metrics");
     eprintln!("  POST http://{addr}/v1/completions");
     eprintln!("  POST http://{addr}/v1/chat/completions");
+    eprintln!("  POST http://{addr}/v1/responses");
     eprintln!("  POST http://{addr}/v1/embeddings");
 
     let listener = tokio::net::TcpListener::bind(&addr)
@@ -67,10 +70,8 @@ pub async fn run_server(state: AppState, host: &str, port: u16) {
             std::process::exit(1);
         });
 
-    axum::serve(listener, app)
-        .await
-        .unwrap_or_else(|e| {
-            eprintln!("Error: server exited unexpectedly: {e}");
-            std::process::exit(1);
-        });
+    axum::serve(listener, app).await.unwrap_or_else(|e| {
+        eprintln!("Error: server exited unexpectedly: {e}");
+        std::process::exit(1);
+    });
 }

@@ -10,8 +10,9 @@
 //! directly to axum's SSE response.
 
 use std::convert::Infallible;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use axum::extract::State;
@@ -38,7 +39,7 @@ fn now_secs() -> u64 {
         .as_secs()
 }
 
-fn gen_id() -> String {
+fn gen_id_with_prefix(prefix: &str) -> String {
     // Simple ID from timestamp + a few xorshift bits
     let ts = now_secs();
     let noise = {
@@ -48,7 +49,11 @@ fn gen_id() -> String {
         s ^= s << 17;
         s & 0xffffff
     };
-    format!("cmpl-{ts:x}{noise:06x}")
+    format!("{prefix}-{ts:x}{noise:06x}")
+}
+
+fn gen_id() -> String {
+    gen_id_with_prefix("cmpl")
 }
 
 fn sampler_config_from_params(
@@ -89,6 +94,216 @@ fn validate_model(requested: &str, loaded: &str) -> Result<(), Response> {
         ))
     } else {
         Ok(())
+    }
+}
+
+struct PreparedGeneration {
+    prompt_tokens: Vec<u32>,
+    prompt_len: usize,
+    max_tokens: usize,
+    sampler_cfg: SamplerConfig,
+    eos: u32,
+    model_name: String,
+}
+
+struct StartedGeneration {
+    rx: tokio::sync::mpsc::Receiver<u32>,
+    prompt_len: usize,
+    model_name: String,
+}
+
+struct CompletedGeneration {
+    text: String,
+    completion_tokens: usize,
+}
+
+fn prepare_generation_from_prompt(
+    state: &Arc<AppState>,
+    requested_model: &str,
+    prompt: &str,
+    max_tokens: Option<usize>,
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    top_k: Option<usize>,
+    repeat_penalty: Option<f32>,
+    seed: Option<u64>,
+) -> Result<PreparedGeneration, Response> {
+    validate_model(requested_model, &state.model_name)?;
+
+    let mut prompt_tokens = state.tokenizer.encode(prompt);
+    prompt_tokens.insert(0, state.tokenizer.bos_token_id);
+
+    let prompt_len = prompt_tokens.len();
+    let context_limit = state.config.context_length as usize;
+    if prompt_len >= context_limit {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "prompt ({prompt_len} tokens) exceeds model context window ({context_limit} tokens)"
+            ),
+        ));
+    }
+
+    let max_tokens = max_tokens.unwrap_or(100).min(context_limit - prompt_len);
+    let sampler_cfg = sampler_config_from_params(temperature, top_p, top_k, repeat_penalty, seed);
+
+    Ok(PreparedGeneration {
+        prompt_tokens,
+        prompt_len,
+        max_tokens,
+        sampler_cfg,
+        eos: state.tokenizer.eos_token_id,
+        model_name: state.model_name.clone(),
+    })
+}
+
+fn prepare_chat_generation(
+    state: &Arc<AppState>,
+    requested_model: &str,
+    messages: &[ChatMessage],
+    max_tokens: Option<usize>,
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    top_k: Option<usize>,
+    repeat_penalty: Option<f32>,
+    seed: Option<u64>,
+) -> Result<PreparedGeneration, Response> {
+    if messages.is_empty() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "messages must not be empty",
+        ));
+    }
+
+    let msgs: Vec<Message<'_>> = messages
+        .iter()
+        .map(|m| Message {
+            role: &m.role,
+            content: &m.content,
+        })
+        .collect();
+    let prompt = state.chat_template.apply(&msgs);
+
+    prepare_generation_from_prompt(
+        state,
+        requested_model,
+        &prompt,
+        max_tokens,
+        temperature,
+        top_p,
+        top_k,
+        repeat_penalty,
+        seed,
+    )
+}
+
+fn prepare_responses_generation(
+    state: &Arc<AppState>,
+    req: &ResponsesRequest,
+) -> Result<PreparedGeneration, Response> {
+    let messages = req
+        .input
+        .to_messages(req.instructions.as_deref())
+        .map_err(|msg| api_error(StatusCode::BAD_REQUEST, msg))?;
+
+    prepare_chat_generation(
+        state,
+        &req.model,
+        &messages,
+        req.max_output_tokens,
+        req.temperature,
+        req.top_p,
+        req.top_k,
+        req.repeat_penalty,
+        req.seed,
+    )
+}
+
+fn start_generation(
+    state: &Arc<AppState>,
+    prepared: PreparedGeneration,
+) -> Result<StartedGeneration, Response> {
+    let PreparedGeneration {
+        prompt_tokens,
+        prompt_len,
+        max_tokens,
+        sampler_cfg,
+        eos,
+        model_name,
+    } = prepared;
+
+    let rx = state
+        .engine
+        .submit(prompt_tokens, max_tokens, sampler_cfg, eos)
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Inference engine unavailable",
+            )
+        })?;
+
+    Ok(StartedGeneration {
+        rx,
+        prompt_len,
+        model_name,
+    })
+}
+
+async fn collect_generation(
+    state: Arc<AppState>,
+    rx: tokio::sync::mpsc::Receiver<u32>,
+) -> CompletedGeneration {
+    let t0 = Instant::now();
+    let mut stream = ReceiverStream::new(rx);
+    let mut generated_ids: Vec<u32> = Vec::new();
+    while let Some(token_id) = stream.next().await {
+        generated_ids.push(token_id);
+    }
+
+    let elapsed_ms = t0.elapsed().as_millis() as u64;
+    let text = state.tokenizer.decode(&generated_ids);
+    let completion_tokens = generated_ids.len();
+    state.metrics.record(completion_tokens as u64, elapsed_ms);
+
+    CompletedGeneration {
+        text,
+        completion_tokens,
+    }
+}
+
+fn build_responses_response(
+    id: String,
+    message_id: String,
+    created_at: u64,
+    model: String,
+    output_text: String,
+    prompt_tokens: usize,
+    output_tokens: usize,
+    status: &'static str,
+) -> ResponsesResponse {
+    ResponsesResponse {
+        id,
+        object: "response",
+        created_at,
+        status,
+        model,
+        output: vec![ResponseOutputItem {
+            id: message_id,
+            item_type: "message",
+            status,
+            role: "assistant",
+            content: vec![ResponseOutputContent {
+                content_type: "output_text",
+                text: output_text.clone(),
+                annotations: vec![],
+            }],
+        }],
+        output_text,
+        usage: ResponsesUsage {
+            input_tokens: prompt_tokens,
+            output_tokens,
+            total_tokens: prompt_tokens + output_tokens,
+        },
     }
 }
 
@@ -146,100 +361,59 @@ pub async fn completions(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CompletionRequest>,
 ) -> Response {
-    if let Err(e) = validate_model(&req.model, &state.model_name) {
-        return e;
-    }
-
-    // Tokenize the prompt
-    let mut prompt_tokens = state.tokenizer.encode(&req.prompt);
-    prompt_tokens.insert(0, state.tokenizer.bos_token_id);
-
-    let max_tokens = req.max_tokens.unwrap_or(100);
-    let stream = req.stream.unwrap_or(false);
-    let sampler_cfg = sampler_config_from_params(
+    let prepared = match prepare_generation_from_prompt(
+        &state,
+        &req.model,
+        &req.prompt,
+        req.max_tokens,
         req.temperature,
         req.top_p,
         req.top_k,
         req.repeat_penalty,
         req.seed,
-    );
-    let prompt_len = prompt_tokens.len();
-    let model_name = state.model_name.clone();
-    let eos = state.tokenizer.eos_token_id;
+    ) {
+        Ok(prepared) => prepared,
+        Err(err) => return err,
+    };
 
-    // Validate against context window
-    let context_limit = state.config.context_length as usize;
-    if prompt_len >= context_limit {
-        return api_error(
-            StatusCode::BAD_REQUEST,
-            format!("prompt ({prompt_len} tokens) exceeds model context window ({context_limit} tokens)"),
-        );
-    }
-    let max_tokens = max_tokens.min(context_limit - prompt_len);
-
-    if stream {
-        streaming_completion(state, prompt_tokens, max_tokens, sampler_cfg, eos, model_name).await
+    if req.stream.unwrap_or(false) {
+        streaming_completion(state, prepared).await
     } else {
-        non_streaming_completion(state, prompt_tokens, prompt_len, max_tokens, sampler_cfg, eos, model_name).await
+        non_streaming_completion(state, prepared).await
     }
 }
 
-async fn non_streaming_completion(
-    state: Arc<AppState>,
-    prompt_tokens: Vec<u32>,
-    prompt_len: usize,
-    max_tokens: usize,
-    sampler_cfg: SamplerConfig,
-    eos: u32,
-    model_name: String,
-) -> Response {
-    let rx = match state.engine.submit(prompt_tokens, max_tokens, sampler_cfg, eos) {
-        Some(rx) => rx,
-        None => return api_error(StatusCode::SERVICE_UNAVAILABLE, "Inference engine unavailable"),
+async fn non_streaming_completion(state: Arc<AppState>, prepared: PreparedGeneration) -> Response {
+    let started = match start_generation(&state, prepared) {
+        Ok(started) => started,
+        Err(err) => return err,
     };
 
-    let t0 = Instant::now();
-    let mut stream = ReceiverStream::new(rx);
-    let mut generated_ids: Vec<u32> = Vec::new();
-    while let Some(token_id) = stream.next().await {
-        generated_ids.push(token_id);
-    }
-
-    let elapsed_ms = t0.elapsed().as_millis() as u64;
-    let text = state.tokenizer.decode(&generated_ids);
-    let completion_tokens = generated_ids.len();
-    state.metrics.record(completion_tokens as u64, elapsed_ms);
+    let completed = collect_generation(Arc::clone(&state), started.rx).await;
 
     Json(CompletionResponse {
         id: gen_id(),
         object: "text_completion",
         created: now_secs(),
-        model: model_name,
+        model: started.model_name,
         choices: vec![CompletionChoice {
-            text,
+            text: completed.text,
             index: 0,
             finish_reason: "stop",
         }],
         usage: UsageInfo {
-            prompt_tokens: prompt_len,
-            completion_tokens,
-            total_tokens: prompt_len + completion_tokens,
+            prompt_tokens: started.prompt_len,
+            completion_tokens: completed.completion_tokens,
+            total_tokens: started.prompt_len + completed.completion_tokens,
         },
     })
     .into_response()
 }
 
-async fn streaming_completion(
-    state: Arc<AppState>,
-    prompt_tokens: Vec<u32>,
-    max_tokens: usize,
-    sampler_cfg: SamplerConfig,
-    eos: u32,
-    model_name: String,
-) -> Response {
-    let rx = match state.engine.submit(prompt_tokens, max_tokens, sampler_cfg, eos) {
-        Some(rx) => rx,
-        None => return api_error(StatusCode::SERVICE_UNAVAILABLE, "Inference engine unavailable"),
+async fn streaming_completion(state: Arc<AppState>, prepared: PreparedGeneration) -> Response {
+    let started = match start_generation(&state, prepared) {
+        Ok(started) => started,
+        Err(err) => return err,
     };
 
     let tokenizer = Arc::clone(&state.tokenizer);
@@ -250,17 +424,18 @@ async fn streaming_completion(
 
     // Clone for the finish chunk (originals are moved into the content closure)
     let finish_id = id.clone();
-    let finish_model = model_name.clone();
+    let stream_model = started.model_name.clone();
+    let finish_model = started.model_name.clone();
 
     let tc = Arc::clone(&token_count);
-    let stream = ReceiverStream::new(rx).map(move |token_id| {
+    let stream = ReceiverStream::new(started.rx).map(move |token_id| {
         tc.fetch_add(1, Ordering::Relaxed);
         let text = tokenizer.decode(&[token_id]);
         let chunk = CompletionChunk {
             id: id.clone(),
             object: "text_completion",
             created,
-            model: model_name.clone(),
+            model: stream_model.clone(),
             choices: vec![ChunkChoice {
                 text,
                 index: 0,
@@ -289,7 +464,9 @@ async fn streaming_completion(
             let data = serde_json::to_string(&chunk).unwrap_or_default();
             Ok::<Event, Infallible>(Event::default().data(data))
         } else {
-            state.metrics.record(tc.load(Ordering::Relaxed), t0.elapsed().as_millis() as u64);
+            state
+                .metrics
+                .record(tc.load(Ordering::Relaxed), t0.elapsed().as_millis() as u64);
             Ok::<Event, Infallible>(Event::default().data("[DONE]"))
         }
     });
@@ -301,17 +478,10 @@ async fn streaming_completion(
         .into_response()
 }
 
-async fn streaming_chat_completion(
-    state: Arc<AppState>,
-    prompt_tokens: Vec<u32>,
-    max_tokens: usize,
-    sampler_cfg: SamplerConfig,
-    eos: u32,
-    model_name: String,
-) -> Response {
-    let rx = match state.engine.submit(prompt_tokens, max_tokens, sampler_cfg, eos) {
-        Some(rx) => rx,
-        None => return api_error(StatusCode::SERVICE_UNAVAILABLE, "Inference engine unavailable"),
+async fn streaming_chat_completion(state: Arc<AppState>, prepared: PreparedGeneration) -> Response {
+    let started = match start_generation(&state, prepared) {
+        Ok(started) => started,
+        Err(err) => return err,
     };
 
     let tokenizer = Arc::clone(&state.tokenizer);
@@ -322,14 +492,15 @@ async fn streaming_chat_completion(
 
     // Clone for the finish chunk (originals are moved into the content closure)
     let finish_id = id.clone();
-    let finish_model = model_name.clone();
+    let stream_model = started.model_name.clone();
+    let finish_model = started.model_name.clone();
 
     // First chunk: send the role
     let role_chunk = ChatChunk {
         id: id.clone(),
         object: "chat.completion.chunk",
         created,
-        model: model_name.clone(),
+        model: stream_model.clone(),
         choices: vec![ChatChunkChoice {
             index: 0,
             delta: ChatDelta {
@@ -340,20 +511,18 @@ async fn streaming_chat_completion(
         }],
     };
     let role_data = serde_json::to_string(&role_chunk).unwrap_or_default();
-    let role_event = tokio_stream::once(Ok::<Event, Infallible>(
-        Event::default().data(role_data),
-    ));
+    let role_event = tokio_stream::once(Ok::<Event, Infallible>(Event::default().data(role_data)));
 
     // Content chunks: one per token
     let tc = Arc::clone(&token_count);
-    let content_stream = ReceiverStream::new(rx).map(move |token_id| {
+    let content_stream = ReceiverStream::new(started.rx).map(move |token_id| {
         tc.fetch_add(1, Ordering::Relaxed);
         let text = tokenizer.decode(&[token_id]);
         let chunk = ChatChunk {
             id: id.clone(),
             object: "chat.completion.chunk",
             created,
-            model: model_name.clone(),
+            model: stream_model.clone(),
             choices: vec![ChatChunkChoice {
                 index: 0,
                 delta: ChatDelta {
@@ -388,14 +557,14 @@ async fn streaming_chat_completion(
             let data = serde_json::to_string(&chunk).unwrap_or_default();
             Ok::<Event, Infallible>(Event::default().data(data))
         } else {
-            state.metrics.record(tc.load(Ordering::Relaxed), t0.elapsed().as_millis() as u64);
+            state
+                .metrics
+                .record(tc.load(Ordering::Relaxed), t0.elapsed().as_millis() as u64);
             Ok::<Event, Infallible>(Event::default().data("[DONE]"))
         }
     });
 
-    let done_stream = role_event
-        .chain(content_stream)
-        .chain(finish_stream);
+    let done_stream = role_event.chain(content_stream).chain(finish_stream);
 
     Sse::new(done_stream)
         .keep_alive(axum::response::sse::KeepAlive::default())
@@ -409,83 +578,48 @@ pub async fn chat_completions(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Response {
-    if let Err(e) = validate_model(&req.model, &state.model_name) {
-        return e;
-    }
-
-    if req.messages.is_empty() {
-        return api_error(StatusCode::BAD_REQUEST, "messages must not be empty");
-    }
-
-    // Apply the model's chat template to format messages into a prompt.
-    let msgs: Vec<Message<'_>> = req.messages.iter()
-        .map(|m| Message { role: &m.role, content: &m.content })
-        .collect();
-    let prompt = state.chat_template.apply(&msgs);
-
-    let mut prompt_tokens = state.tokenizer.encode(&prompt);
-    prompt_tokens.insert(0, state.tokenizer.bos_token_id);
-
-    let max_tokens = req.max_tokens.unwrap_or(100);
-    let stream = req.stream.unwrap_or(false);
-    let sampler_cfg = sampler_config_from_params(
+    let prepared = match prepare_chat_generation(
+        &state,
+        &req.model,
+        &req.messages,
+        req.max_tokens,
         req.temperature,
         req.top_p,
         req.top_k,
         req.repeat_penalty,
         req.seed,
-    );
-    let prompt_len = prompt_tokens.len();
-    let model_name = state.model_name.clone();
-    let eos = state.tokenizer.eos_token_id;
+    ) {
+        Ok(prepared) => prepared,
+        Err(err) => return err,
+    };
 
-    // Validate against context window
-    let context_limit = state.config.context_length as usize;
-    if prompt_len >= context_limit {
-        return api_error(
-            StatusCode::BAD_REQUEST,
-            format!("prompt ({prompt_len} tokens) exceeds model context window ({context_limit} tokens)"),
-        );
-    }
-    let max_tokens = max_tokens.min(context_limit - prompt_len);
-
-    if stream {
-        streaming_chat_completion(state, prompt_tokens, max_tokens, sampler_cfg, eos, model_name).await
+    if req.stream.unwrap_or(false) {
+        streaming_chat_completion(state, prepared).await
     } else {
-        let rx = match state.engine.submit(prompt_tokens, max_tokens, sampler_cfg, eos) {
-            Some(rx) => rx,
-            None => return api_error(StatusCode::SERVICE_UNAVAILABLE, "Inference engine unavailable"),
+        let started = match start_generation(&state, prepared) {
+            Ok(started) => started,
+            Err(err) => return err,
         };
 
-        let t0 = Instant::now();
-        let mut stream = ReceiverStream::new(rx);
-        let mut generated_ids: Vec<u32> = Vec::new();
-        while let Some(token_id) = stream.next().await {
-            generated_ids.push(token_id);
-        }
-
-        let elapsed_ms = t0.elapsed().as_millis() as u64;
-        let text = state.tokenizer.decode(&generated_ids);
-        let completion_tokens = generated_ids.len();
-        state.metrics.record(completion_tokens as u64, elapsed_ms);
+        let completed = collect_generation(Arc::clone(&state), started.rx).await;
 
         Json(ChatCompletionResponse {
             id: gen_id(),
             object: "chat.completion",
             created: now_secs(),
-            model: model_name,
+            model: started.model_name,
             choices: vec![ChatChoice {
                 index: 0,
                 message: ChatMessageOut {
                     role: "assistant",
-                    content: text,
+                    content: completed.text,
                 },
                 finish_reason: "stop",
             }],
             usage: UsageInfo {
-                prompt_tokens: prompt_len,
-                completion_tokens,
-                total_tokens: prompt_len + completion_tokens,
+                prompt_tokens: started.prompt_len,
+                completion_tokens: completed.completion_tokens,
+                total_tokens: started.prompt_len + completed.completion_tokens,
             },
         })
         .into_response()
@@ -498,6 +632,161 @@ pub async fn chat_completions(
 ///
 /// Returns an OpenAI-compatible embedding object. The vector dimension equals
 /// the model's `embedding_length` (e.g. 576 for SmolLM-135M, 4096 for LLaMA-3-8B).
+// ── POST /v1/responses ────────────────────────────────────────────────────────
+
+/// Text-only Responses API built on the same inference engine as chat/completions.
+pub async fn responses(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<ResponsesRequest>,
+) -> Response {
+    let prepared = match prepare_responses_generation(&state, &req) {
+        Ok(prepared) => prepared,
+        Err(err) => return err,
+    };
+
+    if req.stream.unwrap_or(false) {
+        streaming_response(state, prepared).await
+    } else {
+        let started = match start_generation(&state, prepared) {
+            Ok(started) => started,
+            Err(err) => return err,
+        };
+
+        let id = gen_id_with_prefix("resp");
+        let message_id = gen_id_with_prefix("msg");
+        let created_at = now_secs();
+        let completed = collect_generation(Arc::clone(&state), started.rx).await;
+
+        Json(build_responses_response(
+            id,
+            message_id,
+            created_at,
+            started.model_name,
+            completed.text,
+            started.prompt_len,
+            completed.completion_tokens,
+            "completed",
+        ))
+        .into_response()
+    }
+}
+
+async fn streaming_response(state: Arc<AppState>, prepared: PreparedGeneration) -> Response {
+    let started = match start_generation(&state, prepared) {
+        Ok(started) => started,
+        Err(err) => return err,
+    };
+
+    let response_id = gen_id_with_prefix("resp");
+    let message_id = gen_id_with_prefix("msg");
+    let created_at = now_secs();
+    let stream_model = started.model_name.clone();
+    let finish_model = started.model_name.clone();
+    let prompt_len = started.prompt_len;
+    let tokenizer = Arc::clone(&state.tokenizer);
+    let token_count = Arc::new(AtomicU64::new(0));
+    let full_text = Arc::new(Mutex::new(String::new()));
+    let t0 = Instant::now();
+
+    let created_response = build_responses_response(
+        response_id.clone(),
+        message_id.clone(),
+        created_at,
+        stream_model,
+        String::new(),
+        prompt_len,
+        0,
+        "in_progress",
+    );
+    let created_data = serde_json::json!({
+        "type": "response.created",
+        "response": created_response,
+    });
+    let created_event = tokio_stream::once(Ok::<Event, Infallible>(
+        Event::default()
+            .event("response.created")
+            .data(created_data.to_string()),
+    ));
+
+    let tc = Arc::clone(&token_count);
+    let text_buf = Arc::clone(&full_text);
+    let delta_response_id = response_id.clone();
+    let delta_stream = ReceiverStream::new(started.rx).map(move |token_id| {
+        tc.fetch_add(1, Ordering::Relaxed);
+        let text = tokenizer.decode(&[token_id]);
+        if let Ok(mut buf) = text_buf.lock() {
+            buf.push_str(&text);
+        }
+
+        let payload = serde_json::json!({
+            "type": "response.output_text.delta",
+            "response_id": delta_response_id,
+            "output_index": 0,
+            "content_index": 0,
+            "delta": text,
+        });
+
+        Ok::<Event, Infallible>(
+            Event::default()
+                .event("response.output_text.delta")
+                .data(payload.to_string()),
+        )
+    });
+
+    let tc = Arc::clone(&token_count);
+    let text_buf = Arc::clone(&full_text);
+    let done_response_id = response_id.clone();
+    let completed_response_id = response_id.clone();
+    let finish_stream = tokio_stream::iter(vec![0u8, 1u8]).map(move |i| {
+        let text = text_buf.lock().map(|buf| buf.clone()).unwrap_or_default();
+
+        if i == 0 {
+            let payload = serde_json::json!({
+                "type": "response.output_text.done",
+                "response_id": done_response_id,
+                "output_index": 0,
+                "content_index": 0,
+                "text": text,
+            });
+            Ok::<Event, Infallible>(
+                Event::default()
+                    .event("response.output_text.done")
+                    .data(payload.to_string()),
+            )
+        } else {
+            let output_tokens = tc.load(Ordering::Relaxed) as usize;
+            state
+                .metrics
+                .record(output_tokens as u64, t0.elapsed().as_millis() as u64);
+            let response = build_responses_response(
+                completed_response_id.clone(),
+                message_id.clone(),
+                created_at,
+                finish_model.clone(),
+                text,
+                prompt_len,
+                output_tokens,
+                "completed",
+            );
+            let payload = serde_json::json!({
+                "type": "response.completed",
+                "response": response,
+            });
+            Ok::<Event, Infallible>(
+                Event::default()
+                    .event("response.completed")
+                    .data(payload.to_string()),
+            )
+        }
+    });
+
+    let event_stream = created_event.chain(delta_stream).chain(finish_stream);
+
+    Sse::new(event_stream)
+        .keep_alive(axum::response::sse::KeepAlive::default())
+        .into_response()
+}
+
 pub async fn embeddings(
     State(state): State<Arc<AppState>>,
     Json(req): Json<EmbeddingRequest>,
@@ -519,10 +808,7 @@ pub async fn embeddings(
     let weights = Arc::clone(&state.weights);
     let config = Arc::clone(&state.config);
 
-    let result = tokio::task::spawn_blocking(move || {
-        embed(&weights, &config, &tokens)
-    })
-    .await;
+    let result = tokio::task::spawn_blocking(move || embed(&weights, &config, &tokens)).await;
 
     match result {
         Err(_) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "Embedding task panicked"),

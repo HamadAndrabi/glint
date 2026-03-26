@@ -3,7 +3,7 @@
 //! These match the shape of the OpenAI API so that any existing client library
 //! (the OpenAI SDK, LangChain, curl, etc.) works with Glint without changes.
 //!
-//! Reference: https://platform.openai.com/docs/api-reference/completions
+//! Reference: https://platform.openai.com/docs/api-reference
 
 use serde::{Deserialize, Serialize};
 
@@ -31,7 +31,7 @@ pub struct CompletionRequest {
 }
 
 /// One message in a chat conversation.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ChatMessage {
     /// "system", "user", or "assistant".
     pub role: String,
@@ -50,6 +50,116 @@ pub struct ChatCompletionRequest {
     pub repeat_penalty: Option<f32>,
     pub seed: Option<u64>,
     pub stream: Option<bool>,
+}
+
+/// `POST /v1/responses` request body.
+#[derive(Debug, Deserialize)]
+pub struct ResponsesRequest {
+    pub model: String,
+    pub input: ResponseInput,
+    pub instructions: Option<String>,
+    pub max_output_tokens: Option<usize>,
+    pub temperature: Option<f32>,
+    pub top_p: Option<f32>,
+    pub top_k: Option<usize>,
+    pub repeat_penalty: Option<f32>,
+    pub seed: Option<u64>,
+    pub stream: Option<bool>,
+}
+
+/// Minimal text-only `input` forms supported by Glint's responses endpoint.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum ResponseInput {
+    Text(String),
+    Messages(Vec<ResponseInputMessage>),
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ResponseInputMessage {
+    pub role: String,
+    pub content: ResponseInputContent,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum ResponseInputContent {
+    Text(String),
+    Parts(Vec<ResponseInputContentPart>),
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ResponseInputContentPart {
+    #[serde(rename = "type")]
+    pub part_type: String,
+    #[serde(default)]
+    pub text: Option<String>,
+}
+
+impl ResponseInput {
+    pub fn to_messages(&self, instructions: Option<&str>) -> Result<Vec<ChatMessage>, String> {
+        let mut messages = Vec::new();
+
+        if let Some(system) = instructions.filter(|text| !text.trim().is_empty()) {
+            messages.push(ChatMessage {
+                role: "system".to_string(),
+                content: system.to_string(),
+            });
+        }
+
+        match self {
+            ResponseInput::Text(text) => {
+                if text.trim().is_empty() {
+                    return Err("input must not be empty".to_string());
+                }
+                messages.push(ChatMessage {
+                    role: "user".to_string(),
+                    content: text.clone(),
+                });
+            }
+            ResponseInput::Messages(items) => {
+                if items.is_empty() {
+                    return Err("input must not be empty".to_string());
+                }
+                for item in items {
+                    messages.push(ChatMessage {
+                        role: item.role.clone(),
+                        content: item.content.as_text()?,
+                    });
+                }
+            }
+        }
+
+        Ok(messages)
+    }
+}
+
+impl ResponseInputContent {
+    fn as_text(&self) -> Result<String, String> {
+        match self {
+            ResponseInputContent::Text(text) => Ok(text.clone()),
+            ResponseInputContent::Parts(parts) => {
+                let mut text = String::new();
+                for part in parts {
+                    match part.part_type.as_str() {
+                        "input_text" | "text" => {
+                            let part_text = part
+                                .text
+                                .as_deref()
+                                .ok_or_else(|| "text content part is missing `text`".to_string())?;
+                            text.push_str(part_text);
+                        }
+                        other => {
+                            return Err(format!(
+                                "unsupported responses input content type '{other}'; only text is supported"
+                            ));
+                        }
+                    }
+                }
+                Ok(text)
+            }
+        }
+    }
 }
 
 // ── Non-streaming responses ───────────────────────────────────────────────────
@@ -101,6 +211,47 @@ pub struct ChatChoice {
 pub struct ChatMessageOut {
     pub role: &'static str,
     pub content: String,
+}
+
+/// `POST /v1/responses` non-streaming response.
+#[derive(Debug, Serialize)]
+pub struct ResponsesResponse {
+    pub id: String,
+    pub object: &'static str,
+    pub created_at: u64,
+    pub status: &'static str,
+    pub model: String,
+    pub output: Vec<ResponseOutputItem>,
+    pub output_text: String,
+    pub usage: ResponsesUsage,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ResponseOutputItem {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub item_type: &'static str,
+    pub status: &'static str,
+    pub role: &'static str,
+    pub content: Vec<ResponseOutputContent>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ResponseOutputContent {
+    #[serde(rename = "type")]
+    pub content_type: &'static str,
+    pub text: String,
+    pub annotations: Vec<ResponseOutputAnnotation>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ResponseOutputAnnotation {}
+
+#[derive(Debug, Serialize)]
+pub struct ResponsesUsage {
+    pub input_tokens: usize,
+    pub output_tokens: usize,
+    pub total_tokens: usize,
 }
 
 // ── Streaming chunks ──────────────────────────────────────────────────────────
@@ -207,4 +358,63 @@ pub struct ErrorDetail {
     #[serde(rename = "type")]
     pub error_type: &'static str,
     pub code: u16,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn response_string_input_becomes_user_message() {
+        let input = ResponseInput::Text("Hello".to_string());
+        let messages = input.to_messages(None).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, "user");
+        assert_eq!(messages[0].content, "Hello");
+    }
+
+    #[test]
+    fn response_instructions_prepend_system_message() {
+        let input = ResponseInput::Text("Hello".to_string());
+        let messages = input.to_messages(Some("Be concise")).unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, "system");
+        assert_eq!(messages[0].content, "Be concise");
+        assert_eq!(messages[1].role, "user");
+    }
+
+    #[test]
+    fn response_content_parts_concatenate_text() {
+        let input = ResponseInput::Messages(vec![ResponseInputMessage {
+            role: "user".to_string(),
+            content: ResponseInputContent::Parts(vec![
+                ResponseInputContentPart {
+                    part_type: "input_text".to_string(),
+                    text: Some("Hello".to_string()),
+                },
+                ResponseInputContentPart {
+                    part_type: "text".to_string(),
+                    text: Some(" world".to_string()),
+                },
+            ]),
+        }]);
+
+        let messages = input.to_messages(None).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content, "Hello world");
+    }
+
+    #[test]
+    fn response_rejects_non_text_parts() {
+        let input = ResponseInput::Messages(vec![ResponseInputMessage {
+            role: "user".to_string(),
+            content: ResponseInputContent::Parts(vec![ResponseInputContentPart {
+                part_type: "input_image".to_string(),
+                text: None,
+            }]),
+        }]);
+
+        let err = input.to_messages(None).unwrap_err();
+        assert!(err.contains("only text is supported"));
+    }
 }
