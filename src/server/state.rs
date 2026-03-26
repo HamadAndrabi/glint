@@ -4,15 +4,15 @@
 //! to the same memory. The inference weights are read-only after loading, so
 //! there's no need for a mutex.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
+use super::engine::InferenceEngine;
 use crate::model::chat_template::ChatTemplate;
 use crate::model::config::ModelConfig;
 use crate::model::tokenizer::Tokenizer;
 use crate::transformer::TransformerWeights;
-use super::engine::InferenceEngine;
 
 /// Server-wide runtime counters. All fields are atomically updated — no locks needed.
 ///
@@ -42,7 +42,8 @@ impl Metrics {
     pub fn record(&self, tokens: u64, latency_ms: u64) {
         self.requests_total.fetch_add(1, Ordering::Relaxed);
         self.tokens_generated.fetch_add(tokens, Ordering::Relaxed);
-        self.total_latency_ms.fetch_add(latency_ms, Ordering::Relaxed);
+        self.total_latency_ms
+            .fetch_add(latency_ms, Ordering::Relaxed);
     }
 }
 
@@ -59,6 +60,6 @@ pub struct AppState {
     pub chat_template: ChatTemplate,
     /// Runtime metrics — request counts, token throughput, latency.
     pub metrics: Metrics,
-    /// Continuous-batching inference engine — owns the model weights and GPU.
+    /// Concurrent round-robin inference engine — owns the model weights and GPU.
     pub engine: Arc<InferenceEngine>,
 }

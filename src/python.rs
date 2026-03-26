@@ -40,20 +40,24 @@ impl GlintLLM {
     /// incomplete.
     #[new]
     fn new(model_path: &str) -> PyResult<Self> {
-        let model = GgufModel::load(model_path)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let model =
+            GgufModel::load(model_path).map_err(|e| PyValueError::new_err(e.to_string()))?;
 
         let config = ModelConfig::from_metadata(&model.metadata)
             .ok_or_else(|| PyValueError::new_err("Failed to parse model config from metadata"))?;
 
-        let tokenizer = Tokenizer::from_gguf(&model)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let tokenizer =
+            Tokenizer::from_gguf(&model).map_err(|e| PyValueError::new_err(e.to_string()))?;
 
         // Load weights — copies data out of the mmap so the model handle can drop.
         let weights = TransformerWeights::load(&model, &config)
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
 
-        Ok(Self { weights, config, tokenizer })
+        Ok(Self {
+            weights,
+            config,
+            tokenizer,
+        })
     }
 
     /// Generate text continuing `prompt`.
@@ -117,15 +121,15 @@ impl GlintLLM {
 
     /// Return a dict of model hyperparameters.
     fn model_info<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let d = PyDict::new(py);
-        d.set_item("architecture",    &self.config.architecture)?;
-        d.set_item("context_length",  self.config.context_length)?;
+        let d = PyDict::new_bound(py);
+        d.set_item("architecture", &self.config.architecture)?;
+        d.set_item("context_length", self.config.context_length)?;
         d.set_item("embedding_length", self.config.embedding_length)?;
-        d.set_item("block_count",     self.config.block_count)?;
-        d.set_item("head_count",      self.config.head_count)?;
-        d.set_item("head_count_kv",   self.config.head_count_kv)?;
-        d.set_item("vocab_size",      self.config.vocab_size)?;
-        d.set_item("head_dim",        self.config.head_dim())?;
+        d.set_item("block_count", self.config.block_count)?;
+        d.set_item("head_count", self.config.head_count)?;
+        d.set_item("head_count_kv", self.config.head_count_kv)?;
+        d.set_item("vocab_size", self.config.vocab_size)?;
+        d.set_item("head_dim", self.config.head_dim())?;
         if let Some(w) = self.config.sliding_window {
             d.set_item("sliding_window", w)?;
         }

@@ -3,17 +3,23 @@
 use clap::{Parser, Subcommand};
 use std::io::{self, BufRead, Write as IoWrite};
 use std::path::{Path, PathBuf};
+#[cfg(feature = "server")]
 use std::sync::Arc;
 use std::time::Instant;
 
 use glint::model::chat_template::{ChatTemplate, Message};
 use glint::model::config::ModelConfig;
 use glint::model::gguf::GgufModel;
+#[cfg(feature = "server")]
 use glint::model::pull::{pull_model, search_huggingface};
 use glint::model::tokenizer::Tokenizer;
 use glint::sampling::{Sampler, SamplerConfig};
+#[cfg(feature = "server")]
 use glint::server::{AppState, InferenceEngine, Metrics};
-use glint::transformer::{TransformerWeights, generate_cached, generate_greedy_cached, generate_streaming, speculative_decode};
+use glint::transformer::{
+    generate_cached, generate_greedy_cached, generate_streaming, speculative_decode,
+    TransformerWeights,
+};
 
 #[derive(Parser)]
 #[command(name = "glint")]
@@ -150,6 +156,7 @@ enum Commands {
     },
 
     /// Start the OpenAI-compatible HTTP inference server.
+    #[cfg(feature = "server")]
     Serve {
         /// Path to the .gguf model file.
         #[arg(short, long)]
@@ -171,6 +178,7 @@ enum Commands {
     /// Download a GGUF model from HuggingFace Hub.
     ///
     /// Example: glint pull bartowski/SmolLM2-135M-Instruct-GGUF SmolLM2-135M-Instruct-Q8_0.gguf
+    #[cfg(feature = "server")]
     Pull {
         /// HuggingFace repository in "owner/repo" format.
         repo: String,
@@ -184,6 +192,7 @@ enum Commands {
     },
 }
 
+#[cfg(feature = "server")]
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
@@ -211,7 +220,20 @@ async fn main() {
             gpu,
         } => {
             let file = maybe_download(&file).await;
-            run_model(&file, &prompt, max_tokens, temperature, top_k, top_p, repeat_penalty, seed, draft_model.as_deref(), lookahead, lora.as_deref(), gpu);
+            run_model(
+                &file,
+                &prompt,
+                max_tokens,
+                temperature,
+                top_k,
+                top_p,
+                repeat_penalty,
+                seed,
+                draft_model.as_deref(),
+                lookahead,
+                lora.as_deref(),
+                gpu,
+            );
         }
         Commands::Generate {
             file,
@@ -221,17 +243,120 @@ async fn main() {
             generate_tokens(&file, &tokens, max_tokens);
         }
         Commands::Chat {
-            file, system, max_tokens, temperature, top_k, top_p, repeat_penalty, seed, lora, gpu,
+            file,
+            system,
+            max_tokens,
+            temperature,
+            top_k,
+            top_p,
+            repeat_penalty,
+            seed,
+            lora,
+            gpu,
         } => {
             let file = maybe_download(&file).await;
-            chat_model(&file, system.as_deref(), max_tokens, temperature, top_k, top_p, repeat_penalty, seed, lora.as_deref(), gpu);
+            chat_model(
+                &file,
+                system.as_deref(),
+                max_tokens,
+                temperature,
+                top_k,
+                top_p,
+                repeat_penalty,
+                seed,
+                lora.as_deref(),
+                gpu,
+            );
         }
-        Commands::Serve { file, port, host, gpu } => {
+        #[cfg(feature = "server")]
+        Commands::Serve {
+            file,
+            port,
+            host,
+            gpu,
+        } => {
             let file = maybe_download(&file).await;
             serve_model(&file, &host, port, gpu).await;
         }
+        #[cfg(feature = "server")]
         Commands::Pull { repo, file, dir } => {
             pull_model_cmd(&repo, &file, dir.as_deref()).await;
+        }
+    }
+}
+
+#[cfg(not(feature = "server"))]
+fn main() {
+    let cli = Cli::parse();
+
+    match cli.command {
+        Commands::Inspect {
+            file,
+            show_metadata,
+            show_tensors,
+        } => {
+            inspect_model(&file, show_metadata, show_tensors);
+        }
+        Commands::Run {
+            file,
+            prompt,
+            max_tokens,
+            temperature,
+            top_k,
+            top_p,
+            repeat_penalty,
+            seed,
+            draft_model,
+            lookahead,
+            lora,
+            gpu,
+        } => {
+            run_model(
+                &file,
+                &prompt,
+                max_tokens,
+                temperature,
+                top_k,
+                top_p,
+                repeat_penalty,
+                seed,
+                draft_model.as_deref(),
+                lookahead,
+                lora.as_deref(),
+                gpu,
+            );
+        }
+        Commands::Generate {
+            file,
+            tokens,
+            max_tokens,
+        } => {
+            generate_tokens(&file, &tokens, max_tokens);
+        }
+        Commands::Chat {
+            file,
+            system,
+            max_tokens,
+            temperature,
+            top_k,
+            top_p,
+            repeat_penalty,
+            seed,
+            lora,
+            gpu,
+        } => {
+            chat_model(
+                &file,
+                system.as_deref(),
+                max_tokens,
+                temperature,
+                top_k,
+                top_p,
+                repeat_penalty,
+                seed,
+                lora.as_deref(),
+                gpu,
+            );
         }
     }
 }
@@ -334,7 +459,10 @@ fn inspect_model(path: &PathBuf, show_metadata: bool, show_tensors: bool) {
 /// Returns `Some(GpuBackend)` with weights uploaded, or `None` if GPU is not
 /// requested / not available. Prints a warning if `--gpu` is passed without
 /// the `vulkan` feature compiled in.
-fn init_gpu(use_gpu: bool, _weights: &mut TransformerWeights) -> Option<glint::backend::GpuBackend> {
+fn init_gpu(
+    use_gpu: bool,
+    _weights: &mut TransformerWeights,
+) -> Option<glint::backend::GpuBackend> {
     if !use_gpu {
         return None;
     }
@@ -387,13 +515,19 @@ fn run_model(
 
     let config = match ModelConfig::from_metadata(&model.metadata) {
         Some(c) => c,
-        None => { eprintln!("Error: could not extract model configuration from GGUF metadata"); std::process::exit(1); }
+        None => {
+            eprintln!("Error: could not extract model configuration from GGUF metadata");
+            std::process::exit(1);
+        }
     };
 
     eprintln!("Loading tokenizer...");
     let tokenizer = match Tokenizer::from_gguf(&model) {
         Ok(t) => t,
-        Err(e) => { eprintln!("Error: {e}"); std::process::exit(1); }
+        Err(e) => {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        }
     };
     eprintln!("Tokenizer: {} tokens", tokenizer.vocab_size());
 
@@ -402,20 +536,32 @@ fn run_model(
     prompt_tokens.insert(0, tokenizer.bos_token_id);
 
     eprintln!("Prompt: {:?}", prompt);
-    eprintln!("Tokens: {:?} ({} tokens)", prompt_tokens, prompt_tokens.len());
+    eprintln!(
+        "Tokens: {:?} ({} tokens)",
+        prompt_tokens,
+        prompt_tokens.len()
+    );
 
     eprintln!("Loading weights...");
     let weights = match TransformerWeights::load(&model, &config) {
         Ok(w) => w,
-        Err(e) => { eprintln!("Error: {e}"); std::process::exit(1); }
+        Err(e) => {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        }
     };
     let mut weights = if let Some(lp) = lora_path {
         let lora_model = match GgufModel::load(lp) {
             Ok(m) => m,
-            Err(e) => { eprintln!("Error loading LoRA file: {e}"); std::process::exit(1); }
+            Err(e) => {
+                eprintln!("Error loading LoRA file: {e}");
+                std::process::exit(1);
+            }
         };
         weights.with_lora(&lora_model)
-    } else { weights };
+    } else {
+        weights
+    };
 
     // GPU initialization
     let mut gpu_backend = init_gpu(use_gpu, &mut weights);
@@ -438,21 +584,35 @@ fn run_model(
         // Speculative decoding path
         let draft_model = match GgufModel::load(draft_path) {
             Ok(m) => m,
-            Err(e) => { eprintln!("Error loading draft model: {e}"); std::process::exit(1); }
+            Err(e) => {
+                eprintln!("Error loading draft model: {e}");
+                std::process::exit(1);
+            }
         };
         let draft_config = match ModelConfig::from_metadata(&draft_model.metadata) {
             Some(c) => c,
-            None => { eprintln!("Error: could not extract draft model config"); std::process::exit(1); }
+            None => {
+                eprintln!("Error: could not extract draft model config");
+                std::process::exit(1);
+            }
         };
         let draft_weights = match TransformerWeights::load(&draft_model, &draft_config) {
             Ok(w) => w,
-            Err(e) => { eprintln!("Error loading draft weights: {e}"); std::process::exit(1); }
+            Err(e) => {
+                eprintln!("Error loading draft weights: {e}");
+                std::process::exit(1);
+            }
         };
         eprintln!("Speculative decoding: lookahead={lookahead}");
         speculative_decode(
-            &draft_weights, &draft_config,
-            &weights, &config,
-            &prompt_tokens, max_tokens, lookahead, temperature,
+            &draft_weights,
+            &draft_config,
+            &weights,
+            &config,
+            &prompt_tokens,
+            max_tokens,
+            lookahead,
+            temperature,
             tokenizer.eos_token_id,
             &mut gpu,
         )
@@ -465,7 +625,15 @@ fn run_model(
             seed,
             ..Default::default()
         });
-        generate_cached(&weights, &config, &prompt_tokens, max_tokens, &mut sampler, tokenizer.eos_token_id, &mut gpu)
+        generate_cached(
+            &weights,
+            &config,
+            &prompt_tokens,
+            max_tokens,
+            &mut sampler,
+            tokenizer.eos_token_id,
+            &mut gpu,
+        )
     } else {
         generate_greedy_cached(&weights, &config, &prompt_tokens, max_tokens, &mut gpu)
     };
@@ -495,7 +663,10 @@ fn generate_tokens(path: &PathBuf, tokens_str: &str, max_tokens: usize) {
 
     let config = match ModelConfig::from_metadata(&model.metadata) {
         Some(c) => c,
-        None => { eprintln!("Error: could not extract model configuration from GGUF metadata"); std::process::exit(1); }
+        None => {
+            eprintln!("Error: could not extract model configuration from GGUF metadata");
+            std::process::exit(1);
+        }
     };
     println!("Model: {} ({})", config.architecture, path.display());
     println!("{config}");
@@ -510,7 +681,10 @@ fn generate_tokens(path: &PathBuf, tokens_str: &str, max_tokens: usize) {
     eprintln!("Loading weights...");
     let weights = match TransformerWeights::load(&model, &config) {
         Ok(w) => w,
-        Err(e) => { eprintln!("Error: {e}"); std::process::exit(1); }
+        Err(e) => {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        }
     };
 
     eprintln!("Generating...");
@@ -518,7 +692,10 @@ fn generate_tokens(path: &PathBuf, tokens_str: &str, max_tokens: usize) {
 
     println!("\n═══ Output Tokens ═══");
     println!("{:?}", output);
-    println!("\nGenerated {} new tokens", output.len() - prompt_tokens.len());
+    println!(
+        "\nGenerated {} new tokens",
+        output.len() - prompt_tokens.len()
+    );
 }
 
 /// Run the model on a summarization prompt and return the decoded summary string.
@@ -559,9 +736,18 @@ fn summarize_messages(
         ..Default::default()
     });
     let output = generate_cached(
-        weights, config, &prompt_tokens, gen_tokens, &mut sampler, tokenizer.eos_token_id, &mut None,
+        weights,
+        config,
+        &prompt_tokens,
+        gen_tokens,
+        &mut sampler,
+        tokenizer.eos_token_id,
+        &mut None,
     );
-    tokenizer.decode(&output[prompt_tokens.len()..]).trim().to_string()
+    tokenizer
+        .decode(&output[prompt_tokens.len()..])
+        .trim()
+        .to_string()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -587,33 +773,49 @@ fn chat_model(
 
     let config = match ModelConfig::from_metadata(&model.metadata) {
         Some(c) => c,
-        None => { eprintln!("Error: could not extract model configuration from GGUF metadata"); std::process::exit(1); }
+        None => {
+            eprintln!("Error: could not extract model configuration from GGUF metadata");
+            std::process::exit(1);
+        }
     };
 
     eprintln!("Loading tokenizer...");
     let tokenizer = match Tokenizer::from_gguf(&model) {
         Ok(t) => t,
-        Err(e) => { eprintln!("Error: {e}"); std::process::exit(1); }
+        Err(e) => {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        }
     };
     eprintln!("Tokenizer: {} tokens", tokenizer.vocab_size());
 
     eprintln!("Loading weights...");
     let weights = match TransformerWeights::load(&model, &config) {
         Ok(w) => w,
-        Err(e) => { eprintln!("Error: {e}"); std::process::exit(1); }
+        Err(e) => {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        }
     };
     let mut weights = if let Some(lp) = lora_path {
         let lora_model = match GgufModel::load(lp) {
             Ok(m) => m,
-            Err(e) => { eprintln!("Error loading LoRA file: {e}"); std::process::exit(1); }
+            Err(e) => {
+                eprintln!("Error loading LoRA file: {e}");
+                std::process::exit(1);
+            }
         };
         weights.with_lora(&lora_model)
-    } else { weights };
+    } else {
+        weights
+    };
 
     let mut gpu_backend = init_gpu(use_gpu, &mut weights);
     let mut gpu: Option<&mut glint::backend::GpuBackend> = gpu_backend.as_mut();
 
-    let chat_template = config.chat_template.as_deref()
+    let chat_template = config
+        .chat_template
+        .as_deref()
         .map(ChatTemplate::detect)
         .unwrap_or(ChatTemplate::Generic);
     eprintln!("Chat template:  {}", chat_template.name());
@@ -650,7 +852,8 @@ fn chat_model(
         // Build prompt, summarizing or trimming if over context budget
         let context_budget = config.context_length as usize;
         let prompt_tokens = loop {
-            let msgs: Vec<Message<'_>> = history.iter()
+            let msgs: Vec<Message<'_>> = history
+                .iter()
                 .map(|(role, content)| Message { role, content })
                 .collect();
             let prompt = chat_template.apply(&msgs);
@@ -662,7 +865,9 @@ fn chat_model(
             }
 
             // Collect indices of non-system messages
-            let non_sys: Vec<usize> = history.iter().enumerate()
+            let non_sys: Vec<usize> = history
+                .iter()
+                .enumerate()
                 .filter(|(_, (r, _))| r != "system")
                 .map(|(i, _)| i)
                 .collect();
@@ -675,17 +880,26 @@ fn chat_model(
                     .map(|&i| history[i].clone())
                     .collect();
                 eprintln!("[Context limit reached — summarizing earlier conversation...]");
-                let summary = summarize_messages(&weights, &config, &tokenizer, &to_summarize, context_budget);
+                let summary = summarize_messages(
+                    &weights,
+                    &config,
+                    &tokenizer,
+                    &to_summarize,
+                    context_budget,
+                );
                 // Remove summarized messages (reverse order to keep indices valid)
                 for &i in non_sys[..keep_from].iter().rev() {
                     history.remove(i);
                 }
                 // Insert summary after system messages
                 let insert_at = history.iter().position(|(r, _)| r != "system").unwrap_or(0);
-                history.insert(insert_at, (
-                    "system".to_string(),
-                    format!("Summary of earlier conversation: {summary}"),
-                ));
+                history.insert(
+                    insert_at,
+                    (
+                        "system".to_string(),
+                        format!("Summary of earlier conversation: {summary}"),
+                    ),
+                );
                 continue;
             }
 
@@ -738,6 +952,7 @@ fn chat_model(
     eprintln!("\nGoodbye!");
 }
 
+#[cfg(feature = "server")]
 async fn serve_model(path: &PathBuf, host: &str, port: u16, use_gpu: bool) {
     let model = match GgufModel::load(path) {
         Ok(m) => m,
@@ -749,20 +964,29 @@ async fn serve_model(path: &PathBuf, host: &str, port: u16, use_gpu: bool) {
 
     let config = match ModelConfig::from_metadata(&model.metadata) {
         Some(c) => c,
-        None => { eprintln!("Error: could not extract model configuration from GGUF metadata"); std::process::exit(1); }
+        None => {
+            eprintln!("Error: could not extract model configuration from GGUF metadata");
+            std::process::exit(1);
+        }
     };
 
     eprintln!("Loading tokenizer...");
     let tokenizer = match Tokenizer::from_gguf(&model) {
         Ok(t) => t,
-        Err(e) => { eprintln!("Error: {e}"); std::process::exit(1); }
+        Err(e) => {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        }
     };
     eprintln!("Tokenizer: {} tokens", tokenizer.vocab_size());
 
     eprintln!("Loading weights...");
     let weights = match TransformerWeights::load(&model, &config) {
         Ok(w) => w,
-        Err(e) => { eprintln!("Error: {e}"); std::process::exit(1); }
+        Err(e) => {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        }
     };
     eprintln!("Weights loaded.");
 
@@ -777,7 +1001,9 @@ async fn serve_model(path: &PathBuf, host: &str, port: u16, use_gpu: bool) {
         .to_string();
 
     // Detect chat template from GGUF metadata
-    let chat_template = config.chat_template.as_deref()
+    let chat_template = config
+        .chat_template
+        .as_deref()
         .map(ChatTemplate::detect)
         .unwrap_or(ChatTemplate::Generic);
     eprintln!("Chat template:  {}", chat_template.name());
@@ -785,8 +1011,9 @@ async fn serve_model(path: &PathBuf, host: &str, port: u16, use_gpu: bool) {
     let weights = Arc::new(weights);
     let config_arc = Arc::new(config);
 
-    // Start the continuous-batching inference engine on a dedicated OS thread.
-    // The engine owns the GPU backend (if any) and all active KV caches.
+    // Start the concurrent round-robin inference engine on a dedicated OS
+    // thread. The engine owns the GPU backend (if any) and all active KV
+    // caches.
     let engine = Arc::new(InferenceEngine::start(
         Arc::clone(&weights),
         Arc::clone(&config_arc),
@@ -836,6 +1063,7 @@ fn format_bytes(bytes: u64) -> String {
 ///
 /// - Windows: `%LOCALAPPDATA%\glint\models`
 /// - Linux/macOS: `~/.cache/glint/models`
+#[cfg(feature = "server")]
 fn default_cache_dir(override_dir: Option<&Path>) -> PathBuf {
     match override_dir {
         Some(d) => d.to_path_buf(),
@@ -849,6 +1077,7 @@ fn default_cache_dir(override_dir: Option<&Path>) -> PathBuf {
 /// If `path` doesn't exist and looks like a `.gguf` filename, search HuggingFace
 /// and offer to download it. Returns the resolved path (either the original or the
 /// freshly-downloaded one).
+#[cfg(feature = "server")]
 async fn maybe_download(path: &Path) -> PathBuf {
     if path.exists() {
         return path.to_path_buf();
@@ -915,6 +1144,7 @@ async fn maybe_download(path: &Path) -> PathBuf {
 }
 
 /// Handle the `glint pull` subcommand.
+#[cfg(feature = "server")]
 async fn pull_model_cmd(repo: &str, filename: &str, dir: Option<&Path>) {
     let dest_dir = default_cache_dir(dir);
     eprintln!("Repository: {repo}");
@@ -926,7 +1156,10 @@ async fn pull_model_cmd(repo: &str, filename: &str, dir: Option<&Path>) {
         Ok(path) => {
             eprintln!("\nSaved to: {}", path.display());
             eprintln!("\nRun with:");
-            eprintln!("  glint run --file \"{}\" --prompt \"Your prompt here\"", path.display());
+            eprintln!(
+                "  glint run --file \"{}\" --prompt \"Your prompt here\"",
+                path.display()
+            );
         }
         Err(e) => {
             eprintln!("Error: {e}");

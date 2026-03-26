@@ -37,9 +37,20 @@ Glint is a focused inference engine for GGUF-based LLaMA-family models. It is de
 | Performance | AVX2+FMA kernels, scalar fallback, Rayon row-parallel matvec, optional GPU backend (wgpu/Vulkan/Metal/DX12) |
 | KV Cache | f32 and Q8_0-quantized cache variants; `KvStore` trait abstraction |
 | LoRA | Load and apply LoRA adapters at inference time via `--lora` |
-| Server | OpenAI-compatible `/v1/completions`, `/v1/chat/completions`, `/v1/embeddings`, `GET /v1/metrics`, SSE streaming, continuous batching |
+| Server | OpenAI-compatible `/v1/completions`, `/v1/chat/completions`, `/v1/embeddings`, `GET /v1/metrics`, SSE streaming, round-robin concurrent serving |
 | CLI | `run`, `chat`, `serve`, `inspect`, `generate`, `pull` (HuggingFace Hub download) |
 | Bindings | Python (`pyo3`), browser WASM (`wasm-bindgen`), native CLI |
+
+## Build Profiles
+
+CI validates these build surfaces on every push and pull request:
+
+| Surface | Command |
+| --- | --- |
+| Core CLI + server | `cargo build --release` |
+| GPU backend | `cargo check --features vulkan` |
+| Browser / WASM | `cargo check --no-default-features --features wasm` + `wasm-pack build --target web --no-default-features --features wasm` |
+| Python bindings | `cargo check --features python` |
 
 ## Highlights
 
@@ -95,7 +106,7 @@ Glint is a focused inference engine for GGUF-based LLaMA-family models. It is de
 
 ### Python Bindings (optional, `--features python`)
 
-- `from glint import LLM; m = LLM("model.gguf"); m.generate("Hello", 64)`
+- `import glint; m = glint.GlintLLM("model.gguf"); m.generate("Hello", 64)`
 - PyO3 integration with `maturin` for seamless packaging
 
 ### Model Pull
@@ -269,7 +280,7 @@ flowchart TD
     Spec --> Sampler
 
     Sampler --> CLI["CLI output<br/>glint run / chat"]
-    Sampler --> Engine["InferenceEngine<br/>continuous batching"]
+    Sampler --> Engine["InferenceEngine<br/>round-robin concurrent serving"]
     Engine --> SSE["HTTP SSE<br/>/v1/completions<br/>/v1/chat/completions<br/>/v1/embeddings"]
     Sampler --> Py["Python<br/>feature: python"]
     Sampler --> WASM["Browser / WASM<br/>feature: wasm"]
@@ -306,7 +317,7 @@ src/
   sampling/            Temperature, top-k, top-p, min-p, rep-penalty, seeded RNG
   server/              (feature: server)
     mod.rs             Axum router setup and CORS
-    engine.rs          Continuous-batching inference engine
+    engine.rs          Round-robin concurrent inference engine
     routes.rs          /health, /v1/models, /v1/metrics, completions, chat, embeddings
     types.rs           OpenAI-compatible request/response shapes
     state.rs           AppState (Arc-wrapped model + config + metrics)

@@ -10,13 +10,48 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
-
+  build-and-test:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v4
-    - name: Build
-      run: cargo build --verbose
-    - name: Run tests
-      run: cargo test --verbose
+      - uses: actions/checkout@v4
+      - name: Build
+        run: cargo build --verbose
+      - name: Run tests
+        run: cargo test --verbose
+
+  check-vulkan:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check Vulkan feature
+        run: cargo check --verbose --features vulkan
+
+  check-python:
+    runs-on: ubuntu-latest
+    env:
+      PYO3_PYTHON: python3
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Check Python bindings
+        run: cargo check --verbose --features python
+
+  check-wasm:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Add wasm target
+        run: rustup target add wasm32-unknown-unknown
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack
+      - name: Check wasm feature
+        run: cargo check --verbose --no-default-features --features wasm
+      - name: Build wasm package
+        run: wasm-pack build --target web --no-default-features --features wasm
