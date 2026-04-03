@@ -1,0 +1,19 @@
+[book]
+title = "Glint Wiki"
+authors = ["Glint Contributors"]
+language = "en"
+src = "src"
+
+[output.html]
+theme = "coal"
+git-repository-url = "https://github.com/hamadandrabi/glint"
+edit-url-template = "https://github.com/hamadandrabi/glint/edit/main/wiki/src/{path}"
+no-section-label = false
+
+[output.html.search]
+enable = true
+limit-results = 20
+use-boolean-and = true
+boost-title = 3
+boost-hierarchy = 2
+boost-paragraph = 1
