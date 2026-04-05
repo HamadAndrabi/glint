@@ -32,8 +32,8 @@
 /// A simple 64-bit xorshift PRNG.
 ///
 /// Produces a full period of 2^64 - 1 values (state must never be 0).
-pub(crate) struct Xorshift64 {
-    state: u64,
+pub struct Xorshift64 {
+    pub state: u64,
 }
 
 impl Xorshift64 {
@@ -43,6 +43,11 @@ impl Xorshift64 {
         Self {
             state: if seed == 0 { 1 } else { seed },
         }
+    }
+
+    /// Restore a PRNG from a previously saved state (e.g. from a snapshot).
+    pub fn restore(state: u64) -> Self {
+        Self { state: if state == 0 { 1 } else { state } }
     }
 
     /// Generate the next random u64.
@@ -68,6 +73,7 @@ impl Xorshift64 {
 ///
 /// All fields have defaults that disable their effect, so you can enable
 /// only the strategies you want.
+#[derive(Clone, Copy, Debug)]
 pub struct SamplerConfig {
     /// Temperature for logit scaling. 1.0 = no change, >1 = more random,
     /// <1 = more deterministic, 0.0 = greedy (argmax).
@@ -118,7 +124,7 @@ impl Default for SamplerConfig {
 /// ```
 pub struct Sampler {
     config: SamplerConfig,
-    rng: Xorshift64,
+    pub rng: Xorshift64,
 }
 
 impl Sampler {
@@ -149,46 +155,87 @@ impl Sampler {
     ///
     /// `logits` is the raw output from the LM head — one f32 per vocab token.
     /// `past_tokens` is the sequence generated so far (for repetition penalty).
-    pub fn sample(&mut self, logits: &[f32], past_tokens: &[u32]) -> u32 {
-        // Greedy fast path: no copying or manipulation needed
-        if self.config.temperature == 0.0 {
+    /// `constraint` optionally masks disallowed tokens before sampling.
+    pub fn sample(
+        &mut self,
+        logits:     &[f32],
+        past_tokens: &[u32],
+    ) -> u32 {
+        self.sample_inner(logits, past_tokens, None)
+    }
+
+    /// Like [`sample`] but applies a token constraint mask before sampling.
+    ///
+    /// Tokens where `mask[i] == false` are set to `f32::NEG_INFINITY` so they
+    /// are never sampled.  This happens after repetition penalty but before
+    /// temperature scaling, so the constraint dominates.
+    pub fn sample_constrained(
+        &mut self,
+        logits:      &[f32],
+        past_tokens: &[u32],
+        mask:        &[bool],
+    ) -> u32 {
+        self.sample_inner(logits, past_tokens, Some(mask))
+    }
+
+    fn sample_inner(
+        &mut self,
+        logits:      &[f32],
+        past_tokens: &[u32],
+        mask:        Option<&[bool]>,
+    ) -> u32 {
+        // Greedy fast path when no constraint is active.
+        if self.config.temperature == 0.0 && mask.is_none() {
             return argmax(logits);
         }
 
-        // Work on a mutable copy of the logits
+        // Work on a mutable copy of the logits.
         let mut logits = logits.to_vec();
 
-        // 1. Repetition penalty
+        // 1. Repetition penalty.
         if self.config.repeat_penalty != 1.0 {
             apply_repetition_penalty(&mut logits, past_tokens, self.config.repeat_penalty);
         }
 
-        // 2. Temperature scaling
+        // 2. Constraint mask — applied before temperature so disallowed tokens
+        //    have −∞ logit and are excluded from all downstream filtering.
+        if let Some(m) = mask {
+            for (l, &allowed) in logits.iter_mut().zip(m.iter()) {
+                if !allowed { *l = f32::NEG_INFINITY; }
+            }
+        }
+
+        // Greedy path: argmax after masking.
+        if self.config.temperature == 0.0 {
+            return argmax(&logits);
+        }
+
+        // 3. Temperature scaling.
         if self.config.temperature != 1.0 {
             apply_temperature(&mut logits, self.config.temperature);
         }
 
-        // 3. Top-k filtering
+        // 4. Top-k filtering.
         if self.config.top_k > 0 {
             apply_top_k(&mut logits, self.config.top_k);
         }
 
-        // 4. Min-p filtering (before top-p, since min-p works on raw logits)
+        // 5. Min-p filtering (before top-p, since min-p works on raw logits).
         if self.config.min_p > 0.0 {
             apply_min_p(&mut logits, self.config.min_p);
         }
 
-        // 5. Softmax → probabilities
+        // 6. Softmax → probabilities.
         let probs = softmax(&logits);
 
-        // 6. Top-p (nucleus) filtering — operates on probabilities
+        // 7. Top-p (nucleus) filtering — operates on probabilities.
         let probs = if self.config.top_p < 1.0 {
             apply_top_p(&probs, self.config.top_p)
         } else {
             probs
         };
 
-        // 7. Weighted random sample
+        // 8. Weighted random sample.
         sample_from_probs(&probs, &mut self.rng)
     }
 }

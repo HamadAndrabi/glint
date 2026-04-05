@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
+use std::sync::Arc;
 
 use byteorder::{LittleEndian, ReadBytesExt};
 use memmap2::Mmap;
@@ -566,7 +567,7 @@ const DEFAULT_ALIGNMENT: u64 = 32;
 /// Backing storage for a `GgufModel` — either memory-mapped (native) or
 /// heap-owned (WASM / in-memory usage via `GgufModel::from_bytes`).
 enum GgufData {
-    Mmap(Mmap),
+    Mmap(Arc<Mmap>),
     Owned(Box<[u8]>),
 }
 
@@ -646,7 +647,7 @@ impl GgufModel {
     /// Load and parse a GGUF model file via memory-mapped I/O (zero-copy).
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
         let file = File::open(path.as_ref())?;
-        let mmap = unsafe { Mmap::map(&file)? };
+        let mmap = Arc::new(unsafe { Mmap::map(&file)? });
         let (version, metadata, tensor_infos, tensor_index, tensor_data_offset) =
             Self::parse(&mmap)?;
         Ok(Self {
@@ -687,6 +688,26 @@ impl GgufModel {
 
     pub fn get_tensor_info(&self, name: &str) -> Option<&TensorInfo> {
         self.tensor_index.get(name).map(|&idx| &self.tensor_infos[idx])
+    }
+
+    /// Return a reference-counted handle to the memory map, if this model was
+    /// loaded from a file.  `None` when loaded from an in-memory byte buffer.
+    ///
+    /// Used by lazy `QuantizedStorage::Borrowed` to share the mmap without
+    /// copying any weight bytes.
+    pub fn mmap_arc(&self) -> Option<Arc<Mmap>> {
+        match &self.data {
+            GgufData::Mmap(m) => Some(Arc::clone(m)),
+            GgufData::Owned(_) => None,
+        }
+    }
+
+    /// Return the `(byte_offset, byte_len)` of a tensor within the raw file
+    /// data, without copying.  Used by lazy weight loading.
+    pub fn tensor_data_range(&self, name: &str) -> Option<(usize, usize)> {
+        let info = self.get_tensor_info(name)?;
+        let offset = self.tensor_data_offset + info.offset as usize;
+        Some((offset, info.data_size()))
     }
 
     /// Get a tensor's raw data as a byte slice from the mmap'd file.

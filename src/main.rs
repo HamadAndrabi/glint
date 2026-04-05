@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
+use glint::api::Model as GlintModel;
+use glint::bench;
 use glint::model::chat_template::{ChatTemplate, Message};
 use glint::model::config::ModelConfig;
 use glint::model::gguf::GgufModel;
@@ -15,7 +17,13 @@ use glint::model::pull::{pull_model, search_huggingface};
 use glint::model::tokenizer::Tokenizer;
 use glint::sampling::{Sampler, SamplerConfig};
 #[cfg(feature = "server")]
+use glint::constrained::VocabIndex;
+#[cfg(feature = "server")]
+use glint::model::lora_registry::AdapterRegistry;
+#[cfg(feature = "server")]
 use glint::server::{AppState, InferenceEngine, Metrics};
+#[cfg(feature = "server")]
+use glint::session::CacheFormat;
 use glint::transformer::{
     generate_cached, generate_greedy_cached, generate_streaming, speculative_decode,
     TransformerWeights,
@@ -173,6 +181,10 @@ enum Commands {
         /// Use GPU acceleration (requires `vulkan` feature).
         #[arg(long, default_value_t = false)]
         gpu: bool,
+
+        /// KV-cache storage format: "f32" (default, full precision) or "q8" (~3.8× smaller).
+        #[arg(long, default_value = "f32")]
+        kv_cache: String,
     },
 
     /// Download a GGUF model from HuggingFace Hub.
@@ -189,6 +201,41 @@ enum Commands {
         /// Directory to save the model to (default: platform cache dir / glint / models).
         #[arg(long)]
         dir: Option<PathBuf>,
+    },
+
+    /// Benchmark inference performance (prefill, decode, concurrency, cache formats).
+    Bench {
+        /// Path to the .gguf model file.
+        #[arg(short, long)]
+        file: PathBuf,
+
+        /// Which benchmark mode(s) to run: "all", "prefill", "decode", "concurrency", "cache-format".
+        #[arg(long, default_value = "all")]
+        mode: String,
+
+        /// Number of prompt tokens to use for all benchmarks.
+        #[arg(long, default_value_t = 512)]
+        prompt_len: usize,
+
+        /// Number of new tokens to decode in decode/concurrency benchmarks.
+        #[arg(long, default_value_t = 128)]
+        decode_tokens: usize,
+
+        /// Maximum number of concurrent sessions for the concurrency benchmark.
+        #[arg(long, default_value_t = 8)]
+        max_concurrent: usize,
+
+        /// Number of warm-up rounds (discarded).
+        #[arg(long, default_value_t = 3)]
+        warmup: usize,
+
+        /// Number of timed measurement rounds.
+        #[arg(long, default_value_t = 10)]
+        iters: usize,
+
+        /// If set, write results as JSON to this file path.
+        #[arg(long)]
+        output: Option<PathBuf>,
     },
 }
 
@@ -274,13 +321,26 @@ async fn main() {
             port,
             host,
             gpu,
+            kv_cache,
         } => {
             let file = maybe_download(&file).await;
-            serve_model(&file, &host, port, gpu).await;
+            serve_model(&file, &host, port, gpu, &kv_cache).await;
         }
         #[cfg(feature = "server")]
         Commands::Pull { repo, file, dir } => {
             pull_model_cmd(&repo, &file, dir.as_deref()).await;
+        }
+        Commands::Bench {
+            file,
+            mode,
+            prompt_len,
+            decode_tokens,
+            max_concurrent,
+            warmup,
+            iters,
+            output,
+        } => {
+            bench_model(&file, &mode, prompt_len, decode_tokens, max_concurrent, warmup, iters, output.as_deref());
         }
     }
 }
@@ -357,6 +417,18 @@ fn main() {
                 lora.as_deref(),
                 gpu,
             );
+        }
+        Commands::Bench {
+            file,
+            mode,
+            prompt_len,
+            decode_tokens,
+            max_concurrent,
+            warmup,
+            iters,
+            output,
+        } => {
+            bench_model(&file, &mode, prompt_len, decode_tokens, max_concurrent, warmup, iters, output.as_deref());
         }
     }
 }
@@ -614,6 +686,7 @@ fn run_model(
             lookahead,
             temperature,
             tokenizer.eos_token_id,
+            seed,
             &mut gpu,
         )
     } else if use_sampling {
@@ -953,7 +1026,7 @@ fn chat_model(
 }
 
 #[cfg(feature = "server")]
-async fn serve_model(path: &PathBuf, host: &str, port: u16, use_gpu: bool) {
+async fn serve_model(path: &PathBuf, host: &str, port: u16, use_gpu: bool, kv_cache: &str) {
     let model = match GgufModel::load(path) {
         Ok(m) => m,
         Err(e) => {
@@ -1011,13 +1084,34 @@ async fn serve_model(path: &PathBuf, host: &str, port: u16, use_gpu: bool) {
     let weights = Arc::new(weights);
     let config_arc = Arc::new(config);
 
+    // Parse cache format from CLI arg.
+    let cache_format = match kv_cache {
+        "q8" => CacheFormat::Q8,
+        _    => CacheFormat::F32,
+    };
+    eprintln!("KV-cache format: {}", if cache_format == CacheFormat::Q8 { "Q8 (quantised)" } else { "F32 (full precision)" });
+
     // Start the concurrent round-robin inference engine on a dedicated OS
     // thread. The engine owns the GPU backend (if any) and all active KV
     // caches.
+    // Pre-build the vocabulary index for constraint-based generation (JSON mode, etc.).
+    let vocab_strings: Vec<String> = (0..tokenizer.vocab_size())
+        .map(|i| tokenizer.decode_token(i as u32).to_owned())
+        .collect();
+    let vocab_index = VocabIndex::from_vocab(&vocab_strings);
+
+    // Build an empty adapter registry (adapters can be pre-loaded here in future
+    // via a --lora-adapter flag; for now the registry starts empty).
+    let adapter_registry = Arc::new(std::sync::RwLock::new(AdapterRegistry::new()));
+    let engine_registry  = Arc::new(AdapterRegistry::new()); // immutable snapshot for engine
+
     let engine = Arc::new(InferenceEngine::start(
         Arc::clone(&weights),
         Arc::clone(&config_arc),
         gpu_backend,
+        cache_format,
+        Arc::clone(&vocab_index),
+        engine_registry,
     ));
 
     let state = AppState {
@@ -1028,9 +1122,77 @@ async fn serve_model(path: &PathBuf, host: &str, port: u16, use_gpu: bool) {
         chat_template,
         metrics: Metrics::new(),
         engine,
+        vocab_index,
+        adapter_registry,
     };
 
     glint::server::run_server(state, host, port).await;
+}
+
+fn bench_model(
+    path: &PathBuf,
+    mode: &str,
+    prompt_len: usize,
+    decode_tokens: usize,
+    max_concurrent: usize,
+    warmup: usize,
+    iters: usize,
+    output: Option<&Path>,
+) {
+    eprintln!("Loading model: {}", path.display());
+    let model = match GlintModel::load(path) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("Error loading model: {e}");
+            std::process::exit(1);
+        }
+    };
+    eprintln!("Model loaded. Running benchmark mode: {mode}");
+    eprintln!("  prompt_len={prompt_len}  decode_tokens={decode_tokens}  warmup={warmup}  iters={iters}");
+    eprintln!();
+
+    let mut results: Vec<bench::BenchResult> = Vec::new();
+
+    let run_prefill = matches!(mode, "all" | "prefill");
+    let run_decode  = matches!(mode, "all" | "decode");
+    let run_conc    = matches!(mode, "all" | "concurrency");
+    let run_cache   = matches!(mode, "all" | "cache-format");
+
+    if run_prefill {
+        eprintln!("  [1/4] Prefill benchmark...");
+        results.push(bench::run_prefill_bench(&model, prompt_len, warmup, iters));
+    }
+    if run_decode {
+        eprintln!("  [2/4] Decode benchmark...");
+        results.push(bench::run_decode_bench(&model, prompt_len, decode_tokens, warmup, iters));
+    }
+    if run_conc {
+        eprintln!("  [3/4] Concurrency benchmark (1..={max_concurrent} sessions)...");
+        let levels: Vec<usize> = (0..)
+            .map(|i| 1usize << i)
+            .take_while(|&n| n <= max_concurrent)
+            .collect();
+        for n in levels {
+            eprint!("    n={n}... ");
+            results.push(bench::run_concurrency_bench(&model, n, prompt_len, decode_tokens, warmup, iters));
+            eprintln!("done");
+        }
+    }
+    if run_cache {
+        eprintln!("  [4/4] Cache-format benchmark (f32 vs q8)...");
+        results.extend(bench::run_cache_format_bench(&model, prompt_len, decode_tokens, warmup, iters));
+    }
+
+    eprintln!();
+    bench::print_results(&results);
+
+    if let Some(out_path) = output {
+        let json = bench::results_to_json(&results);
+        match std::fs::write(out_path, &json) {
+            Ok(()) => eprintln!("\nResults written to: {}", out_path.display()),
+            Err(e) => eprintln!("Warning: could not write output file: {e}"),
+        }
+    }
 }
 
 fn format_number(n: u64) -> String {

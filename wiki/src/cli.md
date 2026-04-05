@@ -134,7 +134,7 @@ glint serve -f <MODEL> [OPTIONS]
 
 The model name is derived from the file stem (e.g. `smollm-135m-instruct.Q8_0` → `smollm-135m-instruct.Q8_0`). Use this name in API requests.
 
-Runs a background inference engine with a request queue. Supports concurrent requests via the continuous-batching engine.
+Runs a background inference engine with a request queue. Active requests are interleaved one decode step at a time, which improves concurrent serving without yet doing a shared batched forward pass.
 
 **Example:**
 ```bash
@@ -142,6 +142,29 @@ glint serve -f llama-3-8b-q4_k.gguf -p 8080 --host 0.0.0.0
 ```
 
 See [HTTP Server API](./server-api.md) for endpoint documentation.
+
+---
+
+## `bench`
+
+Run Glint's end-to-end inference benchmarks.
+
+```bash
+glint bench -f <MODEL> [OPTIONS]
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-f, --file <PATH>` | required | Model file |
+| `--mode <NAME>` | `all` | `all`, `prefill`, `decode`, `concurrency`, or `cache-format` |
+| `--prompt-len <N>` | `512` | Prompt tokens used for all benchmarks |
+| `--decode-tokens <N>` | `128` | New tokens decoded in decode/concurrency benchmarks |
+| `--max-concurrent <N>` | `8` | Maximum concurrent sessions in the concurrency benchmark |
+| `--warmup <N>` | `3` | Warm-up rounds |
+| `--iters <N>` | `10` | Timed measurement rounds |
+| `--output <PATH>` | — | Write JSON results to a file |
+
+Use this when you want end-to-end numbers for prompt prefill, decode throughput, concurrency, or f32-vs-Q8 KV cache tradeoffs. For matvec micro-benchmarks, use `cargo bench --bench matvec`.
 
 ---
 

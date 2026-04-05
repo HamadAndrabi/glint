@@ -12,6 +12,22 @@
 //!   - **Zephyr**:    `<|role|>\ncontent</s>`
 //!   - **Gemma**:     `<start_of_turn>role\ncontent<end_of_turn>`
 //!   - **Generic**:   `role: content\n` (fallback for unrecognized templates)
+//!
+//! ## Jinja pre-processing
+//!
+//! Before detection, raw templates are normalized by [`jinja_preprocess`]:
+//! - `{%-` / `-%}` whitespace-control strips are collapsed to `{%` / `%}`.
+//! - `{% set <var> = namespace(...) %}` lines (Qwen2-style state tracking) are
+//!   removed — they have no effect on format detection.
+//! - Bare `{% if loop.first %}` / `{% if loop.last %}` guard lines are stripped
+//!   while keeping their body, so that format markers inside those blocks remain
+//!   visible to the `contains`-based detector.
+//!
+//! ## Full Jinja evaluation (`full-jinja` feature)
+//!
+//! The `full-jinja` feature is a reserved slot for a future `minijinja`
+//! integration.  It currently compiles to a stub that returns an error, which
+//! establishes the API surface without pulling in any new dependencies.
 
 /// A detected chat template format.
 ///
@@ -42,18 +58,23 @@ pub struct Message<'a> {
 impl ChatTemplate {
     /// Detect the template format from a raw Jinja template string.
     ///
-    /// Matches on distinctive marker tokens that uniquely identify each format.
-    /// Falls back to `Generic` if no known pattern is found.
+    /// The template is first passed through [`jinja_preprocess`] to strip
+    /// whitespace-control markers, `namespace()` state lines, and bare
+    /// `loop.first` / `loop.last` guard lines.  Detection then matches on
+    /// distinctive format tokens.  Falls back to `Generic` if no known
+    /// pattern is found.
     pub fn detect(template: &str) -> Self {
-        if template.contains("<|im_start|>") {
+        let normalized = jinja_preprocess(template);
+        let t = normalized.as_str();
+        if t.contains("<|im_start|>") {
             ChatTemplate::ChatML
-        } else if template.contains("<|start_header_id|>") {
+        } else if t.contains("<|start_header_id|>") {
             ChatTemplate::Llama3
-        } else if template.contains("[INST]") {
+        } else if t.contains("[INST]") {
             ChatTemplate::MistralInstruct
-        } else if template.contains("<start_of_turn>") {
+        } else if t.contains("<start_of_turn>") {
             ChatTemplate::Gemma
-        } else if template.contains("<|system|>") || template.contains("<|user|>") {
+        } else if t.contains("<|system|>") || t.contains("<|user|>") {
             ChatTemplate::Zephyr
         } else {
             ChatTemplate::Generic
@@ -87,6 +108,102 @@ impl ChatTemplate {
             ChatTemplate::Generic => "generic",
         }
     }
+}
+
+// ── Jinja pre-processor ─────────────────────────────────────────────────────
+
+/// Normalize a raw GGUF Jinja template so that format detection is reliable
+/// even for templates that use common Jinja idioms.
+///
+/// Three classes of noise are removed:
+///
+/// 1. **Whitespace-control strips** — `{%-` → `{%`, `-%}` → `%}`, and the
+///    equivalent for expression blocks `{{-` / `-}}`.  These appear in
+///    virtually every published template and are irrelevant to detection.
+///
+/// 2. **`namespace()` state lines** (Qwen2, DeepSeek, similar) —
+///    `{%- set ns = namespace(found=false) -%}` and mutations like
+///    `{%- set ns.found = true -%}`.  These drive Jinja control-flow but have
+///    no bearing on which format markers (`<|im_start|>` etc.) are present.
+///
+/// 3. **Bare `loop.first` / `loop.last` guard lines** — `{% if loop.first %}`,
+///    `{% if not loop.last %}`, and the matching `{% endif %}` markers that
+///    appear *alone on a line*.  Stripping them keeps the enclosed format
+///    markers (e.g. a BOS token) visible to the `contains`-based detector.
+///    Only guard lines that are the sole non-whitespace content on their line
+///    are removed; multi-statement lines are left unchanged.
+///
+/// The returned string is used **only for detection** — rendering still uses
+/// the hardcoded format-specific renderers which do not execute Jinja.
+pub fn jinja_preprocess(template: &str) -> String {
+    // Step 1 — collapse whitespace-control markers.
+    let s = template
+        .replace("{%-", "{%")
+        .replace("-%}", "%}")
+        .replace("{{-", "{{")
+        .replace("-}}", "}}");
+
+    let mut out = String::with_capacity(s.len());
+
+    for line in s.lines() {
+        let trimmed = line.trim();
+
+        // Step 2 — strip namespace setup / mutation lines.
+        // Matches: {% set <ident> = namespace(...) %} and {% set ns.<field> = ... %}
+        if trimmed.starts_with("{%")
+            && trimmed.ends_with("%}")
+            && (trimmed.contains("namespace(") || trimmed.contains("set ns."))
+        {
+            continue;
+        }
+
+        // Step 3 — strip bare loop.first / loop.last guard lines.
+        // Only remove lines whose entire non-whitespace content is one of these
+        // known guard tags so we don't accidentally discard multi-statement lines.
+        if matches!(
+            trimmed,
+            "{% if loop.first %}"
+                | "{% if not loop.first %}"
+                | "{% if loop.last %}"
+                | "{% if not loop.last %}"
+                | "{% if loop.first and messages[0]['role'] != 'system' %}"
+                | "{% if loop.first and messages[0].role != 'system' %}"
+                | "{% endif %}"
+        ) {
+            continue;
+        }
+
+        out.push_str(line);
+        out.push('\n');
+    }
+
+    out
+}
+
+// ── Full-Jinja stub (feature = "full-jinja") ────────────────────────────────
+
+/// Evaluate a raw Jinja2 template against a list of messages.
+///
+/// **This function is not yet implemented.**  It is a reserved slot for a
+/// future `minijinja`-backed renderer.  Callers that opt in to the
+/// `full-jinja` feature at compile time will receive this error until the
+/// implementation is added.
+///
+/// # Errors
+///
+/// Always returns `Err` with an explanation.  To produce a prompt today,
+/// use [`ChatTemplate::detect`] + [`ChatTemplate::apply`].
+#[cfg(feature = "full-jinja")]
+pub fn apply_full_jinja(
+    _template: &str,
+    _messages: &[Message<'_>],
+) -> Result<String, String> {
+    Err(
+        "full-jinja: minijinja integration is not yet implemented. \
+         Use ChatTemplate::detect + ChatTemplate::apply for format-matched rendering, \
+         or remove the full-jinja feature flag."
+            .to_string(),
+    )
 }
 
 // ── Format implementations ──────────────────────────────────────────────────
@@ -351,5 +468,90 @@ mod tests {
         let msgs = sample_messages();
         let result = ChatTemplate::Generic.apply(&msgs);
         assert_eq!(result, "system: You are helpful.\nuser: Hi!\nassistant:");
+    }
+
+    // ── Jinja pre-processor tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_preprocess_strips_whitespace_control() {
+        let tpl = "{%- for message in messages -%}\n{{- message['content'] -}}\n{%- endfor -%}";
+        let out = jinja_preprocess(tpl);
+        assert!(!out.contains("{%-"), "leading strip not removed");
+        assert!(!out.contains("-%}"), "trailing strip not removed");
+        assert!(!out.contains("{{-"), "expression leading strip not removed");
+        assert!(!out.contains("-}}"), "expression trailing strip not removed");
+        // Core content preserved
+        assert!(out.contains("for message in messages"));
+        assert!(out.contains("message['content']"));
+    }
+
+    #[test]
+    fn test_preprocess_strips_namespace_lines() {
+        let tpl = "{% set ns = namespace(found=false) %}\n\
+                   {% for message in messages %}\n\
+                   {% if message.role == 'system' %}{% set ns.found = true %}{% endif %}\n\
+                   <|im_start|>{{ message.role }}\n\
+                   {{ message.content }}<|im_end|>\n\
+                   {% endfor %}";
+        let out = jinja_preprocess(tpl);
+        assert!(!out.contains("namespace("), "namespace setup line not removed");
+        // Format marker and loop body must survive
+        assert!(out.contains("<|im_start|>"));
+        assert!(out.contains("message.content"));
+    }
+
+    #[test]
+    fn test_preprocess_strips_loop_first_guards() {
+        let tpl = "{% for message in messages %}\n\
+                   {% if loop.first %}\n\
+                   <|start_header_id|>system<|end_header_id|>\n\
+                   {% endif %}\n\
+                   <|start_header_id|>{{ message.role }}<|end_header_id|>\n\
+                   {{ message.content }}<|eot_id|>\n\
+                   {% endfor %}";
+        let out = jinja_preprocess(tpl);
+        // Guard lines removed
+        assert!(!out.contains("{% if loop.first %}"));
+        assert!(!out.contains("{% endif %}"));
+        // Body content (format markers) preserved
+        assert!(out.contains("<|start_header_id|>system<|end_header_id|>"));
+        assert!(out.contains("<|start_header_id|>"));
+        assert!(out.contains("<|eot_id|>"));
+    }
+
+    #[test]
+    fn test_detect_chatml_with_namespace_noise() {
+        // Qwen2-style template: namespace + whitespace-control + ChatML markers
+        let tpl = "{%- set ns = namespace(found=false) -%}\n\
+                   {%- for message in messages -%}\n\
+                   {%- if message.role == 'system' -%}{%- set ns.found = true -%}{%- endif -%}\n\
+                   <|im_start|>{{ message.role }}\n\
+                   {{ message.content }}<|im_end|>\n\
+                   {%- endfor -%}\n\
+                   <|im_start|>assistant\n";
+        assert_eq!(ChatTemplate::detect(tpl), ChatTemplate::ChatML);
+    }
+
+    #[test]
+    fn test_detect_llama3_with_loop_first_guard() {
+        // Templates that add a system header only on loop.first
+        let tpl = "{%- for message in messages -%}\n\
+                   {%- if loop.first -%}\n\
+                   <|start_header_id|>system<|end_header_id|>\n\n\
+                   You are a helpful assistant.<|eot_id|>\n\
+                   {%- endif -%}\n\
+                   <|start_header_id|>{{ message.role }}<|end_header_id|>\n\n\
+                   {{ message.content }}<|eot_id|>\n\
+                   {%- endfor -%}\n\
+                   <|start_header_id|>assistant<|end_header_id|>\n\n";
+        assert_eq!(ChatTemplate::detect(tpl), ChatTemplate::Llama3);
+    }
+
+    #[cfg(feature = "full-jinja")]
+    #[test]
+    fn test_full_jinja_stub_returns_error() {
+        let result = apply_full_jinja("{{ message }}", &[]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("not yet implemented"));
     }
 }

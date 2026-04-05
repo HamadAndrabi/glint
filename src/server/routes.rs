@@ -10,7 +10,7 @@
 //! directly to axum's SSE response.
 
 use std::convert::Infallible;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -23,9 +23,10 @@ use axum::Json;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 
+use crate::constrained::ConstraintSpec;
 use crate::model::chat_template::Message;
 use crate::sampling::SamplerConfig;
-use crate::transformer::embed;
+use crate::transformer::embed_batch;
 
 use super::state::AppState;
 use super::types::*;
@@ -104,6 +105,8 @@ struct PreparedGeneration {
     sampler_cfg: SamplerConfig,
     eos: u32,
     model_name: String,
+    /// Optional structured-output constraint.
+    constraint: Option<ConstraintSpec>,
 }
 
 struct StartedGeneration {
@@ -154,6 +157,7 @@ fn prepare_generation_from_prompt(
         sampler_cfg,
         eos: state.tokenizer.eos_token_id,
         model_name: state.model_name.clone(),
+        constraint: None,
     })
 }
 
@@ -230,17 +234,21 @@ fn start_generation(
         sampler_cfg,
         eos,
         model_name,
+        constraint,
     } = prepared;
 
     let rx = state
         .engine
-        .submit(prompt_tokens, max_tokens, sampler_cfg, eos)
+        .submit(prompt_tokens, max_tokens, sampler_cfg, eos, constraint, None)
         .ok_or_else(|| {
+            state.metrics.record_failure();
             api_error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "Inference engine unavailable",
             )
         })?;
+
+    state.metrics.on_submit();
 
     Ok(StartedGeneration {
         rx,
@@ -256,7 +264,13 @@ async fn collect_generation(
     let t0 = Instant::now();
     let mut stream = ReceiverStream::new(rx);
     let mut generated_ids: Vec<u32> = Vec::new();
+    let mut ttft_recorded = false;
     while let Some(token_id) = stream.next().await {
+        if !ttft_recorded {
+            state.metrics.record_ttft_us(t0.elapsed().as_micros() as u64);
+            state.metrics.on_first_token();
+            ttft_recorded = true;
+        }
         generated_ids.push(token_id);
     }
 
@@ -264,6 +278,7 @@ async fn collect_generation(
     let text = state.tokenizer.decode(&generated_ids);
     let completion_tokens = generated_ids.len();
     state.metrics.record(completion_tokens as u64, elapsed_ms);
+    state.metrics.on_complete();
 
     CompletedGeneration {
         text,
@@ -318,24 +333,30 @@ pub async fn health() -> impl IntoResponse {
 
 // ── GET /v1/metrics ──────────────────────────────────────────────────────────
 
-/// Runtime metrics — requests, token throughput, average latency, uptime.
+/// Runtime metrics — requests, token throughput, latency, and concurrency.
 pub async fn server_metrics(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let requests = state.metrics.requests_total.load(Ordering::Relaxed);
-    let tokens = state.metrics.tokens_generated.load(Ordering::Relaxed);
-    let total_ms = state.metrics.total_latency_ms.load(Ordering::Relaxed);
-    let uptime_secs = state.metrics.started_at.elapsed().as_secs();
-
-    let avg_latency_ms = if requests > 0 {
-        total_ms as f64 / requests as f64
-    } else {
-        0.0
-    };
+    let m = &state.metrics;
+    let requests        = m.requests_total.load(Ordering::Relaxed);
+    let tokens          = m.tokens_generated.load(Ordering::Relaxed);
+    let failed          = m.requests_failed.load(Ordering::Relaxed);
+    let active          = m.active_sessions.load(Ordering::Relaxed);
+    let queued          = m.queue_depth.load(Ordering::Relaxed);
+    let uptime_secs     = m.started_at.elapsed().as_secs();
 
     Json(serde_json::json!({
-        "requests_total":  requests,
-        "tokens_generated": tokens,
-        "avg_latency_ms":  avg_latency_ms,
-        "uptime_secs":     uptime_secs,
+        // Throughput
+        "requests_total":          requests,
+        "requests_failed":         failed,
+        "tokens_generated":        tokens,
+        // Latency averages (0.0 until at least one request completes)
+        "avg_latency_ms":          m.avg_latency_ms(),
+        "avg_ttft_ms":             m.avg_ttft_ms(),
+        "avg_decode_ms":           m.avg_decode_ms(),
+        // Live concurrency
+        "active_sessions":         active,
+        "queue_depth":             queued,
+        // Uptime
+        "uptime_secs":             uptime_secs,
     }))
 }
 
@@ -361,7 +382,7 @@ pub async fn completions(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CompletionRequest>,
 ) -> Response {
-    let prepared = match prepare_generation_from_prompt(
+    let mut prepared = match prepare_generation_from_prompt(
         &state,
         &req.model,
         &req.prompt,
@@ -375,6 +396,10 @@ pub async fn completions(
         Ok(prepared) => prepared,
         Err(err) => return err,
     };
+
+    if req.response_format.as_ref().map_or(false, |f| f.is_json_object()) {
+        prepared.constraint = Some(ConstraintSpec::JsonObject);
+    }
 
     if req.stream.unwrap_or(false) {
         streaming_completion(state, prepared).await
@@ -419,6 +444,7 @@ async fn streaming_completion(state: Arc<AppState>, prepared: PreparedGeneration
     let tokenizer = Arc::clone(&state.tokenizer);
     let token_count = Arc::new(AtomicU64::new(0));
     let t0 = Instant::now();
+    let ttft_instant = t0.clone();
     let id = gen_id();
     let created = now_secs();
 
@@ -428,7 +454,14 @@ async fn streaming_completion(state: Arc<AppState>, prepared: PreparedGeneration
     let finish_model = started.model_name.clone();
 
     let tc = Arc::clone(&token_count);
+    let ttft_sent = Arc::new(AtomicBool::new(false));
+    let ttft_sent_clone = Arc::clone(&ttft_sent);
+    let state_for_stream = Arc::clone(&state);
     let stream = ReceiverStream::new(started.rx).map(move |token_id| {
+        if !ttft_sent_clone.swap(true, Ordering::Relaxed) {
+            state_for_stream.metrics.record_ttft_us(ttft_instant.elapsed().as_micros() as u64);
+            state_for_stream.metrics.on_first_token();
+        }
         tc.fetch_add(1, Ordering::Relaxed);
         let text = tokenizer.decode(&[token_id]);
         let chunk = CompletionChunk {
@@ -467,6 +500,7 @@ async fn streaming_completion(state: Arc<AppState>, prepared: PreparedGeneration
             state
                 .metrics
                 .record(tc.load(Ordering::Relaxed), t0.elapsed().as_millis() as u64);
+            state.metrics.on_complete();
             Ok::<Event, Infallible>(Event::default().data("[DONE]"))
         }
     });
@@ -487,6 +521,7 @@ async fn streaming_chat_completion(state: Arc<AppState>, prepared: PreparedGener
     let tokenizer = Arc::clone(&state.tokenizer);
     let token_count = Arc::new(AtomicU64::new(0));
     let t0 = Instant::now();
+    let ttft_instant = t0.clone();
     let id = gen_id();
     let created = now_secs();
 
@@ -515,7 +550,14 @@ async fn streaming_chat_completion(state: Arc<AppState>, prepared: PreparedGener
 
     // Content chunks: one per token
     let tc = Arc::clone(&token_count);
+    let ttft_sent = Arc::new(AtomicBool::new(false));
+    let ttft_sent_clone = Arc::clone(&ttft_sent);
+    let state_for_stream = Arc::clone(&state);
     let content_stream = ReceiverStream::new(started.rx).map(move |token_id| {
+        if !ttft_sent_clone.swap(true, Ordering::Relaxed) {
+            state_for_stream.metrics.record_ttft_us(ttft_instant.elapsed().as_micros() as u64);
+            state_for_stream.metrics.on_first_token();
+        }
         tc.fetch_add(1, Ordering::Relaxed);
         let text = tokenizer.decode(&[token_id]);
         let chunk = ChatChunk {
@@ -560,6 +602,7 @@ async fn streaming_chat_completion(state: Arc<AppState>, prepared: PreparedGener
             state
                 .metrics
                 .record(tc.load(Ordering::Relaxed), t0.elapsed().as_millis() as u64);
+            state.metrics.on_complete();
             Ok::<Event, Infallible>(Event::default().data("[DONE]"))
         }
     });
@@ -578,7 +621,7 @@ pub async fn chat_completions(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Response {
-    let prepared = match prepare_chat_generation(
+    let mut prepared = match prepare_chat_generation(
         &state,
         &req.model,
         &req.messages,
@@ -592,6 +635,10 @@ pub async fn chat_completions(
         Ok(prepared) => prepared,
         Err(err) => return err,
     };
+
+    if req.response_format.as_ref().map_or(false, |f| f.is_json_object()) {
+        prepared.constraint = Some(ConstraintSpec::JsonObject);
+    }
 
     if req.stream.unwrap_or(false) {
         streaming_chat_completion(state, prepared).await
@@ -708,10 +755,18 @@ async fn streaming_response(state: Arc<AppState>, prepared: PreparedGeneration) 
             .data(created_data.to_string()),
     ));
 
+    let ttft_instant = t0.clone();
     let tc = Arc::clone(&token_count);
     let text_buf = Arc::clone(&full_text);
     let delta_response_id = response_id.clone();
+    let ttft_sent = Arc::new(AtomicBool::new(false));
+    let ttft_sent_clone = Arc::clone(&ttft_sent);
+    let state_for_stream = Arc::clone(&state);
     let delta_stream = ReceiverStream::new(started.rx).map(move |token_id| {
+        if !ttft_sent_clone.swap(true, Ordering::Relaxed) {
+            state_for_stream.metrics.record_ttft_us(ttft_instant.elapsed().as_micros() as u64);
+            state_for_stream.metrics.on_first_token();
+        }
         tc.fetch_add(1, Ordering::Relaxed);
         let text = tokenizer.decode(&[token_id]);
         if let Ok(mut buf) = text_buf.lock() {
@@ -758,6 +813,7 @@ async fn streaming_response(state: Arc<AppState>, prepared: PreparedGeneration) 
             state
                 .metrics
                 .record(output_tokens as u64, t0.elapsed().as_millis() as u64);
+            state.metrics.on_complete();
             let response = build_responses_response(
                 completed_response_id.clone(),
                 message_id.clone(),
@@ -795,37 +851,49 @@ pub async fn embeddings(
         return e;
     }
 
-    if req.input.is_empty() {
+    let input_texts = req.input.as_strings();
+    if input_texts.is_empty() {
         return api_error(StatusCode::BAD_REQUEST, "input must not be empty");
     }
 
-    // Tokenize (include BOS so the forward pass mirrors normal inference)
-    let mut tokens = state.tokenizer.encode(&req.input);
-    tokens.insert(0, state.tokenizer.bos_token_id);
-    let n_tokens = tokens.len();
+    // Tokenize each input, prepending BOS to mirror normal inference.
+    let all_tokens: Vec<Vec<u32>> = input_texts.iter().map(|text| {
+        let mut tokens = state.tokenizer.encode(text);
+        tokens.insert(0, state.tokenizer.bos_token_id);
+        tokens
+    }).collect();
+
+    let total_tokens: usize = all_tokens.iter().map(|t| t.len()).sum();
     let model_name = state.model_name.clone();
 
     let weights = Arc::clone(&state.weights);
-    let config = Arc::clone(&state.config);
+    let config  = Arc::clone(&state.config);
 
-    let result = tokio::task::spawn_blocking(move || embed(&weights, &config, &tokens)).await;
+    let result = tokio::task::spawn_blocking(move || {
+        let refs: Vec<&[u32]> = all_tokens.iter().map(Vec::as_slice).collect();
+        embed_batch(&weights, &config, &refs)
+    }).await;
 
     match result {
         Err(_) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "Embedding task panicked"),
-        Ok(vector) => Json(EmbeddingResponse {
-            object: "list",
-            data: vec![EmbeddingData {
-                object: "embedding",
-                embedding: vector,
-                index: 0,
-            }],
-            model: model_name,
-            usage: UsageInfo {
-                prompt_tokens: n_tokens,
-                completion_tokens: 0,
-                total_tokens: n_tokens,
-            },
-        })
-        .into_response(),
+        Ok(vectors) => {
+            let data: Vec<EmbeddingData> = vectors.into_iter().enumerate()
+                .map(|(i, embedding)| EmbeddingData {
+                    object: "embedding",
+                    embedding,
+                    index: i,
+                })
+                .collect();
+            Json(EmbeddingResponse {
+                object: "list",
+                data,
+                model: model_name,
+                usage: UsageInfo {
+                    prompt_tokens: total_tokens,
+                    completion_tokens: 0,
+                    total_tokens,
+                },
+            }).into_response()
+        }
     }
 }

@@ -200,6 +200,14 @@ impl Tokenizer {
         // Convert GPT-2 unicode chars back to bytes
         piece.chars().map(gpt2_char_to_byte).collect()
     }
+
+    /// Minimal tokenizer for unit tests — no merge rules, identity vocab.
+    #[cfg(test)]
+    pub(crate) fn bare_for_test(vocab_size: usize, bos_token_id: u32, eos_token_id: u32) -> Self {
+        let vocab: Vec<String> = (0..vocab_size).map(|i| format!("tok{}", i)).collect();
+        let token_to_id = vocab.iter().enumerate().map(|(i, s)| (s.clone(), i as u32)).collect();
+        Self { vocab, token_to_id, merges: Vec::new(), bos_token_id, eos_token_id }
+    }
 }
 
 /// GPT-2 BPE byte-to-unicode mapping.

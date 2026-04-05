@@ -11,15 +11,15 @@
 //! print(llm.model_info())
 //! ```
 
+use std::path::Path;
+
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
-use crate::model::config::ModelConfig;
-use crate::model::gguf::GgufModel;
-use crate::model::tokenizer::Tokenizer;
-use crate::sampling::{Sampler, SamplerConfig};
-use crate::transformer::{generate_cached, TransformerWeights};
+use crate::api::{GenerationOptions, Model};
+use crate::sampling::SamplerConfig;
+use crate::session::CacheFormat;
 
 /// A loaded Glint LLM, ready to generate text.
 ///
@@ -27,9 +27,7 @@ use crate::transformer::{generate_cached, TransformerWeights};
 /// generation is synchronous (runs on the calling thread).
 #[pyclass]
 pub struct GlintLLM {
-    weights: TransformerWeights,
-    config: ModelConfig,
-    tokenizer: Tokenizer,
+    model: Model,
 }
 
 #[pymethods]
@@ -40,24 +38,9 @@ impl GlintLLM {
     /// incomplete.
     #[new]
     fn new(model_path: &str) -> PyResult<Self> {
-        let model =
-            GgufModel::load(model_path).map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-        let config = ModelConfig::from_metadata(&model.metadata)
-            .ok_or_else(|| PyValueError::new_err("Failed to parse model config from metadata"))?;
-
-        let tokenizer =
-            Tokenizer::from_gguf(&model).map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-        // Load weights — copies data out of the mmap so the model handle can drop.
-        let weights = TransformerWeights::load(&model, &config)
+        let model = Model::load(Path::new(model_path))
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-        Ok(Self {
-            weights,
-            config,
-            tokenizer,
-        })
+        Ok(Self { model })
     }
 
     /// Generate text continuing `prompt`.
@@ -92,45 +75,41 @@ impl GlintLLM {
         repeat_penalty: f32,
         seed: Option<u64>,
     ) -> PyResult<String> {
-        let prompt_tokens = self.tokenizer.encode(prompt);
-        let eos = self.tokenizer.eos_token_id;
+        let opts = GenerationOptions {
+            max_new_tokens: max_tokens,
+            sampler_cfg: SamplerConfig {
+                temperature,
+                top_k,
+                top_p,
+                repeat_penalty,
+                seed,
+                ..Default::default()
+            },
+            cache_format: CacheFormat::F32,
+            constraint: None,
+            lora_adapter: None,
+        };
 
-        let mut sampler = Sampler::new(SamplerConfig {
-            temperature,
-            top_k,
-            top_p,
-            repeat_penalty,
-            seed,
-            ..Default::default()
-        });
+        let new_tokens = self.model
+            .generate(prompt, &opts, &mut None)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
 
-        let all_tokens = generate_cached(
-            &self.weights,
-            &self.config,
-            &prompt_tokens,
-            max_tokens,
-            &mut sampler,
-            eos,
-            &mut None,
-        );
-
-        // Return only newly generated tokens (skip the prompt)
-        let new_tokens = &all_tokens[prompt_tokens.len()..];
-        Ok(self.tokenizer.decode(new_tokens))
+        Ok(self.model.decode(&new_tokens))
     }
 
     /// Return a dict of model hyperparameters.
     fn model_info<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let config = &self.model.config;
         let d = PyDict::new_bound(py);
-        d.set_item("architecture", &self.config.architecture)?;
-        d.set_item("context_length", self.config.context_length)?;
-        d.set_item("embedding_length", self.config.embedding_length)?;
-        d.set_item("block_count", self.config.block_count)?;
-        d.set_item("head_count", self.config.head_count)?;
-        d.set_item("head_count_kv", self.config.head_count_kv)?;
-        d.set_item("vocab_size", self.config.vocab_size)?;
-        d.set_item("head_dim", self.config.head_dim())?;
-        if let Some(w) = self.config.sliding_window {
+        d.set_item("architecture", &config.architecture)?;
+        d.set_item("context_length", config.context_length)?;
+        d.set_item("embedding_length", config.embedding_length)?;
+        d.set_item("block_count", config.block_count)?;
+        d.set_item("head_count", config.head_count)?;
+        d.set_item("head_count_kv", config.head_count_kv)?;
+        d.set_item("vocab_size", config.vocab_size)?;
+        d.set_item("head_dim", config.head_dim())?;
+        if let Some(w) = config.sliding_window {
             d.set_item("sliding_window", w)?;
         }
         Ok(d)

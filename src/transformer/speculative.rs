@@ -16,6 +16,7 @@
 use crate::backend::GpuBackend;
 use crate::cache::{KvCache, KvStore};
 use crate::model::config::ModelConfig;
+use crate::sampling::Xorshift64;
 use crate::tensor::{softmax, Tensor};
 use super::{TransformerWeights, forward_one, forward_prefill_all};
 
@@ -31,6 +32,7 @@ use super::{TransformerWeights, forward_one, forward_prefill_all};
 /// * `lookahead`                        — draft steps per verification round (default 4–6)
 /// * `temperature`                      — sampling temperature (0 = greedy)
 /// * `eos_token`                        — stop token ID
+/// * `seed`                             — PRNG seed for reproducibility; `None` = random
 ///
 /// # Returns
 /// All tokens including the prompt.
@@ -44,6 +46,7 @@ pub fn speculative_decode(
     lookahead: usize,
     temperature: f32,
     eos_token: u32,
+    seed: Option<u64>,
     gpu: &mut Option<&mut GpuBackend>,
 ) -> Vec<u32> {
     let lookahead = lookahead.max(1);
@@ -68,7 +71,13 @@ pub fn speculative_decode(
     forward_prefill_all(target_weights, target_config, prompt_tokens, &mut target_cache, 0, gpu);
 
     let mut tokens = prompt_tokens.to_vec();
-    let mut rng = rand_seed(42);
+    let rng_seed = seed.unwrap_or_else(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64
+    });
+    let mut rng = Xorshift64::new(rng_seed);
 
     let mut generated = 0usize;
     while generated < max_new_tokens {
@@ -81,8 +90,8 @@ pub fn speculative_decode(
 
         // 1. Draft: generate `lookahead` tokens speculatively
         let k = lookahead.min(max_new_tokens - generated);
-        let mut draft_tokens  = Vec::with_capacity(k);
-        let mut draft_logprob = Vec::with_capacity(k); // log-prob of each sampled token
+        let mut draft_tokens = Vec::with_capacity(k);
+        let mut draft_probs  = Vec::with_capacity(k); // full prob vector for each draft step
 
         let mut draft_pos = current_len;
         for _ in 0..k {
@@ -90,9 +99,8 @@ pub fn speculative_decode(
             // Draft uses temperature sampling to get probabilities
             let probs = softmax_with_temp(logits.data(), temperature);
             let sampled = sample_from_probs(&probs, &mut rng);
-            let log_p = (probs[sampled as usize] + 1e-10).ln();
             draft_tokens.push(sampled);
-            draft_logprob.push(log_p);
+            draft_probs.push(probs); // store full distribution for residual correction
             // Tentatively add to token list so the next draft step sees context
             tokens.push(sampled);
             draft_pos += 1;
@@ -122,11 +130,11 @@ pub fn speculative_decode(
 
         for i in 0..k {
             let target_probs = softmax_with_temp(target_logits[i].data(), temperature);
-            let q = (draft_logprob[i] as f64).exp() as f32; // draft prob
-            let p = target_probs[draft_tokens[i] as usize]; // target prob at draft choice
+            let q = draft_probs[i][draft_tokens[i] as usize]; // draft prob at sampled token
+            let p = target_probs[draft_tokens[i] as usize];   // target prob at draft choice
 
             let accept_prob = (p / (q + 1e-10)).min(1.0);
-            if random_f32(&mut rng) < accept_prob {
+            if rng.next_f32() < accept_prob {
                 // Accept this draft token
                 tokens.push(draft_tokens[i]);
                 generated += 1;
@@ -135,14 +143,8 @@ pub fn speculative_decode(
                     break;
                 }
             } else {
-                // Reject: sample from residual distribution p(x) - q(x)
-                let draft_probs = softmax_with_temp(
-                    // Re-derive draft probs from log-prob (approx: use uniform fallback)
-                    // For a clean implementation we re-run draft; here we approximate.
-                    target_logits[i].data(), // use target as base — safe fallback
-                    temperature,
-                );
-                let residual = residual_distribution(&target_probs, &draft_probs);
+                // Reject: sample from true residual distribution max(0, p(x) - q(x)) / Z
+                let residual = residual_distribution(&target_probs, &draft_probs[i]);
                 let correction = sample_from_probs(&residual, &mut rng);
                 tokens.push(correction);
                 generated += 1;
@@ -211,8 +213,8 @@ fn residual_distribution(p: &[f32], q: &[f32]) -> Vec<f32> {
     residual
 }
 
-fn sample_from_probs(probs: &[f32], rng: &mut u64) -> u32 {
-    let u = random_f32(rng);
+fn sample_from_probs(probs: &[f32], rng: &mut Xorshift64) -> u32 {
+    let u = rng.next_f32();
     let mut cdf = 0.0f32;
     for (i, &p) in probs.iter().enumerate() {
         cdf += p;
@@ -221,19 +223,6 @@ fn sample_from_probs(probs: &[f32], rng: &mut u64) -> u32 {
         }
     }
     (probs.len() - 1) as u32
-}
-
-/// Minimal xorshift64 PRNG — no external crate needed.
-fn rand_seed(seed: u64) -> u64 {
-    if seed == 0 { 1 } else { seed }
-}
-
-fn random_f32(state: &mut u64) -> f32 {
-    // xorshift64
-    *state ^= *state << 13;
-    *state ^= *state >> 7;
-    *state ^= *state << 17;
-    (*state as f32) / (u64::MAX as f32)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -282,22 +271,57 @@ mod tests {
     }
 
     #[test]
-    fn test_random_f32_range() {
-        let mut rng = rand_seed(12345);
-        for _ in 0..1000 {
-            let v = random_f32(&mut rng);
-            assert!((0.0..=1.0).contains(&v), "v={v} out of range");
-        }
-    }
-
-    #[test]
     fn test_sample_from_probs_deterministic() {
         // With a one-hot distribution, always picks the hot index
         let mut probs = vec![0.0f32; 5];
         probs[3] = 1.0;
-        let mut rng = rand_seed(99);
+        let mut rng = Xorshift64::new(99);
         for _ in 0..10 {
             assert_eq!(sample_from_probs(&probs, &mut rng), 3);
+        }
+    }
+
+    #[test]
+    fn test_xorshift64_f32_range() {
+        // Verify Xorshift64::next_f32 produces values in [0, 1) — the old
+        // random_f32 was broken and produced ~1e-19. This confirms the fix.
+        let mut rng = Xorshift64::new(12345);
+        for _ in 0..10_000 {
+            let v = rng.next_f32();
+            assert!(v >= 0.0 && v < 1.0, "v={v} out of [0,1)");
+        }
+    }
+
+    #[test]
+    fn test_softmax_with_temp_seeded_determinism() {
+        // sample_from_probs with the same Xorshift64 seed yields the same sequence
+        let probs = vec![0.1f32, 0.5, 0.2, 0.2];
+        let mut rng_a = Xorshift64::new(42);
+        let mut rng_b = Xorshift64::new(42);
+        for _ in 0..20 {
+            assert_eq!(
+                sample_from_probs(&probs, &mut rng_a),
+                sample_from_probs(&probs, &mut rng_b),
+            );
+        }
+    }
+
+    #[test]
+    fn test_residual_uses_draft_probs_not_target() {
+        // When q >> p for token 0, after rejection the correction token
+        // must be drawn from max(0, p - q) / Z, not from target alone.
+        // Specifically, if p[0]=0.1, q[0]=0.9 and p[1]=0.9, q[1]=0.1,
+        // then the residual has all mass on token 1 (since p[0]-q[0] < 0).
+        let p = vec![0.1f32, 0.9];
+        let q = vec![0.9f32, 0.1];
+        let r = residual_distribution(&p, &q);
+        // residual[0] = max(0, 0.1-0.9) = 0; residual[1] = 0.9-0.1 = 0.8 → normalised to 1.0
+        assert!(r[0] < 1e-6, "r[0]={}", r[0]);
+        assert!((r[1] - 1.0).abs() < 1e-5, "r[1]={}", r[1]);
+        // sample_from_probs must always yield token 1 from this residual
+        let mut rng = Xorshift64::new(7777);
+        for _ in 0..50 {
+            assert_eq!(sample_from_probs(&r, &mut rng), 1);
         }
     }
 }

@@ -18,6 +18,7 @@ use crate::tensor::{load_tensor_f32, Tensor};
 /// One low-rank adapter pair for a single projection matrix.
 ///
 /// Applies `out += scale * B @ (A @ x)` in place.
+#[derive(Debug)]
 pub struct LoraAdapter {
     /// A matrix, shape [rank, in_dim].
     pub a: Tensor,
@@ -60,7 +61,7 @@ impl LoraAdapter {
 /// All LoRA adapters for a single transformer layer.
 ///
 /// Each field is `None` when the adapter file does not target that projection.
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct LoraLayerAdapters {
     pub attn_q:      Option<LoraAdapter>,
     pub attn_k:      Option<LoraAdapter>,
@@ -72,6 +73,7 @@ pub struct LoraLayerAdapters {
 }
 
 /// All LoRA adapters loaded from a GGUF adapter file.
+#[derive(Debug)]
 pub struct LoraWeights {
     /// One entry per transformer layer (same length as `TransformerWeights::layers`).
     pub layers: Vec<LoraLayerAdapters>,

@@ -13,7 +13,7 @@ pub mod gpu;
 pub mod pipeline;
 
 #[cfg(feature = "vulkan")]
-pub use gpu::GpuBackend;
+pub use gpu::{GpuBackend, GpuKvBuffer, GpuKvCache};
 
 /// Stub type when `vulkan` feature is disabled.
 ///
@@ -21,4 +21,16 @@ pub use gpu::GpuBackend;
 /// unconditionally — it simply can never be `Some`.
 #[cfg(not(feature = "vulkan"))]
 pub struct GpuBackend;
+
+/// Stub type when `vulkan` feature is disabled.
+///
+/// Satisfies the `KvStore::gpu_buffer()` return type without pulling in wgpu.
+/// Never instantiated; the default `None` implementation means the GPU path
+/// is unconditionally skipped in non-vulkan builds.
+#[cfg(not(feature = "vulkan"))]
+pub struct GpuKvBuffer;
+
+/// Stub type when `vulkan` feature is disabled.
+#[cfg(not(feature = "vulkan"))]
+pub struct GpuKvCache;
 

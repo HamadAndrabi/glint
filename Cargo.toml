@@ -32,6 +32,17 @@ wasm = ["dep:wasm-bindgen", "dep:js-sys", "dep:console_error_panic_hook"]
 #   cargo build --release --features vulkan
 vulkan = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
 
+# Expose a C-compatible ABI (opaque handles + #[no_mangle] functions). Build with:
+#   cargo build --release --features cffi
+# A C header is generated at include/glint.h via cbindgen in build.rs.
+cffi = []
+
+# Reserved gate for full Jinja2 template evaluation via minijinja.
+# Currently a compile-time stub that returns an error — wires in the interface
+# so that adding the minijinja dependency later doesn't break the feature matrix.
+# Build with: cargo build --features full-jinja
+full-jinja = []
+
 [dependencies]
 # Memory-mapped file I/O — lets us map the GGUF file directly into virtual memory
 # instead of reading it all into the heap. The OS handles paging data in/out.

@@ -4,7 +4,7 @@ Glint can be compiled to WebAssembly and run entirely in the browser — no serv
 
 Source: `src/wasm.rs`, `demo/index.html`, `demo/worker.js`
 
-Build with: `wasm-pack build --target web --features wasm`
+Build with: `wasm-pack build --target web --no-default-features --features wasm`
 
 ---
 
@@ -15,7 +15,7 @@ Build with: `wasm-pack build --target web --features wasm`
 curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
 
 # Build the WASM module
-wasm-pack build --target web --features wasm
+wasm-pack build --target web --no-default-features --features wasm
 
 # Output: pkg/
 #   glint.js          — JS bindings

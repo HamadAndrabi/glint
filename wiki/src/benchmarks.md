@@ -1,14 +1,17 @@
 # Benchmarks
 
-Glint includes micro-benchmarks for the hot-path matvec operations, measured with `criterion`.
+Glint includes both end-to-end inference benchmarks (`glint bench`) and micro-benchmarks for the hot-path matvec operations (`criterion`).
 
-Source: `benches/matvec.rs`
+Source: `src/bench/`, `benches/matvec.rs`
 
 ---
 
 ## Running Benchmarks
 
 ```bash
+# Run the end-to-end benchmark CLI
+glint bench -f model.gguf --mode all
+
 # Run all matvec benchmarks
 cargo bench --bench matvec
 
@@ -19,7 +22,7 @@ cargo bench --bench matvec -- q4_0
 cargo bench --bench matvec -- --output-format html
 ```
 
-Results are saved to `target/criterion/`. The HTML report includes plots of the distribution and historical comparisons.
+The benchmark CLI prints human-readable summaries and can emit JSON with `--output`. Criterion results are saved to `target/criterion/`; the HTML report includes plots of the distribution and historical comparisons.
 
 ---
 
@@ -87,9 +90,12 @@ perf stat -e cache-misses,cache-references ./target/release/glint ...
 
 ## End-to-End Inference Speed
 
-The matvec benchmarks measure individual ops. For real token generation speed, use the `run` subcommand:
+The matvec benchmarks measure individual ops. For real token generation speed, prefer `glint bench`; `glint run` is still useful for quick spot checks:
 
 ```bash
+glint bench -f model.gguf --mode decode --decode-tokens 100
+
+# quick manual spot check
 glint run -f model.gguf -p "benchmark prompt" -m 100
 # (100 tokens in 8.3s — 12.0 tok/s)
 ```

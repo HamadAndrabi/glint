@@ -5,4 +5,4 @@
 
 mod sampler;
 
-pub use sampler::{Sampler, SamplerConfig};
+pub use sampler::{Sampler, SamplerConfig, Xorshift64};

@@ -21,6 +21,7 @@
 - [Tokenization](./tokenization.md)
 - [KV Cache](./kv-cache.md)
 - [Sampling](./sampling.md)
+- [Session API & Snapshots](./session-api.md)
 
 # Advanced Features
 
@@ -33,6 +34,7 @@
 - [CLI Reference](./cli.md)
 - [HTTP Server API](./server-api.md)
 - [GPU Backend (Vulkan)](./gpu-backend.md)
+- [C FFI](./c-ffi.md)
 - [Python Bindings](./python-bindings.md)
 - [Browser (WASM)](./wasm.md)
 

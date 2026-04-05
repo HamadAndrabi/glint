@@ -16,6 +16,18 @@ The model name is derived from the file stem. Use this name in API requests.
 
 ---
 
+## Output Constraints
+
+`POST /v1/completions` and `POST /v1/chat/completions` support OpenAI-style:
+
+```json
+{ "response_format": { "type": "json_object" } }
+```
+
+When present, Glint constrains decoding so the response is a valid JSON object. The `text` format is the default when `response_format` is omitted.
+
+---
+
 ## Endpoints
 
 ### `GET /health`
@@ -81,7 +93,8 @@ Text completion. Continues a prompt string.
   "top_k": 40,
   "repeat_penalty": 1.1,
   "seed": 42,
-  "stream": false
+  "stream": false,
+  "response_format": { "type": "json_object" }
 }
 ```
 
@@ -95,7 +108,7 @@ All fields except `model` and `prompt` are optional with sensible defaults.
   "created": 1712345678,
   "model": "smollm-135m-instruct.Q8_0",
   "choices": [{
-    "text": " Paris, the city of light.",
+    "text": "{\"capital\":\"Paris\"}",
     "index": 0,
     "finish_reason": "stop"
   }],
@@ -138,7 +151,8 @@ Chat completion. Accepts a list of messages and returns a response.
   ],
   "max_tokens": 100,
   "temperature": 0.5,
-  "stream": false
+  "stream": false,
+  "response_format": { "type": "json_object" }
 }
 ```
 
@@ -153,7 +167,7 @@ Chat completion. Accepts a list of messages and returns a response.
     "index": 0,
     "message": {
       "role": "assistant",
-      "content": "2 + 2 = 4."
+      "content": "{\"answer\":4}"
     },
     "finish_reason": "stop"
   }],
