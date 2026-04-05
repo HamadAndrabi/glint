@@ -21,7 +21,7 @@ pip install maturin
 maturin develop --features python
 
 # Browser WASM (requires wasm-pack)
-wasm-pack build --target web --features wasm
+wasm-pack build --target web --no-default-features --features wasm
 ```
 
 The `default` feature set includes `rayon` (parallel matmul) and `server` (HTTP API + HF Hub download). Omit `--release` for faster compilation during development.

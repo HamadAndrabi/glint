@@ -7,6 +7,31 @@
 
 use serde::{Deserialize, Serialize};
 
+// ── ResponseFormat ────────────────────────────────────────────────────────────
+
+/// OpenAI-compatible `response_format` object.
+///
+/// Supported types:
+/// * `"text"` — default, unconstrained (same as omitting the field)
+/// * `"json_object"` — constrains output to a valid JSON object
+///
+/// Example:
+/// ```json
+/// { "response_format": { "type": "json_object" } }
+/// ```
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ResponseFormat {
+    #[serde(rename = "type")]
+    pub format_type: String,
+}
+
+impl ResponseFormat {
+    /// True when this format requires JSON object output.
+    pub fn is_json_object(&self) -> bool {
+        self.format_type == "json_object"
+    }
+}
+
 // ── Requests ─────────────────────────────────────────────────────────────────
 
 /// `POST /v1/completions` request body.
@@ -28,6 +53,8 @@ pub struct CompletionRequest {
     pub seed: Option<u64>,
     /// Whether to stream token-by-token via SSE (default: false).
     pub stream: Option<bool>,
+    /// Optional output format constraint.
+    pub response_format: Option<ResponseFormat>,
 }
 
 /// One message in a chat conversation.
@@ -50,6 +77,8 @@ pub struct ChatCompletionRequest {
     pub repeat_penalty: Option<f32>,
     pub seed: Option<u64>,
     pub stream: Option<bool>,
+    /// Optional output format constraint.
+    pub response_format: Option<ResponseFormat>,
 }
 
 /// `POST /v1/responses` request body.
@@ -321,12 +350,34 @@ pub struct ModelInfo {
 
 // ── Embeddings ────────────────────────────────────────────────────────────────
 
+/// Input accepted by `POST /v1/embeddings`.
+///
+/// Matches the OpenAI API: a single string or a batch of strings.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum EmbeddingInput {
+    /// Single text string — backwards-compatible default.
+    Single(String),
+    /// Batch of text strings — embeds all inputs in one request.
+    Batch(Vec<String>),
+}
+
+impl EmbeddingInput {
+    /// Return the inputs as a slice of `&str`.
+    pub fn as_strings(&self) -> Vec<&str> {
+        match self {
+            EmbeddingInput::Single(s) => vec![s.as_str()],
+            EmbeddingInput::Batch(v)  => v.iter().map(String::as_str).collect(),
+        }
+    }
+}
+
 /// `POST /v1/embeddings` request body.
 #[derive(Debug, Deserialize)]
 pub struct EmbeddingRequest {
     pub model: String,
-    /// Text to embed. Accepts a single string (OpenAI-compatible).
-    pub input: String,
+    /// Text to embed.  Accepts a single string or a batch of strings.
+    pub input: EmbeddingInput,
 }
 
 /// `POST /v1/embeddings` response.

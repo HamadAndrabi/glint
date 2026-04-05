@@ -19,17 +19,21 @@ Point any OpenAI-compatible client at `http://localhost:8080` and it just works.
 | KV-cache (f32 and Q8_0-compressed) | ✅ |
 | Flash attention (O(N) memory, single-query decode) | ✅ |
 | OpenAI-compatible HTTP API | ✅ |
+| Structured output (`json_object`) | ✅ |
 | SSE streaming responses | ✅ |
 | Multi-turn chat with context compression | ✅ |
 | Speculative decoding (draft + target model) | ✅ |
 | LoRA adapter loading and application | ✅ |
+| Session API + KV snapshots | ✅ |
 | AVX2 + FMA SIMD kernels | ✅ |
 | Vulkan GPU backend (via wgpu) | ✅ |
 | Python bindings (PyO3 / maturin) | ✅ |
 | Browser WASM bindings (wasm-bindgen) | ✅ |
+| C FFI (`include/glint.h`) | ✅ |
 | Hugging Face Hub model pull | ✅ |
 | Embeddings endpoint | ✅ |
-| 108 passing unit tests | ✅ |
+| `glint bench` benchmarking CLI | ✅ |
+| 156 passing tests (`cargo test --lib --features cffi`) | ✅ |
 
 ---
 
@@ -41,7 +45,7 @@ Glint makes three bets:
 
 2. **Zero external ML framework.** No PyTorch, Candle, or ONNX Runtime. Every operation — matmul, attention, normalization — is implemented directly in Rust. This makes the code auditable and the binary portable.
 
-3. **Real serving semantics.** The HTTP server is not a demo wrapper. It runs a background inference engine with a proper request queue and exposes the same OpenAI wire format production systems expect.
+3. **Real serving semantics.** The HTTP server is not a demo wrapper. It runs a background inference engine with a proper request queue, interleaves decode work across active requests, and exposes the OpenAI wire format production systems expect.
 
 ---
 
@@ -82,12 +86,14 @@ See [Architecture](./architecture.md) for a deeper walkthrough.
 | [Tokenization](./tokenization.md) | BPE, GPT-2 mapping, special tokens |
 | [KV Cache](./kv-cache.md) | f32 and Q8_0 cache, KvStore trait |
 | [Sampling](./sampling.md) | Temperature, top-k/p, min-p, repetition penalty |
+| [Session API & Snapshots](./session-api.md) | `Model`/`Session`, snapshot export/import, deterministic resume |
 | [SIMD](./simd.md) | AVX2/FMA kernels, dispatch, unsafe discipline |
 | [Speculative Decoding](./speculative-decoding.md) | Draft/target protocol, speedup analysis |
 | [LoRA Adapters](./lora.md) | Adapter loading, ΔW = scale × B @ A |
 | [CLI Reference](./cli.md) | All subcommands with examples |
 | [HTTP Server API](./server-api.md) | Endpoints, request/response shapes, SSE |
 | [GPU Backend](./gpu-backend.md) | Vulkan via wgpu, WGSL shaders |
+| [C FFI](./c-ffi.md) | Opaque handles, generation, snapshots, error handling |
 | [Python Bindings](./python-bindings.md) | PyO3 class, maturin build |
 | [Browser WASM](./wasm.md) | wasm-bindgen API, Web Worker demo |
 | [Benchmarks](./benchmarks.md) | Matvec throughput, profiling tips |

@@ -9,6 +9,7 @@ use crate::model::config::ModelConfig;
 use crate::model::gguf::GgufModel;
 use crate::model::lora::LoraWeights;
 use crate::tensor::{load_tensor_f32, QuantizedTensor, Tensor};
+use crate::tensor::quantized::WeightLoadMode;
 
 /// All weights for a single transformer block (one layer).
 pub struct LayerWeights {
@@ -52,9 +53,25 @@ impl TransformerWeights {
     ///
     /// Weight matrices are loaded as `QuantizedTensor` (raw bytes kept).
     /// Norm vectors are loaded as `Tensor` (f32, tiny — ~2 KB each).
+    /// Load all weights using the default (eager) mode.
     pub fn load(model: &GgufModel, config: &ModelConfig) -> Result<Self, GlintError> {
+        Self::load_with_mode(model, config, WeightLoadMode::Eager)
+    }
+
+    /// Load all weights with explicit load mode.
+    ///
+    /// Use [`WeightLoadMode::Lazy`] to keep weight bytes in the mmap rather
+    /// than copying — halves the peak RAM used during loading.  The mmap pages
+    /// will be faulted in on first access.
+    pub fn load_with_mode(
+        model: &GgufModel,
+        config: &ModelConfig,
+        mode: WeightLoadMode,
+    ) -> Result<Self, GlintError> {
+        let load = |name: &str| QuantizedTensor::load_with_mode(model, name, mode);
+
         eprintln!("Loading token embedding...");
-        let token_embedding = QuantizedTensor::load(model, "token_embd.weight")?;
+        let token_embedding = load("token_embd.weight")?;
 
         let mut layers = Vec::with_capacity(config.block_count as usize);
         for i in 0..config.block_count as usize {
@@ -62,13 +79,13 @@ impl TransformerWeights {
             layers.push(LayerWeights {
                 attn_norm: load_tensor_f32(model, &format!("blk.{i}.attn_norm.weight"))?,
                 ffn_norm:  load_tensor_f32(model, &format!("blk.{i}.ffn_norm.weight"))?,
-                attn_q:      QuantizedTensor::load(model, &format!("blk.{i}.attn_q.weight"))?,
-                attn_k:      QuantizedTensor::load(model, &format!("blk.{i}.attn_k.weight"))?,
-                attn_v:      QuantizedTensor::load(model, &format!("blk.{i}.attn_v.weight"))?,
-                attn_output: QuantizedTensor::load(model, &format!("blk.{i}.attn_output.weight"))?,
-                ffn_gate:    QuantizedTensor::load(model, &format!("blk.{i}.ffn_gate.weight"))?,
-                ffn_up:      QuantizedTensor::load(model, &format!("blk.{i}.ffn_up.weight"))?,
-                ffn_down:    QuantizedTensor::load(model, &format!("blk.{i}.ffn_down.weight"))?,
+                attn_q:      load(&format!("blk.{i}.attn_q.weight"))?,
+                attn_k:      load(&format!("blk.{i}.attn_k.weight"))?,
+                attn_v:      load(&format!("blk.{i}.attn_v.weight"))?,
+                attn_output: load(&format!("blk.{i}.attn_output.weight"))?,
+                ffn_gate:    load(&format!("blk.{i}.ffn_gate.weight"))?,
+                ffn_up:      load(&format!("blk.{i}.ffn_up.weight"))?,
+                ffn_down:    load(&format!("blk.{i}.ffn_down.weight"))?,
             });
         }
         eprintln!("\rLoaded {}/{} layers.       ", config.block_count, config.block_count);
@@ -76,9 +93,9 @@ impl TransformerWeights {
         eprintln!("Loading output weights...");
         let output_norm = load_tensor_f32(model, "output_norm.weight")?;
 
-        // Some models tie the output projection to the token embedding
+        // Some models tie the output projection to the token embedding.
         let output = if model.get_tensor_info("output.weight").is_some() {
-            QuantizedTensor::load(model, "output.weight")?
+            load("output.weight")?
         } else {
             token_embedding.clone()
         };

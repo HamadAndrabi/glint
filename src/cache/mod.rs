@@ -6,6 +6,8 @@
 
 use half::f16;
 
+use crate::error::GlintError;
+
 // ── KvStore trait ────────────────────────────────────────────────────────────
 
 /// Abstraction over KV-cache storage formats (f32 or quantised INT8).
@@ -36,6 +38,35 @@ pub trait KvStore: Send + Sync {
 
     /// Reset to zero positions for a new sequence.
     fn clear(&mut self) { self.truncate(0); }
+
+    /// Export the K and V data for positions `0..self.len()` as raw bytes,
+    /// one `Vec<u8>` per layer.
+    ///
+    /// For `KvCache` (f32): bytes are the native-endian f32 representation.
+    /// For `KvCacheQ8`: bytes are the raw Q8_0 encoded storage.
+    fn export_raw(&self) -> (Vec<Vec<u8>>, Vec<Vec<u8>>);
+
+    /// Import previously exported raw bytes into the cache, setting `len = token_count`.
+    ///
+    /// Returns an error if a layer's byte slice length does not match the expected
+    /// size for `token_count` positions.
+    fn import_raw(
+        &mut self,
+        k_layers: &[Vec<u8>],
+        v_layers: &[Vec<u8>],
+        token_count: usize,
+    ) -> Result<(), GlintError>;
+
+    /// Return a reference to the GPU-resident K/V buffer, if this cache keeps
+    /// its data GPU-resident.
+    ///
+    /// Returns `None` for CPU caches (`KvCache`, `KvCacheQ8`).
+    /// Returns `Some` for `GpuKvCache` when the `vulkan` feature is active.
+    ///
+    /// The forward pass checks this to avoid copying the full K/V context from
+    /// CPU to GPU on every decode step — the resident path uploads only the new
+    /// token's K/V vectors (`O(head_dim)`) instead.
+    fn gpu_buffer(&self) -> Option<&crate::backend::GpuKvBuffer> { None }
 }
 
 // ── F32 KV-cache ─────────────────────────────────────────────────────────────
@@ -107,6 +138,60 @@ impl KvStore for KvCache {
     fn truncate(&mut self, new_len: usize) {
         assert!(new_len <= self.len, "truncate: {new_len} > len {}", self.len);
         self.len = new_len;
+    }
+
+    fn export_raw(&self) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+        let byte_count = self.len * self.kv_dim * std::mem::size_of::<f32>();
+        let k_out: Vec<Vec<u8>> = self.k.iter().map(|layer| {
+            // SAFETY: f32 has no invalid bit patterns; we copy valid initialised bytes.
+            let src: &[u8] = unsafe {
+                std::slice::from_raw_parts(layer.as_ptr() as *const u8, layer.len() * 4)
+            };
+            src[..byte_count].to_vec()
+        }).collect();
+        let v_out: Vec<Vec<u8>> = self.v.iter().map(|layer| {
+            let src: &[u8] = unsafe {
+                std::slice::from_raw_parts(layer.as_ptr() as *const u8, layer.len() * 4)
+            };
+            src[..byte_count].to_vec()
+        }).collect();
+        (k_out, v_out)
+    }
+
+    fn import_raw(
+        &mut self,
+        k_layers: &[Vec<u8>],
+        v_layers: &[Vec<u8>],
+        token_count: usize,
+    ) -> Result<(), GlintError> {
+        let expected_bytes = token_count * self.kv_dim * std::mem::size_of::<f32>();
+        for (l, (k_src, v_src)) in k_layers.iter().zip(v_layers.iter()).enumerate() {
+            if k_src.len() != expected_bytes {
+                return Err(GlintError::SnapshotCacheSizeMismatch {
+                    layer: l, expected: expected_bytes, found: k_src.len(),
+                });
+            }
+            if v_src.len() != expected_bytes {
+                return Err(GlintError::SnapshotCacheSizeMismatch {
+                    layer: l, expected: expected_bytes, found: v_src.len(),
+                });
+            }
+            // SAFETY: destination is properly allocated f32 storage; source byte count matches.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    k_src.as_ptr(),
+                    self.k[l].as_mut_ptr() as *mut u8,
+                    expected_bytes,
+                );
+                std::ptr::copy_nonoverlapping(
+                    v_src.as_ptr(),
+                    self.v[l].as_mut_ptr() as *mut u8,
+                    expected_bytes,
+                );
+            }
+        }
+        self.len = token_count;
+        Ok(())
     }
 }
 
@@ -215,6 +300,161 @@ impl KvStore for KvCacheQ8 {
     fn truncate(&mut self, new_len: usize) {
         assert!(new_len <= self.len, "truncate: {new_len} > len {}", self.len);
         self.len = new_len;
+    }
+
+    fn export_raw(&self) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+        let byte_count = self.len * self.bytes_per_pos;
+        let k_out: Vec<Vec<u8>> = self.k.iter().map(|l| l[..byte_count].to_vec()).collect();
+        let v_out: Vec<Vec<u8>> = self.v.iter().map(|l| l[..byte_count].to_vec()).collect();
+        (k_out, v_out)
+    }
+
+    fn import_raw(
+        &mut self,
+        k_layers: &[Vec<u8>],
+        v_layers: &[Vec<u8>],
+        token_count: usize,
+    ) -> Result<(), GlintError> {
+        let expected_bytes = token_count * self.bytes_per_pos;
+        for (l, (k_src, v_src)) in k_layers.iter().zip(v_layers.iter()).enumerate() {
+            if k_src.len() != expected_bytes {
+                return Err(GlintError::SnapshotCacheSizeMismatch {
+                    layer: l, expected: expected_bytes, found: k_src.len(),
+                });
+            }
+            if v_src.len() != expected_bytes {
+                return Err(GlintError::SnapshotCacheSizeMismatch {
+                    layer: l, expected: expected_bytes, found: v_src.len(),
+                });
+            }
+            self.k[l][..expected_bytes].copy_from_slice(k_src);
+            self.v[l][..expected_bytes].copy_from_slice(v_src);
+        }
+        self.len = token_count;
+        Ok(())
+    }
+}
+
+// ── GpuKvCache KvStore impl ──────────────────────────────────────────────────
+//
+// Only compiled when the `vulkan` feature is active.  Non-vulkan builds use
+// the stub `GpuKvCache` and never exercise this path.
+
+#[cfg(feature = "vulkan")]
+impl KvStore for crate::backend::GpuKvCache {
+    // Reads come from the CPU mirror (no GPU download needed).
+    fn read_k_head(&self, layer: usize, pos: usize, kv_h: usize, head_dim: usize, buf: &mut [f32]) {
+        debug_assert_eq!(buf.len(), head_dim);
+        let start = pos * self.kv_dim + kv_h * head_dim;
+        buf.copy_from_slice(&self.k[layer][start..start + head_dim]);
+    }
+
+    fn read_v_head(&self, layer: usize, pos: usize, kv_h: usize, head_dim: usize, buf: &mut [f32]) {
+        debug_assert_eq!(buf.len(), head_dim);
+        let start = pos * self.kv_dim + kv_h * head_dim;
+        buf.copy_from_slice(&self.v[layer][start..start + head_dim]);
+    }
+
+    /// Write K/V for one position in one layer.
+    ///
+    /// Updates the CPU mirror, then uploads only the new slice to the GPU buffer.
+    /// The upload cost is O(`kv_dim`) — constant with respect to sequence length.
+    fn write(&mut self, layer: usize, pos: usize, k_vec: &[f32], v_vec: &[f32]) {
+        assert!(pos < self.max_seq_len, "GpuKvCache overflow: pos {pos} >= {}", self.max_seq_len);
+        debug_assert_eq!(k_vec.len(), self.kv_dim);
+        debug_assert_eq!(v_vec.len(), self.kv_dim);
+
+        // Update CPU mirror.
+        let offset = pos * self.kv_dim;
+        self.k[layer][offset..offset + self.kv_dim].copy_from_slice(k_vec);
+        self.v[layer][offset..offset + self.kv_dim].copy_from_slice(v_vec);
+
+        // Upload only the new K/V slice to the GPU buffer (O(kv_dim) bytes).
+        let layer_stride = self.max_seq_len * self.kv_dim;
+        let float_offset = layer * layer_stride + pos * self.kv_dim;
+        let byte_offset = (float_offset * std::mem::size_of::<f32>()) as u64;
+        // SAFETY: f32 has no invalid bit patterns; we view initialised floats as bytes.
+        let k_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(k_vec.as_ptr() as *const u8, k_vec.len() * 4)
+        };
+        let v_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(v_vec.as_ptr() as *const u8, v_vec.len() * 4)
+        };
+        self.queue.write_buffer(&self.gpu_buf.k_buf, byte_offset, k_bytes);
+        self.queue.write_buffer(&self.gpu_buf.v_buf, byte_offset, v_bytes);
+    }
+
+    fn advance(&mut self) { self.len += 1; }
+    fn len(&self) -> usize { self.len }
+    fn truncate(&mut self, new_len: usize) {
+        assert!(new_len <= self.len, "truncate: {new_len} > len {}", self.len);
+        self.len = new_len;
+        // GPU buffer data beyond new_len is ignored; overwritten on next write.
+    }
+
+    fn export_raw(&self) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+        // Use CPU mirror — avoids GPU readback.
+        let byte_count = self.len * self.kv_dim * std::mem::size_of::<f32>();
+        let k_out: Vec<Vec<u8>> = self.k.iter().map(|layer| {
+            // SAFETY: f32 → &[u8], valid bytes.
+            let src: &[u8] = unsafe {
+                std::slice::from_raw_parts(layer.as_ptr() as *const u8, layer.len() * 4)
+            };
+            src[..byte_count].to_vec()
+        }).collect();
+        let v_out: Vec<Vec<u8>> = self.v.iter().map(|layer| {
+            let src: &[u8] = unsafe {
+                std::slice::from_raw_parts(layer.as_ptr() as *const u8, layer.len() * 4)
+            };
+            src[..byte_count].to_vec()
+        }).collect();
+        (k_out, v_out)
+    }
+
+    fn import_raw(
+        &mut self,
+        k_layers: &[Vec<u8>],
+        v_layers: &[Vec<u8>],
+        token_count: usize,
+    ) -> Result<(), GlintError> {
+        let expected_bytes = token_count * self.kv_dim * std::mem::size_of::<f32>();
+        for (l, (k_src, v_src)) in k_layers.iter().zip(v_layers.iter()).enumerate() {
+            if k_src.len() != expected_bytes {
+                return Err(GlintError::SnapshotCacheSizeMismatch {
+                    layer: l, expected: expected_bytes, found: k_src.len(),
+                });
+            }
+            if v_src.len() != expected_bytes {
+                return Err(GlintError::SnapshotCacheSizeMismatch {
+                    layer: l, expected: expected_bytes, found: v_src.len(),
+                });
+            }
+            // SAFETY: destination is properly allocated f32 storage.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    k_src.as_ptr(),
+                    self.k[l].as_mut_ptr() as *mut u8,
+                    expected_bytes,
+                );
+                std::ptr::copy_nonoverlapping(
+                    v_src.as_ptr(),
+                    self.v[l].as_mut_ptr() as *mut u8,
+                    expected_bytes,
+                );
+            }
+            // Also upload into GPU buffer (full layer slice).
+            let layer_stride_bytes =
+                (self.max_seq_len * self.kv_dim * std::mem::size_of::<f32>()) as u64;
+            let layer_byte_offset = l as u64 * layer_stride_bytes;
+            self.queue.write_buffer(&self.gpu_buf.k_buf, layer_byte_offset, &k_src[..expected_bytes]);
+            self.queue.write_buffer(&self.gpu_buf.v_buf, layer_byte_offset, &v_src[..expected_bytes]);
+        }
+        self.len = token_count;
+        Ok(())
+    }
+
+    fn gpu_buffer(&self) -> Option<&crate::backend::GpuKvBuffer> {
+        Some(&self.gpu_buf)
     }
 }
 

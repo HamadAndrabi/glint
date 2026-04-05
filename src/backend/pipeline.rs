@@ -15,6 +15,8 @@ pub enum PipelineKind {
     MatvecQ6K,
     MatvecF32,
     Attention,
+    /// Attention with GPU-resident K/V buffers (GpuKvCache path).
+    AttentionResident,
     RmsNorm,
     SiluMul,
     Rope,
@@ -89,6 +91,11 @@ impl Pipeline {
             (
                 PipelineKind::Attention,
                 include_str!("shaders/attention.wgsl"),
+                "main",
+            ),
+            (
+                PipelineKind::AttentionResident,
+                include_str!("shaders/attention_resident.wgsl"),
                 "main",
             ),
         ];

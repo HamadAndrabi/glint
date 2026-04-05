@@ -34,6 +34,19 @@ pub enum GlintError {
     /// A GPU compute shader failed to compile or execute.
     #[cfg(feature = "vulkan")]
     GpuShaderError(String),
+    // ── Snapshot errors ───────────────────────────────────────────────────────
+    /// The snapshot file does not begin with the expected magic bytes.
+    SnapshotBadMagic,
+    /// The snapshot format version is not supported by this build.
+    SnapshotVersionUnsupported { found: u32, current: u32 },
+    /// The snapshot's model hash does not match the loaded model.
+    SnapshotModelMismatch { expected: u64, found: u64 },
+    /// A metadata field in the snapshot does not match the loaded model.
+    SnapshotMetaMismatch { field: &'static str, expected: u64, found: u64 },
+    /// The snapshot data is truncated or otherwise malformed.
+    SnapshotTruncated,
+    /// The snapshot cache data cannot be imported into a cache with different dimensions.
+    SnapshotCacheSizeMismatch { layer: usize, expected: usize, found: usize },
 }
 
 impl fmt::Display for GlintError {
@@ -71,6 +84,20 @@ impl fmt::Display for GlintError {
             Self::GpuBufferError(msg) => write!(f, "GPU buffer error: {msg}"),
             #[cfg(feature = "vulkan")]
             Self::GpuShaderError(msg) => write!(f, "GPU shader error: {msg}"),
+            Self::SnapshotBadMagic => write!(f, "snapshot: invalid magic bytes (not a Glint snapshot)"),
+            Self::SnapshotVersionUnsupported { found, current } => {
+                write!(f, "snapshot version {found} is not supported (current: {current})")
+            }
+            Self::SnapshotModelMismatch { expected, found } => {
+                write!(f, "snapshot model hash mismatch: expected {expected:#018x}, found {found:#018x}")
+            }
+            Self::SnapshotMetaMismatch { field, expected, found } => {
+                write!(f, "snapshot metadata mismatch in '{field}': expected {expected}, found {found}")
+            }
+            Self::SnapshotTruncated => write!(f, "snapshot data is truncated or malformed"),
+            Self::SnapshotCacheSizeMismatch { layer, expected, found } => {
+                write!(f, "snapshot cache layer {layer}: expected {expected} bytes, found {found}")
+            }
         }
     }
 }

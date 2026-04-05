@@ -28,7 +28,8 @@ cargo bench --bench matvec
 
 # Feature-surface compile checks
 cargo build --features python
-cargo build --features wasm
+cargo build --features cffi
+cargo build --no-default-features --features wasm
 cargo build --features vulkan
 ```
 
@@ -59,8 +60,10 @@ cargo clippy
 ### Feature-gated changes
 
 ```bash
+cargo test --lib --features cffi  # if C ABI surface affected
 cargo build --features python    # if Python surface affected
-cargo build --features wasm      # if WASM surface affected
+cargo build --features cffi      # if C ABI surface affected
+cargo build --no-default-features --features wasm  # if WASM surface affected
 cargo build --features vulkan    # if GPU backend affected
 ```
 
@@ -123,6 +126,7 @@ Breaking API changes break every client that uses the server.
 If a shared type or function changes, audit all feature-gated surfaces:
 - `src/python.rs` — if `TransformerWeights`, `Tokenizer`, or `Sampler` API changes
 - `src/wasm.rs` — same
+- `src/ffi/mod.rs` and `include/glint.h` — if public runtime/session APIs change
 - `src/backend/` — if tensor types or forward pass signature changes
 
 ---

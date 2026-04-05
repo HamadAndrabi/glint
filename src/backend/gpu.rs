@@ -818,6 +818,226 @@ impl GpuBackend {
 
         Ok(result)
     }
+
+    // ── GPU-resident attention (GpuKvCache path) ──────────────────────────────
+
+    /// Attention using K/V vectors that are already GPU-resident.
+    ///
+    /// Unlike [`Self::attention`], this function does **not** upload K/V from
+    /// CPU.  Instead it binds the caller-supplied `kv_buf` storage buffers
+    /// directly.  The decode step only uploads the new token's K/V slice
+    /// (O(`head_dim`)) via [`GpuKvCache::write`], so the total per-step
+    /// CPU→GPU bandwidth is `2 * n_kv_heads * head_dim * 4` bytes regardless
+    /// of sequence length.
+    ///
+    /// # Parameters
+    ///
+    /// * `layer_idx` — which transformer layer this call is for.  Used to
+    ///   compute the byte offset into `kv_buf`.
+    /// * `window_start` — first position index in the attention window
+    ///   (non-zero when sliding-window attention is active).
+    /// * `attend_len` — number of K/V positions to attend to.
+    pub fn attention_resident(
+        &mut self,
+        q: &[f32],
+        kv_buf: &GpuKvBuffer,
+        layer_idx: usize,
+        window_start: usize,
+        attend_len: usize,
+        n_heads: u32,
+        n_kv_heads: u32,
+        head_dim: u32,
+        scale: f32,
+    ) -> Result<Vec<f32>, GlintError> {
+        const MAX_SEQ: u32 = 4096;
+        if attend_len as u32 > MAX_SEQ {
+            return Err(GlintError::GpuShaderError(format!(
+                "attention_resident: attend_len {attend_len} > MAX_SEQ {MAX_SEQ}"
+            )));
+        }
+
+        let pipeline = self
+            .pipelines
+            .get(&PipelineKind::AttentionResident)
+            .ok_or_else(|| GlintError::GpuShaderError("AttentionResident pipeline not found".into()))?;
+
+        // kv_layer_off: offset in floats to this layer's start in the K/V buffer.
+        let kv_layer_off = (layer_idx * kv_buf.max_seq_len * kv_buf.n_kv_heads * kv_buf.head_dim) as u32;
+
+        // Params: [n_heads, n_kv_heads, head_dim, seq_len (attend_len), scale_bits, kv_layer_off, window_start]
+        let params_data: [u32; 7] = [
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            attend_len as u32,
+            scale.to_bits(),
+            kv_layer_off,
+            window_start as u32,
+        ];
+        let params_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("attn-res-params"),
+            contents: bytemuck::cast_slice(&params_data),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+
+        let q_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("attn-res-q"),
+            contents: bytemuck::cast_slice(q),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+
+        let embed_dim = n_heads as usize * head_dim as usize;
+        let output_size = (embed_dim * std::mem::size_of::<f32>()) as u64;
+        let out_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("attn-res-out"),
+            size: output_size,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("attn-res-bg"),
+            layout: &pipeline.pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: params_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: q_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: kv_buf.k_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: kv_buf.v_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: out_buf.as_entire_binding() },
+            ],
+        });
+
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("attn-res-dispatch"),
+        });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("attention-resident"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&pipeline.pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(n_heads, 1, 1);
+        }
+
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("attn-res-staging"),
+            size: output_size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        encoder.copy_buffer_to_buffer(&out_buf, 0, &staging, 0, output_size);
+        self.queue.submit(std::iter::once(encoder.finish()));
+
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| { tx.send(r).ok(); });
+        self.device.poll(wgpu::Maintain::Wait);
+        rx.recv()
+            .map_err(|e| GlintError::GpuBufferError(format!("channel: {e}")))?
+            .map_err(|e| GlintError::GpuBufferError(format!("map: {e}")))?;
+
+        let data = slice.get_mapped_range();
+        let result: Vec<f32> = bytemuck::cast_slice(&data).to_vec();
+        drop(data);
+        staging.unmap();
+
+        Ok(result)
+    }
+}
+
+// ── GpuKvBuffer ───────────────────────────────────────────────────────────────
+
+/// GPU-resident K/V storage for one sequence's KV cache.
+///
+/// Layout of `k_buf` (and `v_buf` identically):
+/// ```text
+/// [ layer 0: max_seq_len * n_kv_heads * head_dim  f32s ]
+/// [ layer 1: ...                                        ]
+/// ...
+/// [ layer n_layers-1: ...                               ]
+/// ```
+///
+/// On each decode step, only the new token's K/V slice (size
+/// `n_kv_heads * head_dim`) is written to the buffer via
+/// `wgpu::Queue::write_buffer`, making the upload O(`head_dim`) instead of
+/// O(`seq_len * head_dim`).
+pub struct GpuKvBuffer {
+    pub(crate) k_buf: wgpu::Buffer,
+    pub(crate) v_buf: wgpu::Buffer,
+    pub(crate) n_layers: usize,
+    pub(crate) n_kv_heads: usize,
+    pub(crate) head_dim: usize,
+    pub(crate) max_seq_len: usize,
+}
+
+// ── GpuKvCache ────────────────────────────────────────────────────────────────
+
+/// KV cache that keeps K/V vectors GPU-resident.
+///
+/// At each decode step `write()` uploads only the **new** K/V slice
+/// (O(`n_kv_heads * head_dim`) bytes) to the GPU buffer.  The attention
+/// shader then reads K/V entirely from GPU memory without re-uploading the
+/// full context.
+///
+/// A CPU mirror is maintained for:
+/// - `read_k_head` / `read_v_head` (used when GPU attention is unavailable)
+/// - `export_raw` / `import_raw` (snapshot support)
+pub struct GpuKvCache {
+    pub(crate) device: Arc<wgpu::Device>,
+    pub(crate) queue:  Arc<wgpu::Queue>,
+    pub(crate) gpu_buf: GpuKvBuffer,
+    // CPU mirror — kept in sync with GPU on every write.
+    pub(crate) k: Vec<Vec<f32>>,
+    pub(crate) v: Vec<Vec<f32>>,
+    pub(crate) kv_dim: usize,     // n_kv_heads * head_dim
+    pub(crate) max_seq_len: usize,
+    pub(crate) len: usize,
+}
+
+impl GpuBackend {
+    /// Allocate a new [`GpuKvCache`] whose K/V buffers live on this GPU.
+    pub fn create_kv_cache(
+        &self,
+        n_layers: usize,
+        max_seq_len: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+    ) -> GpuKvCache {
+        let kv_dim = n_kv_heads * head_dim;
+        let layer_floats = max_seq_len * kv_dim;
+        let total_bytes = (n_layers * layer_floats * std::mem::size_of::<f32>()) as u64;
+
+        let make_buf = |label| {
+            self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: total_bytes,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_DST
+                    | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            })
+        };
+
+        let gpu_buf = GpuKvBuffer {
+            k_buf: make_buf("gpu-kv-k"),
+            v_buf: make_buf("gpu-kv-v"),
+            n_layers,
+            n_kv_heads,
+            head_dim,
+            max_seq_len,
+        };
+
+        let k = (0..n_layers).map(|_| vec![0.0f32; layer_floats]).collect();
+        let v = (0..n_layers).map(|_| vec![0.0f32; layer_floats]).collect();
+
+        GpuKvCache {
+            device: Arc::clone(&self.device),
+            queue:  Arc::clone(&self.queue),
+            gpu_buf,
+            k, v, kv_dim, max_seq_len, len: 0,
+        }
+    }
 }
 
 #[cfg(test)]

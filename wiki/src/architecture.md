@@ -10,8 +10,8 @@ Glint is organized as a stack of layers with clean separation between loading, c
 │        (axum + tokio, SSE streaming)                 │
 │        src/server/: mod.rs, routes.rs, engine.rs     │
 ├─────────────────────────────────────────────────────┤
-│              Scheduling & Batching                   │
-│         (request queue, continuous batching)         │
+│              Scheduling & Serving                    │
+│   (request queue, interleaved concurrent decode)    │
 │         src/server/engine.rs                         │
 ├─────────────────────────────────────────────────────┤
 │                Inference Runtime                     │
@@ -83,6 +83,10 @@ GgufModel { metadata, tensor_infos, mmap }
 | `src/tensor/dequantize.rs` | Reference dequantization for all 8 formats |
 | `src/tensor/simd.rs` | AVX2 + FMA matvec kernels (x86_64 + rayon only) |
 | `src/cache/mod.rs` | `KvCache` (f32), `KvCacheQ8` (Q8_0), `KvStore` trait |
+| `src/api/mod.rs` | Library-facing `Model` / `GenerationOptions` / `Session` workflow |
+| `src/session/mod.rs` | `Session`, `CacheFormat`, prompt/generation state |
+| `src/session/snapshot.rs` | KV snapshot serialization, validation, restore helpers |
+| `src/constrained/mod.rs` | Structured-output constraints (`json_object`, enums) |
 | `src/transformer/weights.rs` | Weight loading: GGUF tensors → `TransformerWeights` / `LayerWeights` |
 | `src/transformer/forward.rs` | Forward pass, prefill, generation loops |
 | `src/transformer/speculative.rs` | Speculative decoding: draft generates k tokens, target verifies |
@@ -91,6 +95,7 @@ GgufModel { metadata, tensor_infos, mmap }
 | `src/server/engine.rs` | Background inference engine and request queue |
 | `src/server/routes.rs` | `/health`, `/v1/models`, `/v1/metrics`, completions, chat, embeddings |
 | `src/server/types.rs` | OpenAI-compatible request/response shapes |
+| `src/ffi/mod.rs` | C ABI: opaque handles, generation, snapshots, last-error reporting |
 | `src/backend/gpu.rs` | `GpuBackend`: wgpu device, pipelines, buffer management |
 | `src/backend/pipeline.rs` | WGSL compute pipeline setup and dispatch |
 | `src/python.rs` | Optional PyO3 bindings |
@@ -108,6 +113,8 @@ GgufModel { metadata, tensor_infos, mmap }
 | `KvCache` | `cache/mod.rs` | f32 key-value cache |
 | `KvCacheQ8` | `cache/mod.rs` | Q8_0-compressed KV cache (~3.8× smaller than f32) |
 | `KvStore` | `cache/mod.rs` | Trait abstracting over cache formats |
+| `Session` | `session/mod.rs` | All mutable state for one in-flight generation |
+| `KvSnapshot` | `session/snapshot.rs` | Serialized session/cache state for deterministic resume |
 | `Sampler` | `sampling/sampler.rs` | Owns config and PRNG state for token selection |
 | `GpuBackend` | `backend/gpu.rs` | wgpu device + queue + compiled pipelines |
 | `GlintError` | `error.rs` | Project-wide error enum |
@@ -118,6 +125,7 @@ GgufModel { metadata, tensor_infos, mmap }
 |------|---------|---------|
 | `rayon` | ✅ | Parallel matmul across CPU cores; required for SIMD kernels |
 | `server` | ✅ | HTTP API (axum/tokio) + HF Hub download (reqwest) |
+| `cffi` | — | C-compatible ABI and header |
 | `python` | — | PyO3 extension module |
 | `wasm` | — | wasm-bindgen JS bindings |
 | `vulkan` | — | wgpu GPU compute backend |

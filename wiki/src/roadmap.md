@@ -12,7 +12,7 @@ All five original phases have shipped to varying degrees:
 |-------|------|--------|
 | 1 — Foundations | GGUF parsing, f32 tensors, forward pass, tokenizer | ✅ Complete |
 | 2 — CPU Optimization | KV-cache, quantized inference, AVX2 SIMD, rayon | ✅ Complete |
-| 3 — Serving Layer | HTTP API, sampling strategies, continuous batching | ✅ Complete |
+| 3 — Serving Layer | HTTP API, sampling strategies, queued concurrent serving | ✅ Complete |
 | 4 — Advanced Opts | Speculative decoding, flash attention, K-quants, LoRA | ✅ Complete |
 | 5 — GPU Backends | Vulkan via wgpu, WASM browser inference | ✅ Complete |
 
@@ -47,7 +47,7 @@ Add loading of the [SafeTensors](https://github.com/huggingface/safetensors) for
 
 ### Continuous Batching Improvements
 
-The current `InferenceEngine` processes one request at a time. True continuous batching:
+The current `InferenceEngine` already serves multiple requests concurrently, but it does so by interleaving one decode step per active request. True continuous batching would go further:
 - Multiple active sequences share a single forward pass
 - Logit computation amortizes weight loading across batch
 - New requests join mid-generation when slots free up
