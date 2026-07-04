@@ -67,12 +67,16 @@ pub fn flash_attn_1d(
         // Phase 2 — update running maximum
         let mut m_block = f32::NEG_INFINITY;
         for i in 0..block_len {
-            if scores[i] > m_block { m_block = scores[i]; }
+            if scores[i] > m_block {
+                m_block = scores[i];
+            }
         }
         let m_new = m.max(m_block);
 
         let rescale = (m - m_new).exp();
-        for d in 0..head_dim { out[d] *= rescale; }
+        for d in 0..head_dim {
+            out[d] *= rescale;
+        }
         l *= rescale;
 
         // Phase 3 — V accumulation
@@ -91,7 +95,9 @@ pub fn flash_attn_1d(
 
     if l > 0.0 {
         let inv_l = 1.0 / l;
-        for d in 0..head_dim { out[d] *= inv_l; }
+        for d in 0..head_dim {
+            out[d] *= inv_l;
+        }
     }
 }
 
@@ -142,7 +148,9 @@ mod tests {
         for s in 0..seq_len {
             let v_row = cache.v_at(layer, s);
             let v_head = &v_row[kv_h * head_dim..(kv_h + 1) * head_dim];
-            for d in 0..head_dim { out[d] += weights[s] * v_head[d]; }
+            for d in 0..head_dim {
+                out[d] += weights[s] * v_head[d];
+            }
         }
         out
     }
@@ -152,10 +160,18 @@ mod tests {
         let scale = 1.0 / (head_dim as f32).sqrt();
         let kv_dim = n_kv_heads * head_dim;
         let k_data: Vec<Vec<f32>> = (0..seq_len)
-            .map(|s| (0..kv_dim).map(|d| (s * kv_dim + d) as f32 * 0.1 - 0.5).collect())
+            .map(|s| {
+                (0..kv_dim)
+                    .map(|d| (s * kv_dim + d) as f32 * 0.1 - 0.5)
+                    .collect()
+            })
             .collect();
         let v_data: Vec<Vec<f32>> = (0..seq_len)
-            .map(|s| (0..kv_dim).map(|d| (s * kv_dim + d) as f32 * 0.07 + 0.1).collect())
+            .map(|s| {
+                (0..kv_dim)
+                    .map(|d| (s * kv_dim + d) as f32 * 0.07 + 0.1)
+                    .collect()
+            })
             .collect();
         let q: Vec<f32> = (0..head_dim).map(|d| d as f32 * 0.05 - 0.1).collect();
         let cache = build_cache(seq_len, head_dim, n_kv_heads, &k_data, &v_data);
@@ -164,19 +180,32 @@ mod tests {
         flash_attn_1d(&q, &cache, 0, kv_h, 0, seq_len, head_dim, scale, &mut got);
         for d in 0..head_dim {
             let diff = (expected[d] - got[d]).abs();
-            assert!(diff < 1e-4, "seq_len={seq_len} dim {d}: {:.6} vs {:.6}", expected[d], got[d]);
+            assert!(
+                diff < 1e-4,
+                "seq_len={seq_len} dim {d}: {:.6} vs {:.6}",
+                expected[d],
+                got[d]
+            );
         }
     }
 
     #[test]
-    fn test_flash_vs_standard_attn_aligned() { check(64, 4, 2); }
+    fn test_flash_vs_standard_attn_aligned() {
+        check(64, 4, 2);
+    }
 
     #[test]
-    fn test_flash_vs_standard_attn_unaligned() { check(50, 4, 2); }
+    fn test_flash_vs_standard_attn_unaligned() {
+        check(50, 4, 2);
+    }
 
     #[test]
-    fn test_flash_vs_standard_attn_seq_len_1() { check(1, 4, 2); }
+    fn test_flash_vs_standard_attn_seq_len_1() {
+        check(1, 4, 2);
+    }
 
     #[test]
-    fn test_flash_vs_standard_large_head_dim() { check(35, 128, 1); }
+    fn test_flash_vs_standard_large_head_dim() {
+        check(35, 128, 1);
+    }
 }

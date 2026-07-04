@@ -47,7 +47,9 @@ impl Xorshift64 {
 
     /// Restore a PRNG from a previously saved state (e.g. from a snapshot).
     pub fn restore(state: u64) -> Self {
-        Self { state: if state == 0 { 1 } else { state } }
+        Self {
+            state: if state == 0 { 1 } else { state },
+        }
     }
 
     /// Generate the next random u64.
@@ -156,11 +158,7 @@ impl Sampler {
     /// `logits` is the raw output from the LM head — one f32 per vocab token.
     /// `past_tokens` is the sequence generated so far (for repetition penalty).
     /// `constraint` optionally masks disallowed tokens before sampling.
-    pub fn sample(
-        &mut self,
-        logits:     &[f32],
-        past_tokens: &[u32],
-    ) -> u32 {
+    pub fn sample(&mut self, logits: &[f32], past_tokens: &[u32]) -> u32 {
         self.sample_inner(logits, past_tokens, None)
     }
 
@@ -171,19 +169,14 @@ impl Sampler {
     /// temperature scaling, so the constraint dominates.
     pub fn sample_constrained(
         &mut self,
-        logits:      &[f32],
+        logits: &[f32],
         past_tokens: &[u32],
-        mask:        &[bool],
+        mask: &[bool],
     ) -> u32 {
         self.sample_inner(logits, past_tokens, Some(mask))
     }
 
-    fn sample_inner(
-        &mut self,
-        logits:      &[f32],
-        past_tokens: &[u32],
-        mask:        Option<&[bool]>,
-    ) -> u32 {
+    fn sample_inner(&mut self, logits: &[f32], past_tokens: &[u32], mask: Option<&[bool]>) -> u32 {
         // Greedy fast path when no constraint is active.
         if self.config.temperature == 0.0 && mask.is_none() {
             return argmax(logits);
@@ -201,7 +194,9 @@ impl Sampler {
         //    have −∞ logit and are excluded from all downstream filtering.
         if let Some(m) = mask {
             for (l, &allowed) in logits.iter_mut().zip(m.iter()) {
-                if !allowed { *l = f32::NEG_INFINITY; }
+                if !allowed {
+                    *l = f32::NEG_INFINITY;
+                }
             }
         }
 
@@ -301,9 +296,7 @@ pub(crate) fn apply_top_k(logits: &mut [f32], k: usize) {
     // We collect (index, value) pairs, sort by value descending, and mark
     // everything below rank k as -inf.
     let mut indices: Vec<usize> = (0..logits.len()).collect();
-    indices.select_nth_unstable_by(k, |&a, &b| {
-        logits[b].partial_cmp(&logits[a]).unwrap()
-    });
+    indices.select_nth_unstable_by(k, |&a, &b| logits[b].partial_cmp(&logits[a]).unwrap());
 
     // Everything from index k onward (in the partitioned order) is below top-k
     for &idx in &indices[k..] {
@@ -402,7 +395,13 @@ mod tests {
 
     /// Helper: check that f32 slices are approximately equal.
     fn approx_eq(a: &[f32], b: &[f32], tol: f32) {
-        assert_eq!(a.len(), b.len(), "length mismatch: {} vs {}", a.len(), b.len());
+        assert_eq!(
+            a.len(),
+            b.len(),
+            "length mismatch: {} vs {}",
+            a.len(),
+            b.len()
+        );
         for (i, (&x, &y)) in a.iter().zip(b).enumerate() {
             assert!(
                 (x - y).abs() < tol,
@@ -626,7 +625,10 @@ mod tests {
             }
         }
         // With temp=0.01, the max logit token should be picked nearly every time
-        assert!(count_max >= 95, "expected ~100 picks of argmax, got {count_max}");
+        assert!(
+            count_max >= 95,
+            "expected ~100 picks of argmax, got {count_max}"
+        );
     }
 
     #[test]

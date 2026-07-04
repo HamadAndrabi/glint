@@ -133,8 +133,7 @@ fn prepare_generation_from_prompt(
 ) -> Result<PreparedGeneration, Response> {
     validate_model(requested_model, &state.model_name)?;
 
-    let mut prompt_tokens = state.tokenizer.encode(prompt);
-    prompt_tokens.insert(0, state.tokenizer.bos_token_id);
+    let prompt_tokens = state.tokenizer.encode_prompt(prompt);
 
     let prompt_len = prompt_tokens.len();
     let context_limit = state.config.context_length as usize;
@@ -239,13 +238,26 @@ fn start_generation(
 
     let rx = state
         .engine
-        .submit(prompt_tokens, max_tokens, sampler_cfg, eos, constraint, None)
-        .ok_or_else(|| {
+        .submit(
+            prompt_tokens,
+            max_tokens,
+            sampler_cfg,
+            eos,
+            constraint,
+            None,
+        )
+        .map_err(|e| {
             state.metrics.record_failure();
-            api_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Inference engine unavailable",
-            )
+            match e {
+                crate::server::engine::SubmitError::Busy => api_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Server is at capacity; retry shortly",
+                ),
+                crate::server::engine::SubmitError::Shutdown => api_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Inference engine unavailable",
+                ),
+            }
         })?;
 
     state.metrics.on_submit();
@@ -267,7 +279,9 @@ async fn collect_generation(
     let mut ttft_recorded = false;
     while let Some(token_id) = stream.next().await {
         if !ttft_recorded {
-            state.metrics.record_ttft_us(t0.elapsed().as_micros() as u64);
+            state
+                .metrics
+                .record_ttft_us(t0.elapsed().as_micros() as u64);
             state.metrics.on_first_token();
             ttft_recorded = true;
         }
@@ -336,12 +350,12 @@ pub async fn health() -> impl IntoResponse {
 /// Runtime metrics — requests, token throughput, latency, and concurrency.
 pub async fn server_metrics(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let m = &state.metrics;
-    let requests        = m.requests_total.load(Ordering::Relaxed);
-    let tokens          = m.tokens_generated.load(Ordering::Relaxed);
-    let failed          = m.requests_failed.load(Ordering::Relaxed);
-    let active          = m.active_sessions.load(Ordering::Relaxed);
-    let queued          = m.queue_depth.load(Ordering::Relaxed);
-    let uptime_secs     = m.started_at.elapsed().as_secs();
+    let requests = m.requests_total.load(Ordering::Relaxed);
+    let tokens = m.tokens_generated.load(Ordering::Relaxed);
+    let failed = m.requests_failed.load(Ordering::Relaxed);
+    let active = m.active_sessions.load(Ordering::Relaxed);
+    let queued = m.queue_depth.load(Ordering::Relaxed);
+    let uptime_secs = m.started_at.elapsed().as_secs();
 
     Json(serde_json::json!({
         // Throughput
@@ -397,7 +411,11 @@ pub async fn completions(
         Err(err) => return err,
     };
 
-    if req.response_format.as_ref().map_or(false, |f| f.is_json_object()) {
+    if req
+        .response_format
+        .as_ref()
+        .is_some_and(|f| f.is_json_object())
+    {
         prepared.constraint = Some(ConstraintSpec::JsonObject);
     }
 
@@ -444,7 +462,7 @@ async fn streaming_completion(state: Arc<AppState>, prepared: PreparedGeneration
     let tokenizer = Arc::clone(&state.tokenizer);
     let token_count = Arc::new(AtomicU64::new(0));
     let t0 = Instant::now();
-    let ttft_instant = t0.clone();
+    let ttft_instant = t0;
     let id = gen_id();
     let created = now_secs();
 
@@ -459,7 +477,9 @@ async fn streaming_completion(state: Arc<AppState>, prepared: PreparedGeneration
     let state_for_stream = Arc::clone(&state);
     let stream = ReceiverStream::new(started.rx).map(move |token_id| {
         if !ttft_sent_clone.swap(true, Ordering::Relaxed) {
-            state_for_stream.metrics.record_ttft_us(ttft_instant.elapsed().as_micros() as u64);
+            state_for_stream
+                .metrics
+                .record_ttft_us(ttft_instant.elapsed().as_micros() as u64);
             state_for_stream.metrics.on_first_token();
         }
         tc.fetch_add(1, Ordering::Relaxed);
@@ -521,7 +541,7 @@ async fn streaming_chat_completion(state: Arc<AppState>, prepared: PreparedGener
     let tokenizer = Arc::clone(&state.tokenizer);
     let token_count = Arc::new(AtomicU64::new(0));
     let t0 = Instant::now();
-    let ttft_instant = t0.clone();
+    let ttft_instant = t0;
     let id = gen_id();
     let created = now_secs();
 
@@ -555,7 +575,9 @@ async fn streaming_chat_completion(state: Arc<AppState>, prepared: PreparedGener
     let state_for_stream = Arc::clone(&state);
     let content_stream = ReceiverStream::new(started.rx).map(move |token_id| {
         if !ttft_sent_clone.swap(true, Ordering::Relaxed) {
-            state_for_stream.metrics.record_ttft_us(ttft_instant.elapsed().as_micros() as u64);
+            state_for_stream
+                .metrics
+                .record_ttft_us(ttft_instant.elapsed().as_micros() as u64);
             state_for_stream.metrics.on_first_token();
         }
         tc.fetch_add(1, Ordering::Relaxed);
@@ -636,7 +658,11 @@ pub async fn chat_completions(
         Err(err) => return err,
     };
 
-    if req.response_format.as_ref().map_or(false, |f| f.is_json_object()) {
+    if req
+        .response_format
+        .as_ref()
+        .is_some_and(|f| f.is_json_object())
+    {
         prepared.constraint = Some(ConstraintSpec::JsonObject);
     }
 
@@ -675,10 +701,6 @@ pub async fn chat_completions(
 
 // ── POST /v1/embeddings ───────────────────────────────────────────────────────
 
-/// Text embedding — tokenize the input, run the forward pass, mean-pool hidden states.
-///
-/// Returns an OpenAI-compatible embedding object. The vector dimension equals
-/// the model's `embedding_length` (e.g. 576 for SmolLM-135M, 4096 for LLaMA-3-8B).
 // ── POST /v1/responses ────────────────────────────────────────────────────────
 
 /// Text-only Responses API built on the same inference engine as chat/completions.
@@ -755,7 +777,7 @@ async fn streaming_response(state: Arc<AppState>, prepared: PreparedGeneration) 
             .data(created_data.to_string()),
     ));
 
-    let ttft_instant = t0.clone();
+    let ttft_instant = t0;
     let tc = Arc::clone(&token_count);
     let text_buf = Arc::clone(&full_text);
     let delta_response_id = response_id.clone();
@@ -764,7 +786,9 @@ async fn streaming_response(state: Arc<AppState>, prepared: PreparedGeneration) 
     let state_for_stream = Arc::clone(&state);
     let delta_stream = ReceiverStream::new(started.rx).map(move |token_id| {
         if !ttft_sent_clone.swap(true, Ordering::Relaxed) {
-            state_for_stream.metrics.record_ttft_us(ttft_instant.elapsed().as_micros() as u64);
+            state_for_stream
+                .metrics
+                .record_ttft_us(ttft_instant.elapsed().as_micros() as u64);
             state_for_stream.metrics.on_first_token();
         }
         tc.fetch_add(1, Ordering::Relaxed);
@@ -857,27 +881,29 @@ pub async fn embeddings(
     }
 
     // Tokenize each input, prepending BOS to mirror normal inference.
-    let all_tokens: Vec<Vec<u32>> = input_texts.iter().map(|text| {
-        let mut tokens = state.tokenizer.encode(text);
-        tokens.insert(0, state.tokenizer.bos_token_id);
-        tokens
-    }).collect();
+    let all_tokens: Vec<Vec<u32>> = input_texts
+        .iter()
+        .map(|text| state.tokenizer.encode_prompt(text))
+        .collect();
 
     let total_tokens: usize = all_tokens.iter().map(|t| t.len()).sum();
     let model_name = state.model_name.clone();
 
     let weights = Arc::clone(&state.weights);
-    let config  = Arc::clone(&state.config);
+    let config = Arc::clone(&state.config);
 
     let result = tokio::task::spawn_blocking(move || {
         let refs: Vec<&[u32]> = all_tokens.iter().map(Vec::as_slice).collect();
         embed_batch(&weights, &config, &refs)
-    }).await;
+    })
+    .await;
 
     match result {
         Err(_) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "Embedding task panicked"),
         Ok(vectors) => {
-            let data: Vec<EmbeddingData> = vectors.into_iter().enumerate()
+            let data: Vec<EmbeddingData> = vectors
+                .into_iter()
+                .enumerate()
                 .map(|(i, embedding)| EmbeddingData {
                     object: "embedding",
                     embedding,
@@ -893,7 +919,8 @@ pub async fn embeddings(
                     completion_tokens: 0,
                     total_tokens,
                 },
-            }).into_response()
+            })
+            .into_response()
         }
     }
 }

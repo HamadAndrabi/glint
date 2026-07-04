@@ -82,7 +82,7 @@ impl VocabIndex {
             }
         }
         Arc::new(Self {
-            strings:     vocab.to_vec(),
+            strings: vocab.to_vec(),
             char_to_ids,
         })
     }
@@ -133,7 +133,11 @@ impl JsonState {
     fn step(self, ch: char) -> Self {
         match self {
             Self::ExpectOpenBrace => {
-                if ch == '{' { Self::ExpectKeyOrClose } else { Self::Error }
+                if ch == '{' {
+                    Self::ExpectKeyOrClose
+                } else {
+                    Self::Error
+                }
             }
             Self::ExpectKeyOrClose => {
                 match ch {
@@ -146,18 +150,16 @@ impl JsonState {
             Self::InKey => {
                 match ch {
                     '"' => Self::ExpectColon,
-                    '\\' => Self::InKey, // escape — next char is data
+                    '\\' => Self::InKey,        // escape — next char is data
                     '\n' | '\r' => Self::Error, // raw newline in string
                     _ => Self::InKey,
                 }
             }
-            Self::ExpectColon => {
-                match ch {
-                    ':' => Self::ExpectValue,
-                    ' ' | '\t' => Self::ExpectColon,
-                    _ => Self::Error,
-                }
-            }
+            Self::ExpectColon => match ch {
+                ':' => Self::ExpectValue,
+                ' ' | '\t' => Self::ExpectColon,
+                _ => Self::Error,
+            },
             Self::ExpectValue => {
                 match ch {
                     '"' => Self::InStringValue,
@@ -178,15 +180,13 @@ impl JsonState {
                     _ => Self::InStringValue,
                 }
             }
-            Self::InNumber => {
-                match ch {
-                    '0'..='9' | '.' | 'e' | 'E' | '+' | '-' => Self::InNumber,
-                    ',' => Self::ExpectKeyOrClose,
-                    '}' => Self::Done,
-                    ' ' | '\t' | '\n' | '\r' => Self::AfterValue,
-                    _ => Self::Error,
-                }
-            }
+            Self::InNumber => match ch {
+                '0'..='9' | '.' | 'e' | 'E' | '+' | '-' => Self::InNumber,
+                ',' => Self::ExpectKeyOrClose,
+                '}' => Self::Done,
+                ' ' | '\t' | '\n' | '\r' => Self::AfterValue,
+                _ => Self::Error,
+            },
             Self::InLiteral(mut remaining) => {
                 if remaining.is_empty() {
                     // Literal complete; now expecting separator.
@@ -205,15 +205,13 @@ impl JsonState {
                     }
                 }
             }
-            Self::AfterValue => {
-                match ch {
-                    ',' => Self::ExpectKeyOrClose,
-                    '}' => Self::Done,
-                    ' ' | '\t' | '\n' | '\r' => Self::AfterValue,
-                    _ => Self::Error,
-                }
-            }
-            Self::Done  => Self::Error, // nothing valid after closing brace
+            Self::AfterValue => match ch {
+                ',' => Self::ExpectKeyOrClose,
+                '}' => Self::Done,
+                ' ' | '\t' | '\n' | '\r' => Self::AfterValue,
+                _ => Self::Error,
+            },
+            Self::Done => Self::Error, // nothing valid after closing brace
             Self::Error => Self::Error,
         }
     }
@@ -225,14 +223,18 @@ impl JsonState {
         let mut state = self;
         for ch in s.chars() {
             state = state.step(ch);
-            if state == Self::Error { return Self::Error; }
+            if state == Self::Error {
+                return Self::Error;
+            }
         }
         state
     }
 
     /// True if this state represents a complete, well-formed JSON object.
     #[cfg(test)]
-    fn is_terminal(&self) -> bool { matches!(self, Self::Done) }
+    fn is_terminal(&self) -> bool {
+        matches!(self, Self::Done)
+    }
 }
 
 // ── JsonObjectConstraint ─────────────────────────────────────────────────────
@@ -243,8 +245,8 @@ impl JsonState {
 /// machine over each candidate token's decoded characters.  Masks are cached
 /// per state so re-entry into the same parse state costs a map lookup.
 pub struct JsonObjectConstraint {
-    state:      JsonState,
-    vocab:      Arc<VocabIndex>,
+    state: JsonState,
+    vocab: Arc<VocabIndex>,
     mask_cache: HashMap<JsonState, Vec<bool>>,
 }
 
@@ -255,7 +257,7 @@ impl JsonObjectConstraint {
     /// the index, then pass it here.
     pub fn new(vocab: Arc<VocabIndex>) -> Self {
         Self {
-            state:      JsonState::ExpectOpenBrace,
+            state: JsonState::ExpectOpenBrace,
             vocab,
             mask_cache: HashMap::new(),
         }
@@ -263,12 +265,15 @@ impl JsonObjectConstraint {
 
     /// Build (or return cached) a boolean mask for the current state.
     fn build_mask(&mut self) -> &Vec<bool> {
-        let state   = self.state.clone();
+        let state = self.state.clone();
         let strings = &self.vocab.strings;
         self.mask_cache.entry(state.clone()).or_insert_with(|| {
-            strings.iter()
+            strings
+                .iter()
                 .map(|s| {
-                    if s.is_empty() { return false; }
+                    if s.is_empty() {
+                        return false;
+                    }
                     // A token is allowed if applying all its characters leads to a
                     // non-Error state.  We do NOT require Done — the token may be a
                     // partial step (e.g. the `"` opening a string value is fine).
@@ -300,19 +305,24 @@ impl TokenConstraint for JsonObjectConstraint {
 /// categories, e.g. `["positive", "negative", "neutral"]`.
 pub struct JsonEnumConstraint {
     candidates: Vec<String>,
-    vocab:      Arc<VocabIndex>,
+    vocab: Arc<VocabIndex>,
     /// Characters produced so far.
-    emitted:    String,
+    emitted: String,
 }
 
 impl JsonEnumConstraint {
     pub fn new(candidates: Vec<String>, vocab: Arc<VocabIndex>) -> Self {
-        Self { candidates, vocab, emitted: String::new() }
+        Self {
+            candidates,
+            vocab,
+            emitted: String::new(),
+        }
     }
 
     /// Find candidates that are still reachable.
     fn still_valid(&self) -> Vec<&str> {
-        self.candidates.iter()
+        self.candidates
+            .iter()
             .filter(|c| c.starts_with(&self.emitted as &str))
             .map(String::as_str)
             .collect()
@@ -322,10 +332,14 @@ impl JsonEnumConstraint {
 impl TokenConstraint for JsonEnumConstraint {
     fn allowed_tokens(&mut self, _token_history: &[u32], _vocab: &VocabIndex) -> Vec<bool> {
         let valid = self.still_valid();
-        self.vocab.strings.iter()
+        self.vocab
+            .strings
+            .iter()
             .map(|s| {
                 let candidate = format!("{}{}", self.emitted, s);
-                valid.iter().any(|v| v.starts_with(&candidate as &str) || *v == &candidate as &str)
+                valid
+                    .iter()
+                    .any(|v| v.starts_with(&candidate as &str) || *v == &candidate as &str)
             })
             .collect()
     }
@@ -341,9 +355,7 @@ impl TokenConstraint for JsonEnumConstraint {
 pub fn build_constraint(spec: &ConstraintSpec, vocab: Arc<VocabIndex>) -> Box<dyn TokenConstraint> {
     match spec {
         ConstraintSpec::JsonObject => Box::new(JsonObjectConstraint::new(vocab)),
-        ConstraintSpec::JsonEnum(opts) => {
-            Box::new(JsonEnumConstraint::new(opts.clone(), vocab))
-        }
+        ConstraintSpec::JsonEnum(opts) => Box::new(JsonEnumConstraint::new(opts.clone(), vocab)),
     }
 }
 
@@ -355,10 +367,12 @@ mod tests {
 
     fn tiny_vocab() -> Arc<VocabIndex> {
         let vocab: Vec<String> = [
-            "{", "}", "\"", ":", ",", "a", "b", "c", "1", "2",
-            "true", "false", "null", " ", "\n", "key", "val",
-            "hello", "world", "0", ".",
-        ].iter().map(|s| s.to_string()).collect();
+            "{", "}", "\"", ":", ",", "a", "b", "c", "1", "2", "true", "false", "null", " ", "\n",
+            "key", "val", "hello", "world", "0", ".",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
         VocabIndex::from_vocab(&vocab)
     }
 
@@ -366,11 +380,11 @@ mod tests {
     fn test_json_state_machine_valid_object() {
         // Simulate: { "key": "val" }
         let s = JsonState::ExpectOpenBrace;
-        let s = s.step('{');  // -> ExpectKeyOrClose
+        let s = s.step('{'); // -> ExpectKeyOrClose
         assert_ne!(s, JsonState::Error);
-        let s = s.step('"');  // -> InKey
+        let s = s.step('"'); // -> InKey
         assert_ne!(s, JsonState::Error);
-        let s = s.step('k');  // -> InKey
+        let s = s.step('k'); // -> InKey
         let s = s.step('e');
         let s = s.step('y');
         let s = s.step('"'); // -> ExpectColon
@@ -415,7 +429,7 @@ mod tests {
     fn test_constraint_allows_open_brace() {
         let vocab = tiny_vocab();
         let mut c = JsonObjectConstraint::new(Arc::clone(&vocab));
-        let mask  = c.allowed_tokens(&[], &vocab);
+        let mask = c.allowed_tokens(&[], &vocab);
         // Token 0 is "{" — should be allowed
         assert!(mask[0], "{{ should be allowed in ExpectOpenBrace state");
         // Token 1 is "}" — should NOT be allowed at start
@@ -446,11 +460,16 @@ mod tests {
     #[test]
     fn test_json_enum_constraint() {
         let vocab = Arc::new(VocabIndex::from_vocab(&[
-            "yes".to_string(), "no".to_string(), "maybe".to_string(),
-            "ye".to_string(), "s".to_string(),
+            "yes".to_string(),
+            "no".to_string(),
+            "maybe".to_string(),
+            "ye".to_string(),
+            "s".to_string(),
         ]));
         let mut c = JsonEnumConstraint::new(
-            vec!["yes".to_string(), "no".to_string()], Arc::clone(&vocab));
+            vec!["yes".to_string(), "no".to_string()],
+            Arc::clone(&vocab),
+        );
         let mask = c.allowed_tokens(&[], &vocab);
         // "yes" (0) and "ye" (3) and "no" (1) should be allowed; "maybe" should not
         assert!(mask[0], "\"yes\" should be allowed");

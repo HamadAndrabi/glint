@@ -38,8 +38,8 @@
 use wasm_bindgen::prelude::*;
 
 use crate::api::{GenerationOptions, Model};
-use crate::model::gguf::GgufModel;
 use crate::model::config::ModelConfig;
+use crate::model::gguf::GgufModel;
 use crate::model::tokenizer::Tokenizer;
 use crate::sampling::SamplerConfig;
 use crate::session::CacheFormat;
@@ -78,22 +78,22 @@ impl GlintModel {
     /// ```
     #[wasm_bindgen(constructor)]
     pub fn new(bytes: &[u8]) -> Result<GlintModel, JsValue> {
-        let gguf = GgufModel::from_bytes(bytes.to_vec())
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let gguf =
+            GgufModel::from_bytes(bytes.to_vec()).map_err(|e| JsValue::from_str(&e.to_string()))?;
 
         let config = ModelConfig::from_metadata(&gguf.metadata)
             .ok_or_else(|| JsValue::from_str("could not read model config from GGUF metadata"))?;
 
-        let tokenizer = Tokenizer::from_gguf(&gguf)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let tokenizer =
+            Tokenizer::from_gguf(&gguf).map_err(|e| JsValue::from_str(&e.to_string()))?;
 
         let weights = TransformerWeights::load(&gguf, &config)
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
 
         let model = Model {
-            weights:    Arc::new(weights),
-            config:     Arc::new(config),
-            tokenizer:  Arc::new(tokenizer),
+            weights: Arc::new(weights),
+            config: Arc::new(config),
+            tokenizer: Arc::new(tokenizer),
             model_hash: 0,
             adapter_registry: crate::model::lora_registry::AdapterRegistry::new(),
         };
@@ -107,7 +107,12 @@ impl GlintModel {
     /// * `temperature` — sampling temperature; 0.0 = greedy (deterministic)
     ///
     /// Returns only the newly generated text (not the prompt).
-    pub fn generate(&self, prompt: &str, max_tokens: usize, temperature: f32) -> Result<String, JsValue> {
+    pub fn generate(
+        &self,
+        prompt: &str,
+        max_tokens: usize,
+        temperature: f32,
+    ) -> Result<String, JsValue> {
         let opts = GenerationOptions {
             max_new_tokens: max_tokens,
             sampler_cfg: SamplerConfig {
@@ -118,7 +123,8 @@ impl GlintModel {
             constraint: None,
             lora_adapter: None,
         };
-        let new_tokens = self.model
+        let new_tokens = self
+            .model
             .generate(prompt, &opts, &mut None)
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
         Ok(self.model.decode(&new_tokens))

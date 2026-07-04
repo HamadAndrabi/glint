@@ -39,17 +39,17 @@ pub enum CacheFormat {
 /// Parameters used to create a new [`Session`].
 pub struct SessionOptions {
     pub max_new_tokens: usize,
-    pub sampler_cfg:    SamplerConfig,
-    pub eos_token:      u32,
-    pub cache_format:   CacheFormat,
+    pub sampler_cfg: SamplerConfig,
+    pub eos_token: u32,
+    pub cache_format: CacheFormat,
     // KV cache dimensions — normally taken from ModelConfig.
     pub context_length: usize,
-    pub n_layers:       usize,
-    pub n_kv_heads:     usize,
-    pub head_dim:       usize,
+    pub n_layers: usize,
+    pub n_kv_heads: usize,
+    pub head_dim: usize,
     /// Optional LoRA adapter to apply for this session.  Overrides the base
     /// model's built-in adapter (if any) when `Some`.
-    pub lora_adapter:   Option<Arc<LoraWeights>>,
+    pub lora_adapter: Option<Arc<LoraWeights>>,
 }
 
 // ── Session ───────────────────────────────────────────────────────────────────
@@ -61,34 +61,34 @@ pub struct SessionOptions {
 /// `session.pos` after each `advance` call).
 pub struct Session {
     /// All tokens seen so far (prompt + generated).
-    pub tokens:        Vec<u32>,
+    pub tokens: Vec<u32>,
     /// Number of prompt/prefill tokens at the start of generation.
     ///
     /// This lets restored sessions rebuild structured-output constraints by
     /// replaying only the generated suffix.
-    pub prefill_len:   usize,
+    pub prefill_len: usize,
     /// The KV cache.  Boxed trait object — `F32` and `Q8` are interchangeable.
-    pub cache:         Box<dyn KvStore>,
+    pub cache: Box<dyn KvStore>,
     /// Which storage format the cache uses.
-    pub cache_format:  CacheFormat,
+    pub cache_format: CacheFormat,
     /// Sampler owns its RNG; seeded at session creation.
-    pub sampler:       Sampler,
+    pub sampler: Sampler,
     /// Current decode position (`tokens.len() - 1` after prefill).
-    pub pos:           usize,
+    pub pos: usize,
     /// Logits from the most recent forward pass, ready to sample from.
-    pub last_logits:   Tensor,
+    pub last_logits: Tensor,
     /// EOS token id for this model.
-    pub eos_token:     u32,
+    pub eos_token: u32,
     /// Remaining token budget.
     pub max_remaining: usize,
     /// Optional token constraint (e.g. JSON mode).  Applied during sampling.
-    pub constraint:    Option<Box<dyn TokenConstraint>>,
+    pub constraint: Option<Box<dyn TokenConstraint>>,
     /// Vocabulary index used by the constraint for mask lookups.
     /// Set alongside `constraint`; `None` when no constraint is active.
-    pub vocab_index:   Option<Arc<VocabIndex>>,
+    pub vocab_index: Option<Arc<VocabIndex>>,
     /// Per-session LoRA adapter.  When `Some`, overrides the base model's
     /// global adapter during forward passes.
-    pub lora_adapter:  Option<Arc<LoraWeights>>,
+    pub lora_adapter: Option<Arc<LoraWeights>>,
 }
 
 impl Session {
@@ -110,25 +110,24 @@ impl Session {
         };
         let sampler = Sampler::new(opts.sampler_cfg);
         Self {
-            tokens:        Vec::new(),
-            prefill_len:   0,
+            tokens: Vec::new(),
+            prefill_len: 0,
             cache,
-            cache_format:  opts.cache_format,
+            cache_format: opts.cache_format,
             sampler,
-            pos:           0,
-            last_logits:   Tensor::zeros(&[1]), // placeholder until prefill
-            eos_token:     opts.eos_token,
+            pos: 0,
+            last_logits: Tensor::zeros(&[1]), // placeholder until prefill
+            eos_token: opts.eos_token,
             max_remaining: opts.max_new_tokens,
-            constraint:    None,
-            vocab_index:   None,
-            lora_adapter:  opts.lora_adapter,
+            constraint: None,
+            vocab_index: None,
+            lora_adapter: opts.lora_adapter,
         }
     }
 
     /// True if this session has finished (EOS hit or budget exhausted).
     pub fn is_finished(&self) -> bool {
-        self.max_remaining == 0
-            || self.tokens.last() == Some(&self.eos_token)
+        self.max_remaining == 0 || self.tokens.last() == Some(&self.eos_token)
     }
 }
 
@@ -141,14 +140,17 @@ mod tests {
     fn opts(fmt: CacheFormat) -> SessionOptions {
         SessionOptions {
             max_new_tokens: 10,
-            sampler_cfg:    SamplerConfig { seed: Some(1), ..Default::default() },
-            eos_token:      2,
-            cache_format:   fmt,
+            sampler_cfg: SamplerConfig {
+                seed: Some(1),
+                ..Default::default()
+            },
+            eos_token: 2,
+            cache_format: fmt,
             context_length: 64,
-            n_layers:       2,
-            n_kv_heads:     2,
-            head_dim:       8,
-            lora_adapter:   None,
+            n_layers: 2,
+            n_kv_heads: 2,
+            head_dim: 8,
+            lora_adapter: None,
         }
     }
 

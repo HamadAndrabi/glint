@@ -107,9 +107,7 @@ pub async fn pull_model(
 ///
 /// Returns up to 5 repository IDs (e.g. `"bartowski/SmolLM2-135M-Instruct-GGUF"`)
 /// sorted by download count (the API's default).
-pub async fn search_huggingface(
-    query: &str,
-) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+pub async fn search_huggingface(query: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     let url = format!(
         "https://huggingface.co/api/models?search={query}&filter=gguf&limit=5",
         query = urlencoded(query),

@@ -33,4 +33,3 @@ pub struct GpuKvBuffer;
 /// Stub type when `vulkan` feature is disabled.
 #[cfg(not(feature = "vulkan"))]
 pub struct GpuKvCache;
-

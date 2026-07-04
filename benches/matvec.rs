@@ -12,15 +12,11 @@
 //!
 //! Run:  cargo bench --bench matvec
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId, Throughput};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use glint::model::gguf::GgmlType;
 use glint::tensor::QuantizedTensor;
 
-const SIZES: &[(usize, usize)] = &[
-    (576, 576),
-    (2048, 2048),
-    (4096, 4096),
-];
+const SIZES: &[(usize, usize)] = &[(576, 576), (2048, 2048), (4096, 4096)];
 
 // ── Matrix builders ─────────────────────────────────────────────────────────
 
@@ -28,9 +24,9 @@ fn make_matrix(rows: usize, cols: usize, ggml_type: GgmlType) -> QuantizedTensor
     match ggml_type {
         GgmlType::Q8_0 => make_q8_0(rows, cols),
         GgmlType::Q4_0 => make_q4_0(rows, cols),
-        GgmlType::Q4K  => make_k_quant(rows, cols, GgmlType::Q4K, 144),
-        GgmlType::Q5K  => make_k_quant(rows, cols, GgmlType::Q5K, 176),
-        GgmlType::Q6K  => make_k_quant(rows, cols, GgmlType::Q6K, 210),
+        GgmlType::Q4K => make_k_quant(rows, cols, GgmlType::Q4K, 144),
+        GgmlType::Q5K => make_k_quant(rows, cols, GgmlType::Q5K, 176),
+        GgmlType::Q6K => make_k_quant(rows, cols, GgmlType::Q6K, 210),
         _ => unimplemented!(),
     }
 }
@@ -78,7 +74,12 @@ fn make_q4_0(rows: usize, cols: usize) -> QuantizedTensor {
 }
 
 /// Build a k-quant matrix (Q4_K, Q5_K, or Q6_K) with deterministic data.
-fn make_k_quant(rows: usize, cols: usize, ggml_type: GgmlType, block_bytes: usize) -> QuantizedTensor {
+fn make_k_quant(
+    rows: usize,
+    cols: usize,
+    ggml_type: GgmlType,
+    block_bytes: usize,
+) -> QuantizedTensor {
     const SUPER_BLOCK: usize = 256;
     let n_super = cols / SUPER_BLOCK;
     let bytes_per_row = n_super * block_bytes;
@@ -94,9 +95,15 @@ fn make_k_quant(rows: usize, cols: usize, ggml_type: GgmlType, block_bytes: usiz
                     // [f16 d][f16 dmin][scales×12][qs×128]
                     block[0..2].copy_from_slice(&half::f16::from_f32(0.015).to_le_bytes());
                     block[2..4].copy_from_slice(&half::f16::from_f32(0.005).to_le_bytes());
-                    for j in 0..4 { block[4 + j] = ((i + sb + j) % 63 + 1) as u8; }
-                    for j in 0..4 { block[8 + j] = ((i + sb + j + 7) % 63 + 1) as u8; }
-                    for j in 4..8 { block[4 + j + 4] = ((i + sb + j) % 15 + 1) as u8; }
+                    for j in 0..4 {
+                        block[4 + j] = ((i + sb + j) % 63 + 1) as u8;
+                    }
+                    for j in 0..4 {
+                        block[8 + j] = ((i + sb + j + 7) % 63 + 1) as u8;
+                    }
+                    for j in 4..8 {
+                        block[4 + j + 4] = ((i + sb + j) % 15 + 1) as u8;
+                    }
                     for k in 16..144 {
                         let lo = ((i + sb + k) % 16) as u8;
                         let hi = ((i + sb + k + 5) % 16) as u8;
@@ -107,10 +114,18 @@ fn make_k_quant(rows: usize, cols: usize, ggml_type: GgmlType, block_bytes: usiz
                     // [f16 d][f16 dmin][scales×12][qh×32][qs×128]
                     block[0..2].copy_from_slice(&half::f16::from_f32(0.015).to_le_bytes());
                     block[2..4].copy_from_slice(&half::f16::from_f32(0.005).to_le_bytes());
-                    for j in 0..4 { block[4 + j] = ((i + sb + j) % 63 + 1) as u8; }
-                    for j in 0..4 { block[8 + j] = ((i + sb + j + 7) % 63 + 1) as u8; }
-                    for j in 4..8 { block[4 + j + 4] = ((i + sb + j) % 15 + 1) as u8; }
-                    for k in 0..32 { block[16 + k] = ((i + sb + k * 3) % 256) as u8; }
+                    for j in 0..4 {
+                        block[4 + j] = ((i + sb + j) % 63 + 1) as u8;
+                    }
+                    for j in 0..4 {
+                        block[8 + j] = ((i + sb + j + 7) % 63 + 1) as u8;
+                    }
+                    for j in 4..8 {
+                        block[4 + j + 4] = ((i + sb + j) % 15 + 1) as u8;
+                    }
+                    for k in 0..32 {
+                        block[16 + k] = ((i + sb + k * 3) % 256) as u8;
+                    }
                     for k in 0..128 {
                         let lo = ((i + sb + k) % 16) as u8;
                         let hi = ((i + sb + k + 5) % 16) as u8;
@@ -119,9 +134,15 @@ fn make_k_quant(rows: usize, cols: usize, ggml_type: GgmlType, block_bytes: usiz
                 }
                 GgmlType::Q6K => {
                     // [ql×128][qh×64][scales i8×16][f16 d]
-                    for k in 0..128 { block[k] = ((i + sb + k * 7) % 256) as u8; }
-                    for k in 0..64 { block[128 + k] = ((i + sb + k * 3) % 256) as u8; }
-                    for k in 0..16 { block[192 + k] = ((i + sb + k + 1) % 127 + 1) as u8; }
+                    for k in 0..128 {
+                        block[k] = ((i + sb + k * 7) % 256) as u8;
+                    }
+                    for k in 0..64 {
+                        block[128 + k] = ((i + sb + k * 3) % 256) as u8;
+                    }
+                    for k in 0..16 {
+                        block[192 + k] = ((i + sb + k + 1) % 127 + 1) as u8;
+                    }
                     block[208..210].copy_from_slice(&half::f16::from_f32(0.01).to_le_bytes());
                 }
                 _ => unreachable!(),
@@ -162,11 +183,21 @@ fn bench_format(c: &mut Criterion, name: &str, ggml_type: GgmlType) {
     group.finish();
 }
 
-fn bench_q8_0(c: &mut Criterion) { bench_format(c, "matvec_Q8_0", GgmlType::Q8_0); }
-fn bench_q4_0(c: &mut Criterion) { bench_format(c, "matvec_Q4_0", GgmlType::Q4_0); }
-fn bench_q4_k(c: &mut Criterion) { bench_format(c, "matvec_Q4_K", GgmlType::Q4K); }
-fn bench_q5_k(c: &mut Criterion) { bench_format(c, "matvec_Q5_K", GgmlType::Q5K); }
-fn bench_q6_k(c: &mut Criterion) { bench_format(c, "matvec_Q6_K", GgmlType::Q6K); }
+fn bench_q8_0(c: &mut Criterion) {
+    bench_format(c, "matvec_Q8_0", GgmlType::Q8_0);
+}
+fn bench_q4_0(c: &mut Criterion) {
+    bench_format(c, "matvec_Q4_0", GgmlType::Q4_0);
+}
+fn bench_q4_k(c: &mut Criterion) {
+    bench_format(c, "matvec_Q4_K", GgmlType::Q4K);
+}
+fn bench_q5_k(c: &mut Criterion) {
+    bench_format(c, "matvec_Q5_K", GgmlType::Q5K);
+}
+fn bench_q6_k(c: &mut Criterion) {
+    bench_format(c, "matvec_Q6_K", GgmlType::Q6K);
+}
 
 /// Cross-format comparison at a single representative size (4096×4096).
 fn bench_comparison(c: &mut Criterion) {
@@ -221,7 +252,9 @@ fn bench_gpu_vs_cpu(c: &mut Criterion) {
     // Q8_0 — CPU (AVX2+FMA)
     let qt_q8 = make_matrix(rows, cols, GgmlType::Q8_0);
     group.bench_function("Q8_0_cpu", |b| {
-        b.iter(|| { black_box(qt_q8.matvec(black_box(&input))); });
+        b.iter(|| {
+            black_box(qt_q8.matvec(black_box(&input)));
+        });
     });
 
     // Q8_0 — GPU
@@ -238,7 +271,9 @@ fn bench_gpu_vs_cpu(c: &mut Criterion) {
     // Q4_0 — CPU
     let qt_q4 = make_matrix(rows, cols, GgmlType::Q4_0);
     group.bench_function("Q4_0_cpu", |b| {
-        b.iter(|| { black_box(qt_q4.matvec(black_box(&input))); });
+        b.iter(|| {
+            black_box(qt_q4.matvec(black_box(&input)));
+        });
     });
 
     // Q4_0 — GPU
@@ -279,7 +314,11 @@ fn bench_gpu_scaling(c: &mut Criterion) {
         group.bench_with_input(
             BenchmarkId::new("cpu", format!("{rows}x{cols}")),
             &(&qt, &input),
-            |b, (qt, input)| { b.iter(|| { black_box(qt.matvec(black_box(input))); }); },
+            |b, (qt, input)| {
+                b.iter(|| {
+                    black_box(qt.matvec(black_box(input)));
+                });
+            },
         );
 
         let buf_name = format!("scale_{rows}x{cols}");

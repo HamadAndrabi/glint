@@ -31,13 +31,17 @@ pub trait KvStore: Send + Sync {
     fn len(&self) -> usize;
 
     /// True if no positions have been written.
-    fn is_empty(&self) -> bool { self.len() == 0 }
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 
     /// Truncate to `new_len` valid positions (used to roll back speculative tokens).
     fn truncate(&mut self, new_len: usize);
 
     /// Reset to zero positions for a new sequence.
-    fn clear(&mut self) { self.truncate(0); }
+    fn clear(&mut self) {
+        self.truncate(0);
+    }
 
     /// Export the K and V data for positions `0..self.len()` as raw bytes,
     /// one `Vec<u8>` per layer.
@@ -66,7 +70,9 @@ pub trait KvStore: Send + Sync {
     /// The forward pass checks this to avoid copying the full K/V context from
     /// CPU to GPU on every decode step — the resident path uploads only the new
     /// token's K/V vectors (`O(head_dim)`) instead.
-    fn gpu_buffer(&self) -> Option<&crate::backend::GpuKvBuffer> { None }
+    fn gpu_buffer(&self) -> Option<&crate::backend::GpuKvBuffer> {
+        None
+    }
 }
 
 // ── F32 KV-cache ─────────────────────────────────────────────────────────────
@@ -125,7 +131,11 @@ impl KvStore for KvCache {
     }
 
     fn write(&mut self, layer: usize, pos: usize, k_vec: &[f32], v_vec: &[f32]) {
-        assert!(pos < self.max_seq_len, "KV-cache overflow: pos {pos} >= {}", self.max_seq_len);
+        assert!(
+            pos < self.max_seq_len,
+            "KV-cache overflow: pos {pos} >= {}",
+            self.max_seq_len
+        );
         debug_assert_eq!(k_vec.len(), self.kv_dim);
         debug_assert_eq!(v_vec.len(), self.kv_dim);
         let offset = pos * self.kv_dim;
@@ -133,28 +143,44 @@ impl KvStore for KvCache {
         self.v[layer][offset..offset + self.kv_dim].copy_from_slice(v_vec);
     }
 
-    fn advance(&mut self) { self.len += 1; }
-    fn len(&self) -> usize { self.len }
+    fn advance(&mut self) {
+        self.len += 1;
+    }
+    fn len(&self) -> usize {
+        self.len
+    }
     fn truncate(&mut self, new_len: usize) {
-        assert!(new_len <= self.len, "truncate: {new_len} > len {}", self.len);
+        assert!(
+            new_len <= self.len,
+            "truncate: {new_len} > len {}",
+            self.len
+        );
         self.len = new_len;
     }
 
     fn export_raw(&self) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
         let byte_count = self.len * self.kv_dim * std::mem::size_of::<f32>();
-        let k_out: Vec<Vec<u8>> = self.k.iter().map(|layer| {
-            // SAFETY: f32 has no invalid bit patterns; we copy valid initialised bytes.
-            let src: &[u8] = unsafe {
-                std::slice::from_raw_parts(layer.as_ptr() as *const u8, layer.len() * 4)
-            };
-            src[..byte_count].to_vec()
-        }).collect();
-        let v_out: Vec<Vec<u8>> = self.v.iter().map(|layer| {
-            let src: &[u8] = unsafe {
-                std::slice::from_raw_parts(layer.as_ptr() as *const u8, layer.len() * 4)
-            };
-            src[..byte_count].to_vec()
-        }).collect();
+        let k_out: Vec<Vec<u8>> = self
+            .k
+            .iter()
+            .map(|layer| {
+                // SAFETY: f32 has no invalid bit patterns; we copy valid initialised bytes.
+                let src: &[u8] = unsafe {
+                    std::slice::from_raw_parts(layer.as_ptr() as *const u8, layer.len() * 4)
+                };
+                src[..byte_count].to_vec()
+            })
+            .collect();
+        let v_out: Vec<Vec<u8>> = self
+            .v
+            .iter()
+            .map(|layer| {
+                let src: &[u8] = unsafe {
+                    std::slice::from_raw_parts(layer.as_ptr() as *const u8, layer.len() * 4)
+                };
+                src[..byte_count].to_vec()
+            })
+            .collect();
         (k_out, v_out)
     }
 
@@ -168,12 +194,16 @@ impl KvStore for KvCache {
         for (l, (k_src, v_src)) in k_layers.iter().zip(v_layers.iter()).enumerate() {
             if k_src.len() != expected_bytes {
                 return Err(GlintError::SnapshotCacheSizeMismatch {
-                    layer: l, expected: expected_bytes, found: k_src.len(),
+                    layer: l,
+                    expected: expected_bytes,
+                    found: k_src.len(),
                 });
             }
             if v_src.len() != expected_bytes {
                 return Err(GlintError::SnapshotCacheSizeMismatch {
-                    layer: l, expected: expected_bytes, found: v_src.len(),
+                    layer: l,
+                    expected: expected_bytes,
+                    found: v_src.len(),
                 });
             }
             // SAFETY: destination is properly allocated f32 storage; source byte count matches.
@@ -275,19 +305,31 @@ impl KvStore for KvCacheQ8 {
     fn read_k_head(&self, layer: usize, pos: usize, kv_h: usize, head_dim: usize, buf: &mut [f32]) {
         debug_assert_eq!(buf.len(), head_dim);
         let start = pos * self.bytes_per_pos;
-        Self::dequant_range(&self.k[layer][start..start + self.bytes_per_pos],
-            kv_h * head_dim, (kv_h + 1) * head_dim, buf);
+        Self::dequant_range(
+            &self.k[layer][start..start + self.bytes_per_pos],
+            kv_h * head_dim,
+            (kv_h + 1) * head_dim,
+            buf,
+        );
     }
 
     fn read_v_head(&self, layer: usize, pos: usize, kv_h: usize, head_dim: usize, buf: &mut [f32]) {
         debug_assert_eq!(buf.len(), head_dim);
         let start = pos * self.bytes_per_pos;
-        Self::dequant_range(&self.v[layer][start..start + self.bytes_per_pos],
-            kv_h * head_dim, (kv_h + 1) * head_dim, buf);
+        Self::dequant_range(
+            &self.v[layer][start..start + self.bytes_per_pos],
+            kv_h * head_dim,
+            (kv_h + 1) * head_dim,
+            buf,
+        );
     }
 
     fn write(&mut self, layer: usize, pos: usize, k_vec: &[f32], v_vec: &[f32]) {
-        assert!(pos < self.max_seq_len, "KV-cache overflow: pos {pos} >= {}", self.max_seq_len);
+        assert!(
+            pos < self.max_seq_len,
+            "KV-cache overflow: pos {pos} >= {}",
+            self.max_seq_len
+        );
         debug_assert_eq!(k_vec.len(), self.kv_dim);
         debug_assert_eq!(v_vec.len(), self.kv_dim);
         let start = pos * self.bytes_per_pos;
@@ -295,10 +337,18 @@ impl KvStore for KvCacheQ8 {
         Self::quantize_into(v_vec, &mut self.v[layer][start..start + self.bytes_per_pos]);
     }
 
-    fn advance(&mut self) { self.len += 1; }
-    fn len(&self) -> usize { self.len }
+    fn advance(&mut self) {
+        self.len += 1;
+    }
+    fn len(&self) -> usize {
+        self.len
+    }
     fn truncate(&mut self, new_len: usize) {
-        assert!(new_len <= self.len, "truncate: {new_len} > len {}", self.len);
+        assert!(
+            new_len <= self.len,
+            "truncate: {new_len} > len {}",
+            self.len
+        );
         self.len = new_len;
     }
 
@@ -319,12 +369,16 @@ impl KvStore for KvCacheQ8 {
         for (l, (k_src, v_src)) in k_layers.iter().zip(v_layers.iter()).enumerate() {
             if k_src.len() != expected_bytes {
                 return Err(GlintError::SnapshotCacheSizeMismatch {
-                    layer: l, expected: expected_bytes, found: k_src.len(),
+                    layer: l,
+                    expected: expected_bytes,
+                    found: k_src.len(),
                 });
             }
             if v_src.len() != expected_bytes {
                 return Err(GlintError::SnapshotCacheSizeMismatch {
-                    layer: l, expected: expected_bytes, found: v_src.len(),
+                    layer: l,
+                    expected: expected_bytes,
+                    found: v_src.len(),
                 });
             }
             self.k[l][..expected_bytes].copy_from_slice(k_src);
@@ -360,7 +414,11 @@ impl KvStore for crate::backend::GpuKvCache {
     /// Updates the CPU mirror, then uploads only the new slice to the GPU buffer.
     /// The upload cost is O(`kv_dim`) — constant with respect to sequence length.
     fn write(&mut self, layer: usize, pos: usize, k_vec: &[f32], v_vec: &[f32]) {
-        assert!(pos < self.max_seq_len, "GpuKvCache overflow: pos {pos} >= {}", self.max_seq_len);
+        assert!(
+            pos < self.max_seq_len,
+            "GpuKvCache overflow: pos {pos} >= {}",
+            self.max_seq_len
+        );
         debug_assert_eq!(k_vec.len(), self.kv_dim);
         debug_assert_eq!(v_vec.len(), self.kv_dim);
 
@@ -374,20 +432,28 @@ impl KvStore for crate::backend::GpuKvCache {
         let float_offset = layer * layer_stride + pos * self.kv_dim;
         let byte_offset = (float_offset * std::mem::size_of::<f32>()) as u64;
         // SAFETY: f32 has no invalid bit patterns; we view initialised floats as bytes.
-        let k_bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(k_vec.as_ptr() as *const u8, k_vec.len() * 4)
-        };
-        let v_bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(v_vec.as_ptr() as *const u8, v_vec.len() * 4)
-        };
-        self.queue.write_buffer(&self.gpu_buf.k_buf, byte_offset, k_bytes);
-        self.queue.write_buffer(&self.gpu_buf.v_buf, byte_offset, v_bytes);
+        let k_bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(k_vec.as_ptr() as *const u8, k_vec.len() * 4) };
+        let v_bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(v_vec.as_ptr() as *const u8, v_vec.len() * 4) };
+        self.queue
+            .write_buffer(&self.gpu_buf.k_buf, byte_offset, k_bytes);
+        self.queue
+            .write_buffer(&self.gpu_buf.v_buf, byte_offset, v_bytes);
     }
 
-    fn advance(&mut self) { self.len += 1; }
-    fn len(&self) -> usize { self.len }
+    fn advance(&mut self) {
+        self.len += 1;
+    }
+    fn len(&self) -> usize {
+        self.len
+    }
     fn truncate(&mut self, new_len: usize) {
-        assert!(new_len <= self.len, "truncate: {new_len} > len {}", self.len);
+        assert!(
+            new_len <= self.len,
+            "truncate: {new_len} > len {}",
+            self.len
+        );
         self.len = new_len;
         // GPU buffer data beyond new_len is ignored; overwritten on next write.
     }
@@ -395,19 +461,27 @@ impl KvStore for crate::backend::GpuKvCache {
     fn export_raw(&self) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
         // Use CPU mirror — avoids GPU readback.
         let byte_count = self.len * self.kv_dim * std::mem::size_of::<f32>();
-        let k_out: Vec<Vec<u8>> = self.k.iter().map(|layer| {
-            // SAFETY: f32 → &[u8], valid bytes.
-            let src: &[u8] = unsafe {
-                std::slice::from_raw_parts(layer.as_ptr() as *const u8, layer.len() * 4)
-            };
-            src[..byte_count].to_vec()
-        }).collect();
-        let v_out: Vec<Vec<u8>> = self.v.iter().map(|layer| {
-            let src: &[u8] = unsafe {
-                std::slice::from_raw_parts(layer.as_ptr() as *const u8, layer.len() * 4)
-            };
-            src[..byte_count].to_vec()
-        }).collect();
+        let k_out: Vec<Vec<u8>> = self
+            .k
+            .iter()
+            .map(|layer| {
+                // SAFETY: f32 → &[u8], valid bytes.
+                let src: &[u8] = unsafe {
+                    std::slice::from_raw_parts(layer.as_ptr() as *const u8, layer.len() * 4)
+                };
+                src[..byte_count].to_vec()
+            })
+            .collect();
+        let v_out: Vec<Vec<u8>> = self
+            .v
+            .iter()
+            .map(|layer| {
+                let src: &[u8] = unsafe {
+                    std::slice::from_raw_parts(layer.as_ptr() as *const u8, layer.len() * 4)
+                };
+                src[..byte_count].to_vec()
+            })
+            .collect();
         (k_out, v_out)
     }
 
@@ -421,12 +495,16 @@ impl KvStore for crate::backend::GpuKvCache {
         for (l, (k_src, v_src)) in k_layers.iter().zip(v_layers.iter()).enumerate() {
             if k_src.len() != expected_bytes {
                 return Err(GlintError::SnapshotCacheSizeMismatch {
-                    layer: l, expected: expected_bytes, found: k_src.len(),
+                    layer: l,
+                    expected: expected_bytes,
+                    found: k_src.len(),
                 });
             }
             if v_src.len() != expected_bytes {
                 return Err(GlintError::SnapshotCacheSizeMismatch {
-                    layer: l, expected: expected_bytes, found: v_src.len(),
+                    layer: l,
+                    expected: expected_bytes,
+                    found: v_src.len(),
                 });
             }
             // SAFETY: destination is properly allocated f32 storage.
@@ -446,8 +524,16 @@ impl KvStore for crate::backend::GpuKvCache {
             let layer_stride_bytes =
                 (self.max_seq_len * self.kv_dim * std::mem::size_of::<f32>()) as u64;
             let layer_byte_offset = l as u64 * layer_stride_bytes;
-            self.queue.write_buffer(&self.gpu_buf.k_buf, layer_byte_offset, &k_src[..expected_bytes]);
-            self.queue.write_buffer(&self.gpu_buf.v_buf, layer_byte_offset, &v_src[..expected_bytes]);
+            self.queue.write_buffer(
+                &self.gpu_buf.k_buf,
+                layer_byte_offset,
+                &k_src[..expected_bytes],
+            );
+            self.queue.write_buffer(
+                &self.gpu_buf.v_buf,
+                layer_byte_offset,
+                &v_src[..expected_bytes],
+            );
         }
         self.len = token_count;
         Ok(())
@@ -559,7 +645,10 @@ mod tests {
         let q8_bytes: usize = q8.k.iter().chain(q8.v.iter()).map(|l| l.len()).sum();
         let f32_bytes = n_layers * max_seq * n_kv_heads * head_dim * 4 * 2;
         let ratio = f32_bytes as f64 / q8_bytes as f64;
-        assert!(ratio > 3.5 && ratio < 4.0, "Compression ratio {ratio:.2} not in [3.5, 4.0]");
+        assert!(
+            ratio > 3.5 && ratio < 4.0,
+            "Compression ratio {ratio:.2} not in [3.5, 4.0]"
+        );
     }
 
     #[test]
@@ -572,7 +661,10 @@ mod tests {
         let mut head1_k = vec![0.0f32; 32];
         cache.read_k_head(0, 0, 1, 32, &mut head1_k);
         for (i, (&orig, &dec)) in k[32..].iter().zip(&head1_k).enumerate() {
-            assert!((orig - dec).abs() < 0.12, "head1 K[{i}]: {orig:.3} vs {dec:.3}");
+            assert!(
+                (orig - dec).abs() < 0.12,
+                "head1 K[{i}]: {orig:.3} vs {dec:.3}"
+            );
         }
     }
 }
