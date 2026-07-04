@@ -41,25 +41,25 @@ const VERSION: u32 = 2;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SnapshotMetadata {
     /// FNV-64 hash of (model file path as bytes) + (file size as 8 LE bytes).
-    pub model_hash:   u64,
-    pub context_len:  u32,
-    pub n_layers:     u32,
-    pub n_kv_heads:   u32,
-    pub head_dim:     u32,
+    pub model_hash: u64,
+    pub context_len: u32,
+    pub n_layers: u32,
+    pub n_kv_heads: u32,
+    pub head_dim: u32,
     pub cache_format: CacheFormat,
 }
 
 /// A fully deserialised snapshot — ready to be restored into a [`Session`].
 pub struct KvSnapshot {
-    pub meta:      SnapshotMetadata,
-    pub tokens:    Vec<u32>,
+    pub meta: SnapshotMetadata,
+    pub tokens: Vec<u32>,
     pub prefill_len: u32,
-    pub pos:       u32,
+    pub pos: u32,
     pub rng_state: u64,
     /// One `Vec<u8>` per layer — raw K storage (f32 bytes or Q8 bytes).
-    pub k_layers:  Vec<Vec<u8>>,
+    pub k_layers: Vec<Vec<u8>>,
     /// One `Vec<u8>` per layer — raw V storage.
-    pub v_layers:  Vec<Vec<u8>>,
+    pub v_layers: Vec<Vec<u8>>,
 }
 
 // ── Serialisation helpers ────────────────────────────────────────────────────
@@ -83,14 +83,22 @@ fn write_bytes(buf: &mut Vec<u8>, data: &[u8]) {
 
 struct Reader<'a> {
     data: &'a [u8],
-    pos:  usize,
+    pos: usize,
 }
 
 impl<'a> Reader<'a> {
-    fn new(data: &'a [u8]) -> Self { Self { data, pos: 0 } }
+    fn new(data: &'a [u8]) -> Self {
+        Self { data, pos: 0 }
+    }
 
     fn read_exact(&mut self, n: usize) -> Result<&'a [u8], GlintError> {
-        if self.pos + n > self.data.len() {
+        // `checked_add` guards against a hostile length field wrapping `pos + n`
+        // (snapshot bytes are untrusted, e.g. via the C FFI deserialize path).
+        if self
+            .pos
+            .checked_add(n)
+            .is_none_or(|end| end > self.data.len())
+        {
             return Err(GlintError::SnapshotTruncated);
         }
         let slice = &self.data[self.pos..self.pos + n];
@@ -109,7 +117,9 @@ impl<'a> Reader<'a> {
 
     fn read_u64(&mut self) -> Result<u64, GlintError> {
         let b = self.read_exact(8)?;
-        Ok(u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
+        Ok(u64::from_le_bytes([
+            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+        ]))
     }
 
     fn read_byte_vec(&mut self) -> Result<Vec<u8>, GlintError> {
@@ -127,7 +137,7 @@ impl<'a> Reader<'a> {
 /// (different file, truncated file) without reading any model content.
 pub fn model_hash(path: &str, file_size: u64) -> u64 {
     const FNV_OFFSET: u64 = 14695981039346656037;
-    const FNV_PRIME:  u64 = 1099511628211;
+    const FNV_PRIME: u64 = 1099511628211;
     let mut h = FNV_OFFSET;
     for &b in path.as_bytes().iter().chain(file_size.to_le_bytes().iter()) {
         h ^= b as u64;
@@ -179,18 +189,27 @@ pub fn export_snapshot_with_meta(
 }
 
 fn cache_format_tag(fmt: CacheFormat) -> u8 {
-    match fmt { CacheFormat::F32 => 0, CacheFormat::Q8 => 1 }
+    match fmt {
+        CacheFormat::F32 => 0,
+        CacheFormat::Q8 => 1,
+    }
 }
 
 fn cache_format_from_tag(tag: u8) -> Option<CacheFormat> {
-    match tag { 0 => Some(CacheFormat::F32), 1 => Some(CacheFormat::Q8), _ => None }
+    match tag {
+        0 => Some(CacheFormat::F32),
+        1 => Some(CacheFormat::Q8),
+        _ => None,
+    }
 }
 
-/// Read just the cache-format tag from a snapshot header.
+/// Read the full metadata header from a snapshot blob, validating magic and
+/// version, without touching the model.
 ///
-/// This is useful for callers that need the expected metadata before they can
-/// run full validation.
-pub fn peek_snapshot_cache_format(bytes: &[u8]) -> Result<CacheFormat, GlintError> {
+/// This is the single source of truth for the header layout — external callers
+/// (e.g. the C FFI) must go through this rather than re-deriving byte offsets,
+/// so a format change can never leave a second parser out of sync.
+pub fn peek_snapshot_metadata(bytes: &[u8]) -> Result<SnapshotMetadata, GlintError> {
     let mut r = Reader::new(bytes);
     let magic = r.read_exact(8)?;
     if magic != MAGIC {
@@ -198,15 +217,34 @@ pub fn peek_snapshot_cache_format(bytes: &[u8]) -> Result<CacheFormat, GlintErro
     }
     let version = r.read_u32()?;
     if version != VERSION {
-        return Err(GlintError::SnapshotVersionUnsupported { found: version, current: VERSION });
+        return Err(GlintError::SnapshotVersionUnsupported {
+            found: version,
+            current: VERSION,
+        });
     }
-    r.read_u64()?; // model_hash
-    r.read_u32()?; // context_len
-    r.read_u32()?; // n_layers
-    r.read_u32()?; // n_kv_heads
-    r.read_u32()?; // head_dim
+    let model_hash = r.read_u64()?;
+    let context_len = r.read_u32()?;
+    let n_layers = r.read_u32()?;
+    let n_kv_heads = r.read_u32()?;
+    let head_dim = r.read_u32()?;
     let fmt_tag = r.read_u8()?;
-    cache_format_from_tag(fmt_tag).ok_or(GlintError::SnapshotTruncated)
+    let cache_format = cache_format_from_tag(fmt_tag).ok_or(GlintError::SnapshotTruncated)?;
+    Ok(SnapshotMetadata {
+        model_hash,
+        context_len,
+        n_layers,
+        n_kv_heads,
+        head_dim,
+        cache_format,
+    })
+}
+
+/// Read just the cache-format tag from a snapshot header.
+///
+/// This is useful for callers that need the expected metadata before they can
+/// run full validation.
+pub fn peek_snapshot_cache_format(bytes: &[u8]) -> Result<CacheFormat, GlintError> {
+    Ok(peek_snapshot_metadata(bytes)?.cache_format)
 }
 
 // ── Import ───────────────────────────────────────────────────────────────────
@@ -230,7 +268,10 @@ pub fn import_snapshot(
     // ── Version ────────────────────────────────────────────────────────────
     let version = r.read_u32()?;
     if version != VERSION {
-        return Err(GlintError::SnapshotVersionUnsupported { found: version, current: VERSION });
+        return Err(GlintError::SnapshotVersionUnsupported {
+            found: version,
+            current: VERSION,
+        });
     }
 
     // ── Metadata — fail-fast on every mismatch ────────────────────────────
@@ -279,8 +320,7 @@ pub fn import_snapshot(
     }
 
     let fmt_tag = r.read_u8()?;
-    let cache_format = cache_format_from_tag(fmt_tag)
-        .ok_or(GlintError::SnapshotTruncated)?;
+    let cache_format = cache_format_from_tag(fmt_tag).ok_or(GlintError::SnapshotTruncated)?;
     if cache_format != expected.cache_format {
         return Err(GlintError::SnapshotMetaMismatch {
             field: "cache_format",
@@ -290,8 +330,13 @@ pub fn import_snapshot(
     }
 
     // ── Session state ─────────────────────────────────────────────────────
+    // `token_count` and `n_layers` are attacker-controlled on the FFI
+    // deserialize path (there the "expected" meta is read from the blob
+    // itself), so clamp every preallocation to the remaining byte length —
+    // each entry consumes at least one byte, so the true count can never
+    // exceed it. A dishonest count still fails cleanly in the read loop.
     let token_count = r.read_u32()? as usize;
-    let mut tokens = Vec::with_capacity(token_count);
+    let mut tokens = Vec::with_capacity(token_count.min(bytes.len()));
     for _ in 0..token_count {
         tokens.push(r.read_u32()?);
     }
@@ -300,8 +345,9 @@ pub fn import_snapshot(
     let rng_state = r.read_u64()?;
 
     // ── KV cache data ─────────────────────────────────────────────────────
-    let mut k_layers = Vec::with_capacity(n_layers as usize);
-    let mut v_layers = Vec::with_capacity(n_layers as usize);
+    let layer_cap = (n_layers as usize).min(bytes.len());
+    let mut k_layers = Vec::with_capacity(layer_cap);
+    let mut v_layers = Vec::with_capacity(layer_cap);
     for _ in 0..n_layers {
         k_layers.push(r.read_byte_vec()?);
         v_layers.push(r.read_byte_vec()?);
@@ -331,10 +377,7 @@ pub fn import_snapshot(
 ///
 /// The session's sampler RNG is seeded from `snap.rng_state` so that
 /// generation resumes deterministically when a fixed seed was used.
-pub fn restore_session(
-    snap: KvSnapshot,
-    opts: SessionOptions,
-) -> Result<Session, GlintError> {
+pub fn restore_session(snap: KvSnapshot, opts: SessionOptions) -> Result<Session, GlintError> {
     let mut session = Session::new(opts);
     session.tokens = snap.tokens;
     session.prefill_len = snap.prefill_len as usize;
@@ -345,7 +388,9 @@ pub fn restore_session(
 
     // Import KV data into the freshly allocated cache.
     let token_count = session.tokens.len();
-    session.cache.import_raw(&snap.k_layers, &snap.v_layers, token_count)?;
+    session
+        .cache
+        .import_raw(&snap.k_layers, &snap.v_layers, token_count)?;
 
     Ok(session)
 }
@@ -360,11 +405,11 @@ mod tests {
 
     fn make_meta() -> SnapshotMetadata {
         SnapshotMetadata {
-            model_hash:   0xdeadbeef_cafebabe,
-            context_len:  64,
-            n_layers:     2,
-            n_kv_heads:   2,
-            head_dim:     8,
+            model_hash: 0xdeadbeef_cafebabe,
+            context_len: 64,
+            n_layers: 2,
+            n_kv_heads: 2,
+            head_dim: 8,
             cache_format: CacheFormat::F32,
         }
     }
@@ -372,14 +417,17 @@ mod tests {
     fn make_opts(meta: &SnapshotMetadata) -> SessionOptions {
         SessionOptions {
             max_new_tokens: 16,
-            sampler_cfg:    SamplerConfig { seed: Some(42), ..Default::default() },
-            eos_token:      2,
-            cache_format:   meta.cache_format,
+            sampler_cfg: SamplerConfig {
+                seed: Some(42),
+                ..Default::default()
+            },
+            eos_token: 2,
+            cache_format: meta.cache_format,
             context_length: meta.context_len as usize,
-            n_layers:       meta.n_layers as usize,
-            n_kv_heads:     meta.n_kv_heads as usize,
-            head_dim:       meta.head_dim as usize,
-            lora_adapter:   None,
+            n_layers: meta.n_layers as usize,
+            n_kv_heads: meta.n_kv_heads as usize,
+            head_dim: meta.head_dim as usize,
+            lora_adapter: None,
         }
     }
 
@@ -444,7 +492,44 @@ mod tests {
         let meta = make_meta();
         let mut bytes = vec![0u8; 16];
         bytes[0..8].copy_from_slice(b"NOTMAGIC");
-        assert!(matches!(import_snapshot(&bytes, &meta), Err(GlintError::SnapshotBadMagic)));
+        assert!(matches!(
+            import_snapshot(&bytes, &meta),
+            Err(GlintError::SnapshotBadMagic)
+        ));
+    }
+
+    #[test]
+    fn test_peek_metadata_matches_export() {
+        let meta = make_meta();
+        let opts = make_opts(&meta);
+        let mut session = Session::new(opts);
+        write_dummy_cache(&mut session);
+        let bytes = export_snapshot_with_meta(&session, &meta).unwrap();
+        // The shared header parser must recover exactly what was written.
+        assert_eq!(peek_snapshot_metadata(&bytes).unwrap(), meta);
+    }
+
+    #[test]
+    fn test_hostile_token_count_does_not_oom() {
+        // A structurally-valid header whose token_count claims ~4 billion, but
+        // the stream ends right after. Import must fail (truncated) without
+        // attempting a multi-gigabyte preallocation.
+        let meta = make_meta();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(MAGIC);
+        write_u32(&mut bytes, VERSION);
+        write_u64(&mut bytes, meta.model_hash);
+        write_u32(&mut bytes, meta.context_len);
+        write_u32(&mut bytes, meta.n_layers);
+        write_u32(&mut bytes, meta.n_kv_heads);
+        write_u32(&mut bytes, meta.head_dim);
+        write_u8(&mut bytes, cache_format_tag(meta.cache_format));
+        write_u32(&mut bytes, u32::MAX); // token_count — hostile
+                                         // no token data follows
+        assert!(matches!(
+            import_snapshot(&bytes, &meta),
+            Err(GlintError::SnapshotTruncated)
+        ));
     }
 
     #[test]
@@ -477,7 +562,10 @@ mod tests {
         wrong_meta.n_layers = 4;
         assert!(matches!(
             import_snapshot(&bytes, &wrong_meta),
-            Err(GlintError::SnapshotMetaMismatch { field: "n_layers", .. })
+            Err(GlintError::SnapshotMetaMismatch {
+                field: "n_layers",
+                ..
+            })
         ));
     }
 
@@ -487,7 +575,9 @@ mod tests {
         let opts = make_opts(&meta);
         let mut session = Session::new(opts);
         // Advance RNG a few steps
-        for _ in 0..10 { session.sampler.rng.next_f32(); }
+        for _ in 0..10 {
+            session.sampler.rng.next_f32();
+        }
         let state_before = session.sampler.rng.state;
         write_dummy_cache(&mut session);
 

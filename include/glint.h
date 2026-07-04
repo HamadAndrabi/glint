@@ -17,6 +17,22 @@
  *   glint_session_free(s);
  *   glint_model_free(m);
  * @endcode
+ *
+ * @section threadsafety Thread-safety
+ *   - A GlintModel* is read-only after load and MAY be shared across threads:
+ *     any number of threads may call functions taking a const GlintModel*
+ *     concurrently.
+ *   - A GlintSession* is NOT thread-safe. It owns mutable KV-cache and RNG
+ *     state; calling glint_generate / glint_stream_generate /
+ *     glint_snapshot_export on the same session from two threads at once is a
+ *     data race. Use one session per thread, or guard it with your own lock.
+ *   - glint_last_error() is thread-local: each thread only sees errors from
+ *     its own calls.
+ *
+ * @section panics Panic-safety
+ *   Every entry point catches internal Rust panics at the boundary and reports
+ *   them as NULL / -1 with a message from glint_last_error(). A failure never
+ *   unwinds into the C caller or aborts the host process.
  */
 
 #ifndef GLINT_H

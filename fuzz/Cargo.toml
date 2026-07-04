@@ -1,0 +1,32 @@
+[package]
+name = "glint-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+# Fuzz the pure-parsing surfaces. Disable default features so the fuzz build
+# doesn't pull in the async server / native download stack (and its OpenSSL
+# dependency); the GGUF parser and snapshot importer only need the core crate.
+[dependencies.glint]
+path = ".."
+default-features = false
+
+[[bin]]
+name = "gguf_parse"
+path = "fuzz_targets/gguf_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "snapshot_import"
+path = "fuzz_targets/snapshot_import.rs"
+test = false
+doc = false
+bench = false

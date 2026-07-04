@@ -1,5 +1,10 @@
 # glint- A Rust LLM Inference Engine — Project Roadmap
 
+> **Historical document.** This is the original pre-implementation design doc and
+> no longer tracks the current state of the codebase. For what actually exists,
+> see [README.md](README.md) and the module map in [CLAUDE.md](CLAUDE.md). Kept
+> for context on the initial plan.
+
 ## Project Vision
 
 Build a production-grade LLM inference engine from scratch in Rust, starting with CPU-only support and progressively adding optimizations, GPU backends, and a serving layer. The engine will be capable of loading quantized models (GGUF format), running efficient transformer inference, and serving multiple concurrent requests via an HTTP API.

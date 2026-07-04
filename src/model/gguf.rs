@@ -177,8 +177,14 @@ impl GgmlType {
     pub fn is_quantized(&self) -> bool {
         !matches!(
             self,
-            Self::F32 | Self::F16 | Self::BF16 | Self::F64 |
-            Self::I8 | Self::I16 | Self::I32 | Self::I64
+            Self::F32
+                | Self::F16
+                | Self::BF16
+                | Self::F64
+                | Self::I8
+                | Self::I16
+                | Self::I32
+                | Self::I64
         )
     }
 
@@ -387,17 +393,29 @@ pub struct TensorInfo {
 
 impl TensorInfo {
     /// Total number of elements (product of dimensions).
+    ///
+    /// Saturating so a hostile set of dimensions (e.g. several `u64::MAX`
+    /// values) yields `u64::MAX` rather than wrapping to a small number that
+    /// would later under-report the tensor's byte size.
     pub fn n_elements(&self) -> u64 {
-        self.dimensions.iter().product()
+        self.dimensions
+            .iter()
+            .copied()
+            .fold(1u64, |acc, d| acc.saturating_mul(d))
     }
 
     /// Total byte size of this tensor's data on disk.
+    ///
+    /// Saturating throughout: the result is only ever compared against the
+    /// real mapped length in `tensor_data`, so an overflowing (dishonest)
+    /// descriptor saturates to `usize::MAX` and is rejected there instead of
+    /// wrapping to a small size that would permit an out-of-bounds slice.
     pub fn data_size(&self) -> usize {
         let n_elements = self.n_elements() as usize;
         let block_size = self.ggml_type.block_size();
         let type_size = self.ggml_type.type_size();
         let n_blocks = n_elements.div_ceil(block_size);
-        n_blocks * type_size
+        n_blocks.saturating_mul(type_size)
     }
 }
 
@@ -415,11 +433,16 @@ impl<'a> Cursor<'a> {
     }
 
     fn check_remaining(&self, needed: usize) -> Result<()> {
-        if self.pos + needed > self.data.len() {
+        // `checked_add` guards against `pos + needed` wrapping on a hostile
+        // length field; `saturating_sub` keeps `available` from underflowing
+        // if `pos` has somehow advanced past `len` (it should not, but the
+        // error path must not itself panic on untrusted input).
+        let end = self.pos.checked_add(needed);
+        if end.is_none() || end.unwrap() > self.data.len() {
             Err(GgufError::UnexpectedEof {
                 offset: self.pos,
                 needed,
-                available: self.data.len() - self.pos,
+                available: self.data.len().saturating_sub(self.pos),
             })
         } else {
             Ok(())
@@ -574,7 +597,7 @@ enum GgufData {
 impl GgufData {
     fn as_slice(&self) -> &[u8] {
         match self {
-            GgufData::Mmap(m)  => m,
+            GgufData::Mmap(m) => m,
             GgufData::Owned(b) => b,
         }
     }
@@ -603,9 +626,18 @@ impl std::fmt::Debug for GgufModel {
     }
 }
 
+/// Parsed GGUF header: `(version, metadata, tensor_infos, name→index, data_offset)`.
+type ParsedHeader = (
+    u32,
+    HashMap<String, MetadataValue>,
+    Vec<TensorInfo>,
+    HashMap<String, usize>,
+    usize,
+);
+
 impl GgufModel {
     /// Shared header + metadata + tensor-info parsing from any byte slice.
-    fn parse(bytes: &[u8]) -> Result<(u32, HashMap<String, MetadataValue>, Vec<TensorInfo>, HashMap<String, usize>, usize)> {
+    fn parse(bytes: &[u8]) -> Result<ParsedHeader> {
         let mut cursor = Cursor::new(bytes);
 
         let magic = cursor.read_u32()?;
@@ -618,17 +650,26 @@ impl GgufModel {
             return Err(GgufError::UnsupportedVersion(version));
         }
 
-        let tensor_count      = cursor.read_u64()? as usize;
+        let tensor_count = cursor.read_u64()? as usize;
         let metadata_kv_count = cursor.read_u64()? as usize;
 
-        let mut metadata = HashMap::with_capacity(metadata_kv_count);
+        // `tensor_count` / `metadata_kv_count` come straight from the file and
+        // cannot be trusted: a hostile header could claim `u64::MAX` and turn
+        // `with_capacity` into a multi-exabyte allocation (abort/OOM DoS).
+        // Every entry consumes at least a few bytes of the stream, so the true
+        // count can never exceed the remaining byte length — clamp the
+        // preallocation to that bound. The read loops below still fail cleanly
+        // via `check_remaining` if the declared count is a lie.
+        let cap_bound = bytes.len();
+
+        let mut metadata = HashMap::with_capacity(metadata_kv_count.min(cap_bound));
         for _ in 0..metadata_kv_count {
             let (key, value) = cursor.read_metadata_kv()?;
             metadata.insert(key, value);
         }
 
-        let mut tensor_infos = Vec::with_capacity(tensor_count);
-        let mut tensor_index = HashMap::with_capacity(tensor_count);
+        let mut tensor_infos = Vec::with_capacity(tensor_count.min(cap_bound));
+        let mut tensor_index = HashMap::with_capacity(tensor_count.min(cap_bound));
         for i in 0..tensor_count {
             let info = cursor.read_tensor_info()?;
             tensor_index.insert(info.name.clone(), i);
@@ -641,18 +682,38 @@ impl GgufModel {
             .unwrap_or(DEFAULT_ALIGNMENT as u32) as u64;
 
         let tensor_data_offset = align_offset(cursor.pos as u64, alignment) as usize;
-        Ok((version, metadata, tensor_infos, tensor_index, tensor_data_offset))
+        Ok((
+            version,
+            metadata,
+            tensor_infos,
+            tensor_index,
+            tensor_data_offset,
+        ))
     }
 
     /// Load and parse a GGUF model file via memory-mapped I/O (zero-copy).
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
         let file = File::open(path.as_ref())?;
+        // SAFETY: `Mmap::map` is unsafe because the mapped bytes alias external
+        // storage: if another process truncates or writes the file while it is
+        // mapped, reads through the map are UB (typically SIGBUS). We accept the
+        // standard mmap contract here — the file is expected to be a stable,
+        // read-only model artifact for the lifetime of the returned `GgufModel`
+        // (weights borrow from this map via `QuantizedStorage::Borrowed`). All
+        // reads go through bounds-checked accessors (`tensor_data`,
+        // `tensor_data_range`, `Cursor`), so no in-bounds access can escape the
+        // mapping; the only residual risk is concurrent external mutation of the
+        // backing file, which is outside Rust's ability to prevent.
         let mmap = Arc::new(unsafe { Mmap::map(&file)? });
         let (version, metadata, tensor_infos, tensor_index, tensor_data_offset) =
             Self::parse(&mmap)?;
         Ok(Self {
             data: GgufData::Mmap(mmap),
-            metadata, tensor_infos, tensor_index, tensor_data_offset, version,
+            metadata,
+            tensor_infos,
+            tensor_index,
+            tensor_data_offset,
+            version,
         })
     }
 
@@ -667,7 +728,11 @@ impl GgufModel {
             Self::parse(&bytes)?;
         Ok(Self {
             data: GgufData::Owned(bytes.into_boxed_slice()),
-            metadata, tensor_infos, tensor_index, tensor_data_offset, version,
+            metadata,
+            tensor_infos,
+            tensor_index,
+            tensor_data_offset,
+            version,
         })
     }
 
@@ -679,7 +744,9 @@ impl GgufModel {
     }
 
     pub fn architecture(&self) -> Option<&str> {
-        self.metadata.get("general.architecture").and_then(|v| v.as_str())
+        self.metadata
+            .get("general.architecture")
+            .and_then(|v| v.as_str())
     }
 
     pub fn model_name(&self) -> Option<&str> {
@@ -687,7 +754,9 @@ impl GgufModel {
     }
 
     pub fn get_tensor_info(&self, name: &str) -> Option<&TensorInfo> {
-        self.tensor_index.get(name).map(|&idx| &self.tensor_infos[idx])
+        self.tensor_index
+            .get(name)
+            .map(|&idx| &self.tensor_infos[idx])
     }
 
     /// Return a reference-counted handle to the memory map, if this model was
@@ -703,11 +772,22 @@ impl GgufModel {
     }
 
     /// Return the `(byte_offset, byte_len)` of a tensor within the raw file
-    /// data, without copying.  Used by lazy weight loading.
+    /// data, without copying.  Used by lazy zero-copy weight loading.
+    ///
+    /// Returns `None` if the descriptor's range does not lie fully within the
+    /// mapped data — the caller then falls back to the eager path, which
+    /// surfaces a proper error. This keeps a corrupt or hostile offset/size
+    /// from producing an out-of-bounds borrow that the SIMD kernels would read
+    /// unchecked.
     pub fn tensor_data_range(&self, name: &str) -> Option<(usize, usize)> {
         let info = self.get_tensor_info(name)?;
-        let offset = self.tensor_data_offset + info.offset as usize;
-        Some((offset, info.data_size()))
+        let len = info.data_size();
+        let offset = self.tensor_data_offset.checked_add(info.offset as usize)?;
+        let end = offset.checked_add(len)?;
+        if end > self.data.as_slice().len() {
+            return None;
+        }
+        Some((offset, len))
     }
 
     /// Get a tensor's raw data as a byte slice from the mmap'd file.
@@ -716,18 +796,27 @@ impl GgufModel {
             .get_tensor_info(name)
             .ok_or_else(|| GgufError::TensorNotFound(name.to_string()))?;
 
-        let start = self.tensor_data_offset + info.offset as usize;
-        let size = info.data_size();
-        let end = start + size;
-
         let raw = self.data.as_slice();
-        if end > raw.len() {
-            return Err(GgufError::UnexpectedEof {
+        let size = info.data_size();
+        // All three of `offset`, `size`, and their sum are attacker-influenced
+        // (the descriptor is read from the file), so every step is checked:
+        // a wrapping `start` or `end` must surface as an EOF error, never as an
+        // out-of-bounds slice into the mapped region.
+        let start = self
+            .tensor_data_offset
+            .checked_add(info.offset as usize)
+            .ok_or(GgufError::UnexpectedEof {
+                offset: 0,
+                needed: size,
+                available: raw.len(),
+            })?;
+        let end = start.checked_add(size).filter(|&e| e <= raw.len()).ok_or(
+            GgufError::UnexpectedEof {
                 offset: start,
                 needed: size,
-                available: raw.len() - start,
-            });
-        }
+                available: raw.len().saturating_sub(start),
+            },
+        )?;
 
         Ok(&raw[start..end])
     }
@@ -812,9 +901,18 @@ mod tests {
 
     #[test]
     fn test_metadata_value_type_from_u32() {
-        assert_eq!(MetadataValueType::from_u32(0).unwrap(), MetadataValueType::UInt8);
-        assert_eq!(MetadataValueType::from_u32(8).unwrap(), MetadataValueType::String);
-        assert_eq!(MetadataValueType::from_u32(9).unwrap(), MetadataValueType::Array);
+        assert_eq!(
+            MetadataValueType::from_u32(0).unwrap(),
+            MetadataValueType::UInt8
+        );
+        assert_eq!(
+            MetadataValueType::from_u32(8).unwrap(),
+            MetadataValueType::String
+        );
+        assert_eq!(
+            MetadataValueType::from_u32(9).unwrap(),
+            MetadataValueType::Array
+        );
         assert!(MetadataValueType::from_u32(99).is_err());
     }
 
@@ -862,7 +960,61 @@ mod tests {
 
         let result = GgufModel::load(&path);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Invalid GGUF magic"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid GGUF magic"));
+    }
+
+    // ── Adversarial-input hardening ────────────────────────────────────────────
+    // These lock in the guards against hostile/corrupt headers: the parser must
+    // return an error, never panic (arithmetic overflow) or OOM (unbounded
+    // preallocation), on attacker-controlled count/dimension/offset fields.
+
+    #[test]
+    fn test_huge_tensor_count_does_not_oom() {
+        // Claims u64::MAX tensors but the stream ends immediately. The capacity
+        // hint must be clamped to the byte length, and the read loop must fail
+        // cleanly on the first (missing) tensor rather than pre-allocating.
+        let mut data = Vec::new();
+        data.extend_from_slice(&GGUF_MAGIC.to_le_bytes());
+        data.extend_from_slice(&3u32.to_le_bytes());
+        data.extend_from_slice(&u64::MAX.to_le_bytes()); // tensor_count
+        data.extend_from_slice(&0u64.to_le_bytes()); // metadata_kv_count
+        assert!(GgufModel::from_bytes(data).is_err());
+    }
+
+    #[test]
+    fn test_huge_metadata_count_does_not_oom() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&GGUF_MAGIC.to_le_bytes());
+        data.extend_from_slice(&3u32.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes()); // tensor_count
+        data.extend_from_slice(&u64::MAX.to_le_bytes()); // metadata_kv_count
+        assert!(GgufModel::from_bytes(data).is_err());
+    }
+
+    #[test]
+    fn test_overflowing_string_length_is_rejected() {
+        // A string field claiming u64::MAX bytes must not wrap the bounds check.
+        let mut data = Vec::new();
+        data.extend_from_slice(&u64::MAX.to_le_bytes());
+        let mut cursor = Cursor::new(&data);
+        assert!(cursor.read_string().is_err());
+    }
+
+    #[test]
+    fn test_n_elements_saturates_instead_of_wrapping() {
+        let info = TensorInfo {
+            name: "x".into(),
+            dimensions: vec![u64::MAX, u64::MAX],
+            ggml_type: GgmlType::F32,
+            offset: 0,
+        };
+        // Wrapping would give a tiny product; saturating keeps it enormous so
+        // the range check in `tensor_data` rejects it.
+        assert_eq!(info.n_elements(), u64::MAX);
+        assert_eq!(info.data_size(), usize::MAX);
     }
 
     #[test]

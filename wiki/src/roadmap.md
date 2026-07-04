@@ -1,5 +1,11 @@
 # Roadmap & Future Exploration
 
+> **Note:** The "What's Built" list below reflects an earlier milestone and lags
+> the current code (which has since added K-quant SIMD, runtime sessions and
+> snapshots, C FFI, LoRA, speculative decoding, and constrained decoding). Treat
+> [README.md](https://github.com/HamadAndrabi/glint/blob/master/README.md) as the
+> source of truth for shipped features.
+
 This page documents what's already built, what's planned next, and the longer-term exploration paths worth investigating.
 
 ---

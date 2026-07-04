@@ -2,7 +2,7 @@
 name = "glint"
 version = "0.1.0"
 edition = "2021"
-description = "A production-grade LLM inference engine built from scratch in Rust"
+description = "A CPU-first LLM inference engine built from scratch in Rust"
 license = "MIT"
 
 [lib]
@@ -34,7 +34,7 @@ vulkan = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
 
 # Expose a C-compatible ABI (opaque handles + #[no_mangle] functions). Build with:
 #   cargo build --release --features cffi
-# A C header is generated at include/glint.h via cbindgen in build.rs.
+# The C header is maintained by hand at include/glint.h.
 cffi = []
 
 # Reserved gate for full Jinja2 template evaluation via minijinja.

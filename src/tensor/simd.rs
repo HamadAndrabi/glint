@@ -23,6 +23,47 @@ use rayon::prelude::*;
 
 use super::dequantize::get_scale_min_q4k;
 
+// ── Safety contract for the public kernels ───────────────────────────────────
+//
+// Every `matvec_*_avx2` entry point below reads `data` and `vec` through raw
+// unaligned SIMD loads that perform NO bounds checking. For the loads to stay
+// in bounds the caller MUST uphold, for a format with `block_elems` elements
+// and `block_bytes` bytes per block:
+//
+//   * `cols % block_elems == 0`         (no partial trailing block)
+//   * `vec.len()  >= cols`              (input vector fully covers a row)
+//   * `data.len() >= rows * (cols / block_elems) * block_bytes`
+//                                       (weight buffer covers every row)
+//
+// These hold for weights loaded from a validated GGUF descriptor. `check_dims`
+// asserts them in debug builds so a violated invariant trips a panic in tests
+// instead of silently reading out of bounds; it compiles to nothing in release
+// so the hot path is unaffected.
+
+/// Debug-only precondition check for a quantized matvec kernel.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn check_dims(
+    data_len: usize,
+    rows: usize,
+    cols: usize,
+    vec_len: usize,
+    block_elems: usize,
+    block_bytes: usize,
+) {
+    debug_assert!(
+        cols % block_elems == 0,
+        "cols ({cols}) must be a multiple of block size ({block_elems})"
+    );
+    debug_assert!(vec_len >= cols, "vec.len() ({vec_len}) < cols ({cols})");
+    let bytes_per_row = (cols / block_elems) * block_bytes;
+    debug_assert!(
+        data_len >= rows * bytes_per_row,
+        "data.len() ({data_len}) < rows*bytes_per_row ({})",
+        rows * bytes_per_row
+    );
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 /// Horizontal sum of 8 f32 lanes in a __m256 register.
@@ -39,9 +80,9 @@ unsafe fn hsum_avx2(v: __m256) -> f32 {
     let hi128 = _mm256_extractf128_ps(v, 1);
     let lo128 = _mm256_castps256_ps128(v);
     let sum128 = _mm_add_ps(hi128, lo128);
-    let shuf = _mm_movehdup_ps(sum128);       // [b,b,d,d]
-    let sums = _mm_add_ps(sum128, shuf);       // [a+b, -, c+d, -]
-    let hi64 = _mm_movehl_ps(sums, sums);      // [c+d, -, -, -]
+    let shuf = _mm_movehdup_ps(sum128); // [b,b,d,d]
+    let sums = _mm_add_ps(sum128, shuf); // [a+b, -, c+d, -]
+    let hi64 = _mm_movehl_ps(sums, sums); // [c+d, -, -, -]
     let total = _mm_add_ss(sums, hi64);
     _mm_cvtss_f32(total)
 }
@@ -135,10 +176,8 @@ unsafe fn dot_row_q4_0(data: &[u8], row_start: usize, n_blocks: usize, vec: &[f3
         let hi_nib = _mm_and_si128(_mm_srli_epi16(packed, 4), low_mask);
         let interleaved_lo = _mm_unpacklo_epi8(lo_nib, hi_nib);
         let interleaved_hi = _mm_unpackhi_epi8(lo_nib, hi_nib);
-        let values_u8 = _mm256_inserti128_si256::<1>(
-            _mm256_castsi128_si256(interleaved_lo),
-            interleaved_hi,
-        );
+        let values_u8 =
+            _mm256_inserti128_si256::<1>(_mm256_castsi128_si256(interleaved_lo), interleaved_hi);
         let centered = _mm256_sub_epi8(values_u8, offset_8);
 
         acc = accum_block_q8(centered, vec.as_ptr().add(b * BLOCK_ELEMS), scale, acc);
@@ -165,6 +204,7 @@ pub(crate) unsafe fn matvec_q8_0_avx2(
 ) -> Vec<f32> {
     const BLOCK_ELEMS: usize = 32;
     const BLOCK_BYTES: usize = 34;
+    check_dims(data.len(), rows, cols, vec.len(), BLOCK_ELEMS, BLOCK_BYTES);
 
     let n_blocks = cols / BLOCK_ELEMS;
     let bytes_per_row = n_blocks * BLOCK_BYTES;
@@ -239,17 +279,19 @@ unsafe fn dot_row_q4_k(data: &[u8], row_start: usize, n_super: usize, vec: &[f32
 
     for sb in 0..n_super {
         let b = &data[row_start + sb * BLOCK_BYTES..];
-        let d    = f16::from_le_bytes([b[0], b[1]]).to_f32();
+        let d = f16::from_le_bytes([b[0], b[1]]).to_f32();
         let dmin = f16::from_le_bytes([b[2], b[3]]).to_f32();
         let scales = &b[4..16];
         let qs = &b[16..144];
         let x_base = sb * SUPER_BLOCK;
 
         for group in 0..4_usize {
-            let (sc0, mn0) = get_scale_min_q4k(group * 2,     scales);
+            let (sc0, mn0) = get_scale_min_q4k(group * 2, scales);
             let (sc1, mn1) = get_scale_min_q4k(group * 2 + 1, scales);
-            let d0 = d * sc0 as f32;  let m0 = dmin * mn0 as f32;
-            let d1 = d * sc1 as f32;  let m1 = dmin * mn1 as f32;
+            let d0 = d * sc0 as f32;
+            let m0 = dmin * mn0 as f32;
+            let d1 = d * sc1 as f32;
+            let m1 = dmin * mn1 as f32;
 
             // Load 32 packed nibble bytes: low nibbles → first 32 elements,
             // high nibbles → next 32 elements of this group.
@@ -294,6 +336,7 @@ pub(crate) unsafe fn matvec_q4_k_avx2(
 ) -> Vec<f32> {
     const SUPER_BLOCK: usize = 256;
     const BLOCK_BYTES: usize = 144;
+    check_dims(data.len(), rows, cols, vec.len(), SUPER_BLOCK, BLOCK_BYTES);
 
     let n_super = cols / SUPER_BLOCK;
     let bytes_per_row = n_super * BLOCK_BYTES;
@@ -333,28 +376,30 @@ unsafe fn dot_row_q5_k(data: &[u8], row_start: usize, n_super: usize, vec: &[f32
     const BLOCK_BYTES: usize = 176;
 
     let lo_mask = _mm256_set1_epi8(0x0F_u8 as i8);
-    let zero    = _mm256_setzero_si256();
+    let zero = _mm256_setzero_si256();
     let sixteen = _mm256_set1_epi8(16_u8 as i8);
 
     let mut total = 0.0f32;
 
     for sb in 0..n_super {
-        let b      = &data[row_start + sb * BLOCK_BYTES..];
-        let d      = f16::from_le_bytes([b[0], b[1]]).to_f32();
-        let dmin   = f16::from_le_bytes([b[2], b[3]]).to_f32();
+        let b = &data[row_start + sb * BLOCK_BYTES..];
+        let d = f16::from_le_bytes([b[0], b[1]]).to_f32();
+        let dmin = f16::from_le_bytes([b[2], b[3]]).to_f32();
         let scales = &b[4..16];
-        let qh     = &b[16..48];   // 32 bytes — one bit per element per sub-block
-        let qs     = &b[48..176];  // 128 bytes — low 4 bits (same layout as Q4_K)
+        let qh = &b[16..48]; // 32 bytes — one bit per element per sub-block
+        let qs = &b[48..176]; // 128 bytes — low 4 bits (same layout as Q4_K)
         let x_base = sb * SUPER_BLOCK;
 
         // Load all 32 qh bytes once; each group uses two specific bits per byte.
         let qh_v = _mm256_loadu_si256(qh.as_ptr() as *const __m256i);
 
         for group in 0..4_usize {
-            let (sc0, mn0) = get_scale_min_q4k(group * 2,     scales);
+            let (sc0, mn0) = get_scale_min_q4k(group * 2, scales);
             let (sc1, mn1) = get_scale_min_q4k(group * 2 + 1, scales);
-            let d0 = d * sc0 as f32;  let m0 = dmin * mn0 as f32;
-            let d1 = d * sc1 as f32;  let m1 = dmin * mn1 as f32;
+            let d0 = d * sc0 as f32;
+            let m0 = dmin * mn0 as f32;
+            let d1 = d * sc1 as f32;
+            let m1 = dmin * mn1 as f32;
 
             // 32 packed nibble bytes (same position as Q4_K)
             let q_base = group * 32;
@@ -415,6 +460,7 @@ pub(crate) unsafe fn matvec_q5_k_avx2(
 ) -> Vec<f32> {
     const SUPER_BLOCK: usize = 256;
     const BLOCK_BYTES: usize = 176;
+    check_dims(data.len(), rows, cols, vec.len(), SUPER_BLOCK, BLOCK_BYTES);
 
     let n_super = cols / SUPER_BLOCK;
     let bytes_per_row = n_super * BLOCK_BYTES;
@@ -471,25 +517,25 @@ unsafe fn dot_row_q6_k(data: &[u8], row_start: usize, n_super: usize, vec: &[f32
     const BLOCK_BYTES: usize = 210;
     const SUPER_BLOCK: usize = 256;
 
-    let lo4    = _mm_set1_epi8(0x0F_u8 as i8);  // mask low nibble
-    let mask03 = _mm_set1_epi8(0x03_u8 as i8);  // mask 2 bits
-    let mul16  = _mm_set1_epi16(16);             // ×16 per byte (values 0..3 only)
-    let sub32  = _mm_set1_epi8(32_u8 as i8);     // centering offset
+    let lo4 = _mm_set1_epi8(0x0F_u8 as i8); // mask low nibble
+    let mask03 = _mm_set1_epi8(0x03_u8 as i8); // mask 2 bits
+    let mul16 = _mm_set1_epi16(16); // ×16 per byte (values 0..3 only)
+    let sub32 = _mm_set1_epi8(32_u8 as i8); // centering offset
 
     let mut total = 0.0f32;
 
     for sb in 0..n_super {
-        let b    = &data[row_start + sb * BLOCK_BYTES..];
-        let ql   = &b[0..128];
-        let qh   = &b[128..192];
-        let sc   = &b[192..208]; // 16 × i8 sub-block scales
-        let d    = f16::from_le_bytes([b[208], b[209]]).to_f32();
+        let b = &data[row_start + sb * BLOCK_BYTES..];
+        let ql = &b[0..128];
+        let qh = &b[128..192];
+        let sc = &b[192..208]; // 16 × i8 sub-block scales
+        let d = f16::from_le_bytes([b[208], b[209]]).to_f32();
         let x_base = sb * SUPER_BLOCK;
 
         for group in 0..2_usize {
-            let ql_off  = group * 64;
-            let qh_off  = group * 32;
-            let sc_off  = group * 8;
+            let ql_off = group * 64;
+            let qh_off = group * 32;
+            let sc_off = group * 8;
             let x_group = x_base + group * 128;
 
             // Each group has 32 l-values; the scale index `is = l / 16` changes
@@ -498,15 +544,15 @@ unsafe fn dot_row_q6_k(data: &[u8], row_start: usize, n_super: usize, vec: &[f32
                 let l = half * 16;
 
                 // Sub-block scales for this (group, half): indices 0,2,4,6 + half
-                let sc0 = d * sc[sc_off + half    ] as i8 as f32;
+                let sc0 = d * sc[sc_off + half] as i8 as f32;
                 let sc2 = d * sc[sc_off + half + 2] as i8 as f32;
                 let sc4 = d * sc[sc_off + half + 4] as i8 as f32;
                 let sc6 = d * sc[sc_off + half + 6] as i8 as f32;
 
                 // Load 16 raw bytes from each needed region
-                let ql_a = _mm_loadu_si128(ql[ql_off +  l..].as_ptr()      as *const __m128i);
-                let ql_b = _mm_loadu_si128(ql[ql_off + 32 + l..].as_ptr()  as *const __m128i);
-                let qhv  = _mm_loadu_si128(qh[qh_off +  l..].as_ptr()      as *const __m128i);
+                let ql_a = _mm_loadu_si128(ql[ql_off + l..].as_ptr() as *const __m128i);
+                let ql_b = _mm_loadu_si128(ql[ql_off + 32 + l..].as_ptr() as *const __m128i);
+                let qhv = _mm_loadu_si128(qh[qh_off + l..].as_ptr() as *const __m128i);
 
                 // ── Assemble 6-bit values (0..63) then subtract 32 → i8 (−32..+31) ──
                 //
@@ -528,10 +574,7 @@ unsafe fn dot_row_q6_k(data: &[u8], row_start: usize, n_super: usize, vec: &[f32
                 let q2 = _mm_sub_epi8(
                     _mm_or_si128(
                         _mm_and_si128(ql_b, lo4),
-                        _mm_mullo_epi16(
-                            _mm_and_si128(_mm_srli_epi16(qhv, 2), mask03),
-                            mul16,
-                        ),
+                        _mm_mullo_epi16(_mm_and_si128(_mm_srli_epi16(qhv, 2), mask03), mul16),
                     ),
                     sub32,
                 );
@@ -540,10 +583,7 @@ unsafe fn dot_row_q6_k(data: &[u8], row_start: usize, n_super: usize, vec: &[f32
                 let q3 = _mm_sub_epi8(
                     _mm_or_si128(
                         _mm_and_si128(_mm_srli_epi16(ql_a, 4), lo4),
-                        _mm_mullo_epi16(
-                            _mm_and_si128(_mm_srli_epi16(qhv, 4), mask03),
-                            mul16,
-                        ),
+                        _mm_mullo_epi16(_mm_and_si128(_mm_srli_epi16(qhv, 4), mask03), mul16),
                     ),
                     sub32,
                 );
@@ -552,19 +592,16 @@ unsafe fn dot_row_q6_k(data: &[u8], row_start: usize, n_super: usize, vec: &[f32
                 let q4 = _mm_sub_epi8(
                     _mm_or_si128(
                         _mm_and_si128(_mm_srli_epi16(ql_b, 4), lo4),
-                        _mm_mullo_epi16(
-                            _mm_and_si128(_mm_srli_epi16(qhv, 6), mask03),
-                            mul16,
-                        ),
+                        _mm_mullo_epi16(_mm_and_si128(_mm_srli_epi16(qhv, 6), mask03), mul16),
                     ),
                     sub32,
                 );
 
                 // Dot each 16-element region against its input slice
-                total += sc0 * dot16_i8_f32(q1, vec.as_ptr().add(x_group +       l));
-                total += sc2 * dot16_i8_f32(q2, vec.as_ptr().add(x_group + 32  + l));
-                total += sc4 * dot16_i8_f32(q3, vec.as_ptr().add(x_group + 64  + l));
-                total += sc6 * dot16_i8_f32(q4, vec.as_ptr().add(x_group + 96  + l));
+                total += sc0 * dot16_i8_f32(q1, vec.as_ptr().add(x_group + l));
+                total += sc2 * dot16_i8_f32(q2, vec.as_ptr().add(x_group + 32 + l));
+                total += sc4 * dot16_i8_f32(q3, vec.as_ptr().add(x_group + 64 + l));
+                total += sc6 * dot16_i8_f32(q4, vec.as_ptr().add(x_group + 96 + l));
             }
         }
     }
@@ -589,6 +626,7 @@ pub(crate) unsafe fn matvec_q6_k_avx2(
 ) -> Vec<f32> {
     const SUPER_BLOCK: usize = 256;
     const BLOCK_BYTES: usize = 210;
+    check_dims(data.len(), rows, cols, vec.len(), SUPER_BLOCK, BLOCK_BYTES);
 
     let n_super = cols / SUPER_BLOCK;
     let bytes_per_row = n_super * BLOCK_BYTES;
@@ -613,6 +651,7 @@ pub(crate) unsafe fn matvec_q4_0_avx2(
 ) -> Vec<f32> {
     const BLOCK_ELEMS: usize = 32;
     const BLOCK_BYTES: usize = 18;
+    check_dims(data.len(), rows, cols, vec.len(), BLOCK_ELEMS, BLOCK_BYTES);
 
     let n_blocks = cols / BLOCK_ELEMS;
     let bytes_per_row = n_blocks * BLOCK_BYTES;
