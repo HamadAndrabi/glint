@@ -62,6 +62,29 @@ Snapshot restore re-validates model identity and KV cache format before importin
 
 ---
 
+## Panic and Thread Safety
+
+Every exported `extern "C"` function runs its body under `catch_unwind`. A Rust
+panic can therefore never unwind across the FFI boundary (which would be undefined
+behaviour and abort the host process): a caught panic is reported as a `NULL` handle
+or a `-1` return code, with the reason available from `glint_last_error()`. All
+incoming pointers are null-checked before use.
+
+Thread-safety follows handle ownership:
+
+- `GlintModel*` is read-only after load and may be shared across threads — any
+  number of threads may call `const GlintModel*` functions concurrently.
+- `GlintSession*` is **not** thread-safe: it owns mutable KV-cache and RNG state,
+  so driving one session from two threads at once is a data race. Use one session
+  per thread, or serialize with your own lock.
+- `glint_last_error()` is thread-local — each thread sees only its own errors.
+
+The snapshot deserialize path parses fully untrusted bytes with bounded,
+overflow-checked arithmetic (the same parser the fuzz suite exercises), so a
+malformed blob yields an error rather than an over-allocation or out-of-bounds read.
+
+---
+
 ## Notes
 
 - Cache format strings are `"f32"` and `"q8"`.

@@ -299,3 +299,25 @@ The server uses a background inference engine (`src/server/engine.rs`) that:
 - Sends tokens back through per-request `mpsc` channels
 
 The engine is wrapped in `Arc<InferenceEngine>` and shared across all route handlers.
+
+### Backpressure and slow clients
+
+Token delivery to clients never blocks the decode loop. On each generated token the
+engine performs a non-blocking `try_deliver` per active sequence, so one slow or
+stalled reader can no longer freeze decoding for everyone else:
+
+- **Healthy client** — the token is pushed onto the per-sequence outbound channel
+  and decoding continues.
+- **Disconnected client** — if the receiver has been dropped (the client hung up),
+  the sequence is finished immediately and its work is reclaimed.
+- **Too-slow client** — if a sequence's undelivered backlog grows past
+  `MAX_PENDING_TOKENS` (4096), the client is treated as unable to keep up and its
+  sequence is evicted. A finished sequence is also given a bounded `DRAIN_TIMEOUT`
+  (10 s) to accept its remaining tokens before the undelivered tail is dropped.
+
+### Fault isolation
+
+The engine's decode loop runs under `catch_unwind`. If a decode step panics, the
+panic is logged as `FATAL`, every in-flight sequence is dropped (each client
+observes its stream ending), and the engine loop is respawned rather than silently
+zombieing the server.

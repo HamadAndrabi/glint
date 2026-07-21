@@ -332,11 +332,16 @@ pub fn import_snapshot(
     // ── Session state ─────────────────────────────────────────────────────
     // `token_count` and `n_layers` are attacker-controlled on the FFI
     // deserialize path (there the "expected" meta is read from the blob
-    // itself), so clamp every preallocation to the remaining byte length —
-    // each entry consumes at least one byte, so the true count can never
-    // exceed it. A dishonest count still fails cleanly in the read loop.
+    // itself), so clamp every preallocation to what the remaining byte length
+    // could actually hold. Dividing by the minimum per-entry stream size keeps
+    // the estimate a true upper bound while stopping a merely-large hostile
+    // blob from preallocating far more than it contains. A dishonest count
+    // still fails cleanly in the read loop, and the vectors grow on their own
+    // if an honest count exceeds the estimate.
+    let remaining = bytes.len();
+    // Each token is a u32 (4 bytes).
     let token_count = r.read_u32()? as usize;
-    let mut tokens = Vec::with_capacity(token_count.min(bytes.len()));
+    let mut tokens = Vec::with_capacity(token_count.min(remaining / 4));
     for _ in 0..token_count {
         tokens.push(r.read_u32()?);
     }
@@ -345,7 +350,9 @@ pub fn import_snapshot(
     let rng_state = r.read_u64()?;
 
     // ── KV cache data ─────────────────────────────────────────────────────
-    let layer_cap = (n_layers as usize).min(bytes.len());
+    // Each layer reads a K and a V byte-vector, each prefixed by a u64 length
+    // (8 bytes), so a layer consumes at least 16 bytes of the stream.
+    let layer_cap = (n_layers as usize).min(remaining / 16);
     let mut k_layers = Vec::with_capacity(layer_cap);
     let mut v_layers = Vec::with_capacity(layer_cap);
     for _ in 0..n_layers {

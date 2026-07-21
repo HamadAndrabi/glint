@@ -150,6 +150,79 @@ The heaviest quantization coverage is in `src/tensor/dequantize.rs` and `src/ten
 
 ---
 
+## Correctness Anchors
+
+Glint's numerics are validated against two *external* references, so the kernels
+are checked against the wider ecosystem rather than only against themselves:
+
+### ggml reference vectors
+
+`scripts/gen_ggml_vectors.py` transcribes the `dequantize_row_*` algorithms from
+llama.cpp's `ggml/src/ggml-quants.c` (plus the block byte layouts from
+`ggml-common.h`) and emits hardcoded golden vectors for every supported format.
+These land in the `ggml_reference_tests` module in `src/tensor/dequantize.rs`, so
+each dequantizer is pinned to the reference output rather than to a Glint-internal
+round-trip. Regenerate them when adding or changing a format:
+
+```bash
+python3 scripts/gen_ggml_vectors.py   # prints Rust source to paste into the test module
+```
+
+### Golden-output parity vs llama.cpp
+
+`scripts/golden_parity.sh MODEL.gguf [N_TOKENS] [PROMPT]` greedy-decodes the same
+prompt through both Glint and llama.cpp at temperature 0 and requires
+byte-identical output. Because greedy decode is deterministic, any divergence
+means the two stacks disagree somewhere — tokenizer, BOS handling, quantized
+kernels, RoPE/GQA attention, or sampling.
+
+```bash
+cargo build --release
+scripts/golden_parity.sh models/SmolLM2-135M-Instruct-Q4_K_M.gguf
+```
+
+A CI workflow (`.github/workflows/parity.yml`) runs this weekly across
+`Q8_0 / Q4_K_M / Q2_K / Q3_K_M` builds of SmolLM2-135M.
+
+---
+
+## Fuzzing and Miri
+
+The two untrusted-byte surfaces — the GGUF parser and the KV-snapshot importer —
+are fuzzed under `fuzz/`. The contract each target asserts is that parsing any
+input returns `Ok`/`Err` and never panics, aborts, or attempts an unbounded
+allocation:
+
+```bash
+cargo fuzz run gguf_parse
+cargo fuzz run snapshot_import
+```
+
+CI smoke-runs both targets on every push (`fuzz-smoke` job) and runs the
+unsafe-heavy `tensor::` and `cache::` modules under Miri to catch undefined
+behaviour the tests cannot see on real hardware:
+
+```bash
+cargo miri test --no-default-features --lib -- tensor:: cache::
+```
+
+---
+
+## Continuous Integration
+
+`.github/workflows/rust.yml` gates every push and PR with:
+
+- **Build + test** on an x86_64 runner (exercises the AVX2/FMA SIMD kernels) *and*
+  an ARM64 runner (exercises the scalar fallback), each in both the default and
+  `--features cffi` configurations.
+- **Format + lint** — `cargo fmt --all --check` plus `cargo clippy --lib -D warnings`
+  for the default and `cffi` feature sets (the library surface is warning-clean).
+- **fuzz-smoke** — a short run of each fuzz target so they cannot rot.
+- **Miri** — the `tensor::`/`cache::` UB check described above.
+- **Feature checks** — `vulkan`, `python`, and `wasm` compile surfaces.
+
+---
+
 ## Adding a New Quantization Format
 
 When adding support for a new GGUF quant type:

@@ -52,7 +52,7 @@ fn check_dims(
     block_bytes: usize,
 ) {
     debug_assert!(
-        cols % block_elems == 0,
+        cols.is_multiple_of(block_elems),
         "cols ({cols}) must be a multiple of block size ({block_elems})"
     );
     debug_assert!(vec_len >= cols, "vec.len() ({vec_len}) < cols ({cols})");

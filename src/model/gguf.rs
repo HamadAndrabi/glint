@@ -656,20 +656,24 @@ impl GgufModel {
         // `tensor_count` / `metadata_kv_count` come straight from the file and
         // cannot be trusted: a hostile header could claim `u64::MAX` and turn
         // `with_capacity` into a multi-exabyte allocation (abort/OOM DoS).
-        // Every entry consumes at least a few bytes of the stream, so the true
-        // count can never exceed the remaining byte length — clamp the
-        // preallocation to that bound. The read loops below still fail cleanly
-        // via `check_remaining` if the declared count is a lie.
-        let cap_bound = bytes.len();
+        // Every entry begins with a u64 string length prefix (8 bytes: the
+        // metadata key, or the tensor name), so the true count can never exceed
+        // `remaining_bytes / 8` — clamp the preallocation to that bound rather
+        // than to the raw byte length, which would still let a merely-large
+        // hostile file (e.g. 1 GB claiming u64::MAX entries) preallocate tens of
+        // gigabytes. The read loops below still fail cleanly via
+        // `check_remaining` if the declared count is a lie, and the collections
+        // grow on their own if the (honest) count exceeds the estimate.
+        let entry_cap = bytes.len() / 8;
 
-        let mut metadata = HashMap::with_capacity(metadata_kv_count.min(cap_bound));
+        let mut metadata = HashMap::with_capacity(metadata_kv_count.min(entry_cap));
         for _ in 0..metadata_kv_count {
             let (key, value) = cursor.read_metadata_kv()?;
             metadata.insert(key, value);
         }
 
-        let mut tensor_infos = Vec::with_capacity(tensor_count.min(cap_bound));
-        let mut tensor_index = HashMap::with_capacity(tensor_count.min(cap_bound));
+        let mut tensor_infos = Vec::with_capacity(tensor_count.min(entry_cap));
+        let mut tensor_index = HashMap::with_capacity(tensor_count.min(entry_cap));
         for i in 0..tensor_count {
             let info = cursor.read_tensor_info()?;
             tensor_index.insert(info.name.clone(), i);
