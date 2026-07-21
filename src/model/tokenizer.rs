@@ -17,6 +17,12 @@ pub struct Tokenizer {
     merges: Vec<(String, String)>,
     pub bos_token_id: u32,
     pub eos_token_id: u32,
+    /// Whether prompts should be prefixed with BOS
+    /// (`tokenizer.ggml.add_bos_token`; true when the model omits the key).
+    ///
+    /// llama.cpp honours this flag, so Glint must too or greedy decode
+    /// diverges from the reference on models like SmolLM2 that set it false.
+    pub add_bos: bool,
 }
 
 impl Tokenizer {
@@ -71,13 +77,34 @@ impl Tokenizer {
             .and_then(|v| v.as_u32())
             .unwrap_or(2);
 
+        let add_bos = model
+            .metadata
+            .get("tokenizer.ggml.add_bos_token")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+
         Ok(Self {
             vocab,
             token_to_id,
             merges,
             bos_token_id,
             eos_token_id,
+            add_bos,
         })
+    }
+
+    /// Encode a prompt for generation: BPE-encode and prepend BOS if (and
+    /// only if) the model's metadata asks for it.
+    ///
+    /// Every generation entry point (CLI, server, runtime API, bindings)
+    /// should tokenize prompts through this, not raw [`encode`](Self::encode),
+    /// so BOS handling stays consistent with llama.cpp.
+    pub fn encode_prompt(&self, text: &str) -> Vec<u32> {
+        let mut tokens = self.encode(text);
+        if self.add_bos {
+            tokens.insert(0, self.bos_token_id);
+        }
+        tokens
     }
 
     /// Encode a string into token IDs using BPE.
@@ -88,10 +115,7 @@ impl Tokenizer {
 
         // Start with individual bytes as initial tokens
         // GPT-2 BPE operates on bytes represented as unicode chars in the vocab
-        let mut pieces: Vec<String> = text
-            .bytes()
-            .map(|b| self.byte_to_token(b))
-            .collect();
+        let mut pieces: Vec<String> = text.bytes().map(|b| self.byte_to_token(b)).collect();
 
         // Build a lookup for merge priority (lower index = higher priority)
         let merge_rank: HashMap<(&str, &str), usize> = self
@@ -205,8 +229,19 @@ impl Tokenizer {
     #[cfg(test)]
     pub(crate) fn bare_for_test(vocab_size: usize, bos_token_id: u32, eos_token_id: u32) -> Self {
         let vocab: Vec<String> = (0..vocab_size).map(|i| format!("tok{}", i)).collect();
-        let token_to_id = vocab.iter().enumerate().map(|(i, s)| (s.clone(), i as u32)).collect();
-        Self { vocab, token_to_id, merges: Vec::new(), bos_token_id, eos_token_id }
+        let token_to_id = vocab
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.clone(), i as u32))
+            .collect();
+        Self {
+            vocab,
+            token_to_id,
+            merges: Vec::new(),
+            bos_token_id,
+            eos_token_id,
+            add_bos: true,
+        }
     }
 }
 
@@ -219,9 +254,9 @@ fn gpt2_byte_to_char(byte: u8) -> char {
     let b = byte as u32;
     let cp = match b {
         // Printable ASCII range (except space/delete edge cases)
-        33..=126 => b,      // '!' to '~'
-        161..=172 => b,     // '¡' to '¬'
-        174..=255 => b,     // '®' to 'ÿ'
+        33..=126 => b,  // '!' to '~'
+        161..=172 => b, // '¡' to '¬'
+        174..=255 => b, // '®' to 'ÿ'
         // Everything else gets mapped to U+0100+
         _ => 256 + b - b.min(32), // offset to avoid collisions
     };
@@ -242,8 +277,8 @@ fn gpt2_char_to_byte(ch: char) -> u8 {
         161..=172 => cp as u8,
         174..=255 => cp as u8,
         // Reverse the special mappings
-        256..=288 => (cp - 256) as u8,         // 0..=32
-        289..=322 => (127 + cp - 289) as u8,   // 127..=160
+        256..=288 => (cp - 256) as u8,       // 0..=32
+        289..=322 => (127 + cp - 289) as u8, // 127..=160
         323 => 173u8,
         _ => b'?', // fallback
     }
@@ -259,7 +294,11 @@ mod tests {
         for b in 0..=255u8 {
             let ch = gpt2_byte_to_char(b);
             let back = gpt2_char_to_byte(ch);
-            assert_eq!(b, back, "Byte {} -> char {:?} (U+{:04X}) -> {}", b, ch, ch as u32, back);
+            assert_eq!(
+                b, back,
+                "Byte {} -> char {:?} (U+{:04X}) -> {}",
+                b, ch, ch as u32, back
+            );
         }
     }
 

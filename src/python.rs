@@ -38,8 +38,8 @@ impl GlintLLM {
     /// incomplete.
     #[new]
     fn new(model_path: &str) -> PyResult<Self> {
-        let model = Model::load(Path::new(model_path))
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let model =
+            Model::load(Path::new(model_path)).map_err(|e| PyValueError::new_err(e.to_string()))?;
         Ok(Self { model })
     }
 
@@ -90,7 +90,8 @@ impl GlintLLM {
             lora_adapter: None,
         };
 
-        let new_tokens = self.model
+        let new_tokens = self
+            .model
             .generate(prompt, &opts, &mut None)
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
 

@@ -83,11 +83,7 @@ impl Pipeline {
                 include_str!("shaders/softmax.wgsl"),
                 "main",
             ),
-            (
-                PipelineKind::Add,
-                include_str!("shaders/add.wgsl"),
-                "main",
-            ),
+            (PipelineKind::Add, include_str!("shaders/add.wgsl"), "main"),
             (
                 PipelineKind::Attention,
                 include_str!("shaders/attention.wgsl"),

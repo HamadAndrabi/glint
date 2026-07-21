@@ -194,16 +194,11 @@ pub fn jinja_preprocess(template: &str) -> String {
 /// Always returns `Err` with an explanation.  To produce a prompt today,
 /// use [`ChatTemplate::detect`] + [`ChatTemplate::apply`].
 #[cfg(feature = "full-jinja")]
-pub fn apply_full_jinja(
-    _template: &str,
-    _messages: &[Message<'_>],
-) -> Result<String, String> {
-    Err(
-        "full-jinja: minijinja integration is not yet implemented. \
+pub fn apply_full_jinja(_template: &str, _messages: &[Message<'_>]) -> Result<String, String> {
+    Err("full-jinja: minijinja integration is not yet implemented. \
          Use ChatTemplate::detect + ChatTemplate::apply for format-matched rendering, \
          or remove the full-jinja feature flag."
-            .to_string(),
-    )
+        .to_string())
 }
 
 // ── Format implementations ──────────────────────────────────────────────────
@@ -313,7 +308,11 @@ fn apply_gemma(messages: &[Message<'_>]) -> String {
     for msg in messages {
         prompt.push_str("<start_of_turn>");
         // Gemma convention: "assistant" → "model"
-        let role = if msg.role == "assistant" { "model" } else { msg.role };
+        let role = if msg.role == "assistant" {
+            "model"
+        } else {
+            msg.role
+        };
         prompt.push_str(role);
         prompt.push('\n');
         prompt.push_str(msg.content);
@@ -345,16 +344,31 @@ mod tests {
 
     fn sample_messages() -> Vec<Message<'static>> {
         vec![
-            Message { role: "system", content: "You are helpful." },
-            Message { role: "user", content: "Hi!" },
+            Message {
+                role: "system",
+                content: "You are helpful.",
+            },
+            Message {
+                role: "user",
+                content: "Hi!",
+            },
         ]
     }
 
     fn multi_turn() -> Vec<Message<'static>> {
         vec![
-            Message { role: "user", content: "Hello" },
-            Message { role: "assistant", content: "Hi there!" },
-            Message { role: "user", content: "How are you?" },
+            Message {
+                role: "user",
+                content: "Hello",
+            },
+            Message {
+                role: "assistant",
+                content: "Hi there!",
+            },
+            Message {
+                role: "user",
+                content: "How are you?",
+            },
         ]
     }
 
@@ -391,7 +405,10 @@ mod tests {
 
     #[test]
     fn test_detect_unknown() {
-        assert_eq!(ChatTemplate::detect("some unknown template"), ChatTemplate::Generic);
+        assert_eq!(
+            ChatTemplate::detect("some unknown template"),
+            ChatTemplate::Generic
+        );
     }
 
     #[test]
@@ -429,7 +446,10 @@ mod tests {
     fn test_mistral_multi_turn() {
         let msgs = multi_turn();
         let result = ChatTemplate::MistralInstruct.apply(&msgs);
-        assert_eq!(result, "[INST] Hello [/INST] Hi there!</s>[INST] How are you? [/INST]");
+        assert_eq!(
+            result,
+            "[INST] Hello [/INST] Hi there!</s>[INST] How are you? [/INST]"
+        );
     }
 
     #[test]
@@ -479,7 +499,10 @@ mod tests {
         assert!(!out.contains("{%-"), "leading strip not removed");
         assert!(!out.contains("-%}"), "trailing strip not removed");
         assert!(!out.contains("{{-"), "expression leading strip not removed");
-        assert!(!out.contains("-}}"), "expression trailing strip not removed");
+        assert!(
+            !out.contains("-}}"),
+            "expression trailing strip not removed"
+        );
         // Core content preserved
         assert!(out.contains("for message in messages"));
         assert!(out.contains("message['content']"));
@@ -494,7 +517,10 @@ mod tests {
                    {{ message.content }}<|im_end|>\n\
                    {% endfor %}";
         let out = jinja_preprocess(tpl);
-        assert!(!out.contains("namespace("), "namespace setup line not removed");
+        assert!(
+            !out.contains("namespace("),
+            "namespace setup line not removed"
+        );
         // Format marker and loop body must survive
         assert!(out.contains("<|im_start|>"));
         assert!(out.contains("message.content"));

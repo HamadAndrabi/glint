@@ -42,11 +42,19 @@ pub enum GlintError {
     /// The snapshot's model hash does not match the loaded model.
     SnapshotModelMismatch { expected: u64, found: u64 },
     /// A metadata field in the snapshot does not match the loaded model.
-    SnapshotMetaMismatch { field: &'static str, expected: u64, found: u64 },
+    SnapshotMetaMismatch {
+        field: &'static str,
+        expected: u64,
+        found: u64,
+    },
     /// The snapshot data is truncated or otherwise malformed.
     SnapshotTruncated,
     /// The snapshot cache data cannot be imported into a cache with different dimensions.
-    SnapshotCacheSizeMismatch { layer: usize, expected: usize, found: usize },
+    SnapshotCacheSizeMismatch {
+        layer: usize,
+        expected: usize,
+        found: usize,
+    },
 }
 
 impl fmt::Display for GlintError {
@@ -56,7 +64,10 @@ impl fmt::Display for GlintError {
                 write!(f, "tensor '{name}' not found in model")
             }
             Self::InvalidTensorShape { name, ndim } => {
-                write!(f, "tensor '{name}' has unexpected {ndim}-D shape (expected 1-D or 2-D)")
+                write!(
+                    f,
+                    "tensor '{name}' has unexpected {ndim}-D shape (expected 1-D or 2-D)"
+                )
             }
             Self::TensorReadError { name, detail } => {
                 write!(f, "failed to read tensor '{name}': {detail}")
@@ -72,11 +83,17 @@ impl fmt::Display for GlintError {
                 write!(f, "model metadata is missing 'tokenizer.ggml.tokens'")
             }
             Self::MissingModelConfig => {
-                write!(f, "could not extract model configuration from GGUF metadata")
+                write!(
+                    f,
+                    "could not extract model configuration from GGUF metadata"
+                )
             }
             #[cfg(feature = "vulkan")]
             Self::GpuAdapterNotFound => {
-                write!(f, "no compatible GPU adapter found (need Vulkan, Metal, or DX12)")
+                write!(
+                    f,
+                    "no compatible GPU adapter found (need Vulkan, Metal, or DX12)"
+                )
             }
             #[cfg(feature = "vulkan")]
             Self::GpuDeviceError(msg) => write!(f, "GPU device error: {msg}"),
@@ -84,19 +101,41 @@ impl fmt::Display for GlintError {
             Self::GpuBufferError(msg) => write!(f, "GPU buffer error: {msg}"),
             #[cfg(feature = "vulkan")]
             Self::GpuShaderError(msg) => write!(f, "GPU shader error: {msg}"),
-            Self::SnapshotBadMagic => write!(f, "snapshot: invalid magic bytes (not a Glint snapshot)"),
+            Self::SnapshotBadMagic => {
+                write!(f, "snapshot: invalid magic bytes (not a Glint snapshot)")
+            }
             Self::SnapshotVersionUnsupported { found, current } => {
-                write!(f, "snapshot version {found} is not supported (current: {current})")
+                write!(
+                    f,
+                    "snapshot version {found} is not supported (current: {current})"
+                )
             }
             Self::SnapshotModelMismatch { expected, found } => {
-                write!(f, "snapshot model hash mismatch: expected {expected:#018x}, found {found:#018x}")
+                write!(
+                    f,
+                    "snapshot model hash mismatch: expected {expected:#018x}, found {found:#018x}"
+                )
             }
-            Self::SnapshotMetaMismatch { field, expected, found } => {
-                write!(f, "snapshot metadata mismatch in '{field}': expected {expected}, found {found}")
+            Self::SnapshotMetaMismatch {
+                field,
+                expected,
+                found,
+            } => {
+                write!(
+                    f,
+                    "snapshot metadata mismatch in '{field}': expected {expected}, found {found}"
+                )
             }
             Self::SnapshotTruncated => write!(f, "snapshot data is truncated or malformed"),
-            Self::SnapshotCacheSizeMismatch { layer, expected, found } => {
-                write!(f, "snapshot cache layer {layer}: expected {expected} bytes, found {found}")
+            Self::SnapshotCacheSizeMismatch {
+                layer,
+                expected,
+                found,
+            } => {
+                write!(
+                    f,
+                    "snapshot cache layer {layer}: expected {expected} bytes, found {found}"
+                )
             }
         }
     }

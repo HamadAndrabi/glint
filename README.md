@@ -12,7 +12,6 @@
 
   <p>
     <img alt="Rust" src="https://img.shields.io/badge/Rust-2021-black?logo=rust" />
-    <img alt="Tests" src="https://img.shields.io/badge/tests-156%20passing-success" />
     <img alt="License" src="https://img.shields.io/badge/license-MIT-blue" />
   </p>
 </div>
@@ -64,8 +63,8 @@ CI validates these build surfaces on every push and pull request:
 
 ### Quantization
 
-- Five commonly used GGUF quantization formats: `Q8_0`, `Q4_0`, `Q4_K`, `Q5_K`, `Q6_K`
-- SIMD kernels for all supported formats on AVX2+FMA systems
+- Eight GGUF quantization formats: `Q8_0`, `Q4_0`, `Q4_K`, `Q5_K`, `Q6_K`, `Q2_K`, `Q3_K`, `IQ4_NL`
+- AVX2+FMA SIMD kernels for the five hottest formats (`Q8_0`, `Q4_0`, `Q4_K`, `Q5_K`, `Q6_K`); the rest use the scalar path
 - Compressed weights stay compressed in memory
 - Example footprint: a 135M-parameter `Q8_0` model is about 140 MB in memory versus about 540 MB dequantized
 
@@ -251,7 +250,10 @@ curl http://localhost:8080/health
 
 ## Benchmarks
 
-Matvec throughput at `4096 x 4096` (Llama 3 8B scale), AVX2+FMA, Rayon:
+Matvec throughput at `4096 x 4096` (Llama 3 8B scale), AVX2+FMA, Rayon.
+Reproduce with `cargo bench --bench matvec` on your own hardware — absolute
+numbers are machine-dependent, so treat these as relative ordering, not a
+cross-machine baseline:
 
 | Format | Throughput | Time |
 | --- | --- | --- |
@@ -359,13 +361,30 @@ demo/
 
 ## Testing
 
-The library test suite currently covers tokenizer behavior, GGUF parsing, quantization paths, tensor ops, sampling, KV-cache handling, transformer forward logic, snapshot resume, and C FFI edge cases.
+The library test suite currently covers tokenizer behavior, GGUF parsing (including
+adversarial/malformed headers), quantization paths, tensor ops, sampling, KV-cache
+handling, transformer forward logic, snapshot resume, and C FFI edge cases.
 
 ```bash
-cargo test --lib
+cargo test --lib                   # default surface
+cargo test --lib --features cffi   # + C FFI edge cases
 ```
 
-Current status: **149** library tests passing by default, **156** with the `cffi` feature enabled.
+It also fuzzes the two untrusted-byte surfaces — the GGUF parser and the KV-snapshot
+importer — under `fuzz/` (`cargo fuzz run gguf_parse` / `snapshot_import`), which CI
+smoke-runs on every push, and runs the unsafe-heavy `tensor::`/`cache::` modules
+under Miri.
+
+Two external anchors keep the numerics honest:
+
+- **ggml reference vectors** — hardcoded dequantization outputs for every
+  supported format, derived independently from llama.cpp's `ggml-quants.c`
+  (`ggml_reference_tests` in `src/tensor/dequantize.rs`), so the kernels are
+  validated against the ecosystem's reference rather than against Glint itself.
+- **Golden-output parity** — `scripts/golden_parity.sh model.gguf` greedy-decodes
+  the same prompt through Glint and llama.cpp and requires byte-identical output.
+  A CI workflow runs this weekly across Q8_0 / Q4_K_M / Q2_K / Q3_K_M builds of
+  SmolLM2-135M (mixed-format files also cover Q5_0, Q5_1, Q6_K).
 
 ## License
 

@@ -8,8 +8,8 @@ use crate::error::GlintError;
 use crate::model::config::ModelConfig;
 use crate::model::gguf::GgufModel;
 use crate::model::lora::LoraWeights;
-use crate::tensor::{load_tensor_f32, QuantizedTensor, Tensor};
 use crate::tensor::quantized::WeightLoadMode;
+use crate::tensor::{load_tensor_f32, QuantizedTensor, Tensor};
 
 /// All weights for a single transformer block (one layer).
 pub struct LayerWeights {
@@ -78,17 +78,20 @@ impl TransformerWeights {
             eprint!("\rLoading layer {}/{}...", i + 1, config.block_count);
             layers.push(LayerWeights {
                 attn_norm: load_tensor_f32(model, &format!("blk.{i}.attn_norm.weight"))?,
-                ffn_norm:  load_tensor_f32(model, &format!("blk.{i}.ffn_norm.weight"))?,
-                attn_q:      load(&format!("blk.{i}.attn_q.weight"))?,
-                attn_k:      load(&format!("blk.{i}.attn_k.weight"))?,
-                attn_v:      load(&format!("blk.{i}.attn_v.weight"))?,
+                ffn_norm: load_tensor_f32(model, &format!("blk.{i}.ffn_norm.weight"))?,
+                attn_q: load(&format!("blk.{i}.attn_q.weight"))?,
+                attn_k: load(&format!("blk.{i}.attn_k.weight"))?,
+                attn_v: load(&format!("blk.{i}.attn_v.weight"))?,
                 attn_output: load(&format!("blk.{i}.attn_output.weight"))?,
-                ffn_gate:    load(&format!("blk.{i}.ffn_gate.weight"))?,
-                ffn_up:      load(&format!("blk.{i}.ffn_up.weight"))?,
-                ffn_down:    load(&format!("blk.{i}.ffn_down.weight"))?,
+                ffn_gate: load(&format!("blk.{i}.ffn_gate.weight"))?,
+                ffn_up: load(&format!("blk.{i}.ffn_up.weight"))?,
+                ffn_down: load(&format!("blk.{i}.ffn_down.weight"))?,
             });
         }
-        eprintln!("\rLoaded {}/{} layers.       ", config.block_count, config.block_count);
+        eprintln!(
+            "\rLoaded {}/{} layers.       ",
+            config.block_count, config.block_count
+        );
 
         eprintln!("Loading output weights...");
         let output_norm = load_tensor_f32(model, "output_norm.weight")?;
@@ -100,7 +103,13 @@ impl TransformerWeights {
             token_embedding.clone()
         };
 
-        Ok(Self { token_embedding, layers, output_norm, output, lora: None })
+        Ok(Self {
+            token_embedding,
+            layers,
+            output_norm,
+            output,
+            lora: None,
+        })
     }
 
     /// Upload all quantized weight tensors to the GPU.
@@ -118,10 +127,16 @@ impl TransformerWeights {
             layer.attn_q.upload_to_gpu(gpu, &format!("blk.{i}.attn_q"));
             layer.attn_k.upload_to_gpu(gpu, &format!("blk.{i}.attn_k"));
             layer.attn_v.upload_to_gpu(gpu, &format!("blk.{i}.attn_v"));
-            layer.attn_output.upload_to_gpu(gpu, &format!("blk.{i}.attn_output"));
-            layer.ffn_gate.upload_to_gpu(gpu, &format!("blk.{i}.ffn_gate"));
+            layer
+                .attn_output
+                .upload_to_gpu(gpu, &format!("blk.{i}.attn_output"));
+            layer
+                .ffn_gate
+                .upload_to_gpu(gpu, &format!("blk.{i}.ffn_gate"));
             layer.ffn_up.upload_to_gpu(gpu, &format!("blk.{i}.ffn_up"));
-            layer.ffn_down.upload_to_gpu(gpu, &format!("blk.{i}.ffn_down"));
+            layer
+                .ffn_down
+                .upload_to_gpu(gpu, &format!("blk.{i}.ffn_down"));
         }
         eprintln!("\r  Uploaded all layers.       ");
     }

@@ -9,17 +9,17 @@ use std::time::Instant;
 
 use glint::api::Model as GlintModel;
 use glint::bench;
+#[cfg(feature = "server")]
+use glint::constrained::VocabIndex;
 use glint::model::chat_template::{ChatTemplate, Message};
 use glint::model::config::ModelConfig;
 use glint::model::gguf::GgufModel;
 #[cfg(feature = "server")]
+use glint::model::lora_registry::AdapterRegistry;
+#[cfg(feature = "server")]
 use glint::model::pull::{pull_model, search_huggingface};
 use glint::model::tokenizer::Tokenizer;
 use glint::sampling::{Sampler, SamplerConfig};
-#[cfg(feature = "server")]
-use glint::constrained::VocabIndex;
-#[cfg(feature = "server")]
-use glint::model::lora_registry::AdapterRegistry;
 #[cfg(feature = "server")]
 use glint::server::{AppState, InferenceEngine, Metrics};
 #[cfg(feature = "server")]
@@ -340,7 +340,16 @@ async fn main() {
             iters,
             output,
         } => {
-            bench_model(&file, &mode, prompt_len, decode_tokens, max_concurrent, warmup, iters, output.as_deref());
+            bench_model(
+                &file,
+                &mode,
+                prompt_len,
+                decode_tokens,
+                max_concurrent,
+                warmup,
+                iters,
+                output.as_deref(),
+            );
         }
     }
 }
@@ -428,7 +437,16 @@ fn main() {
             iters,
             output,
         } => {
-            bench_model(&file, &mode, prompt_len, decode_tokens, max_concurrent, warmup, iters, output.as_deref());
+            bench_model(
+                &file,
+                &mode,
+                prompt_len,
+                decode_tokens,
+                max_concurrent,
+                warmup,
+                iters,
+                output.as_deref(),
+            );
         }
     }
 }
@@ -603,9 +621,7 @@ fn run_model(
     };
     eprintln!("Tokenizer: {} tokens", tokenizer.vocab_size());
 
-    let mut prompt_tokens = tokenizer.encode(prompt);
-    // Prepend BOS token
-    prompt_tokens.insert(0, tokenizer.bos_token_id);
+    let prompt_tokens = tokenizer.encode_prompt(prompt);
 
     eprintln!("Prompt: {:?}", prompt);
     eprintln!(
@@ -794,8 +810,7 @@ fn summarize_messages(
     }
     transcript.push_str("\nSummary:");
 
-    let mut prompt_tokens = tokenizer.encode(&transcript);
-    prompt_tokens.insert(0, tokenizer.bos_token_id);
+    let prompt_tokens = tokenizer.encode_prompt(&transcript);
 
     let max_summary_tokens = 120usize;
     let available = context_budget.saturating_sub(prompt_tokens.len());
@@ -930,8 +945,7 @@ fn chat_model(
                 .map(|(role, content)| Message { role, content })
                 .collect();
             let prompt = chat_template.apply(&msgs);
-            let mut tokens = tokenizer.encode(&prompt);
-            tokens.insert(0, tokenizer.bos_token_id);
+            let mut tokens = tokenizer.encode_prompt(&prompt);
 
             if tokens.len() + max_tokens <= context_budget {
                 break tokens;
@@ -1087,9 +1101,16 @@ async fn serve_model(path: &PathBuf, host: &str, port: u16, use_gpu: bool, kv_ca
     // Parse cache format from CLI arg.
     let cache_format = match kv_cache {
         "q8" => CacheFormat::Q8,
-        _    => CacheFormat::F32,
+        _ => CacheFormat::F32,
     };
-    eprintln!("KV-cache format: {}", if cache_format == CacheFormat::Q8 { "Q8 (quantised)" } else { "F32 (full precision)" });
+    eprintln!(
+        "KV-cache format: {}",
+        if cache_format == CacheFormat::Q8 {
+            "Q8 (quantised)"
+        } else {
+            "F32 (full precision)"
+        }
+    );
 
     // Start the concurrent round-robin inference engine on a dedicated OS
     // thread. The engine owns the GPU backend (if any) and all active KV
@@ -1103,7 +1124,7 @@ async fn serve_model(path: &PathBuf, host: &str, port: u16, use_gpu: bool, kv_ca
     // Build an empty adapter registry (adapters can be pre-loaded here in future
     // via a --lora-adapter flag; for now the registry starts empty).
     let adapter_registry = Arc::new(std::sync::RwLock::new(AdapterRegistry::new()));
-    let engine_registry  = Arc::new(AdapterRegistry::new()); // immutable snapshot for engine
+    let engine_registry = Arc::new(AdapterRegistry::new()); // immutable snapshot for engine
 
     let engine = Arc::new(InferenceEngine::start(
         Arc::clone(&weights),
@@ -1112,6 +1133,7 @@ async fn serve_model(path: &PathBuf, host: &str, port: u16, use_gpu: bool, kv_ca
         cache_format,
         Arc::clone(&vocab_index),
         engine_registry,
+        glint::server::EngineLimits::default(),
     ));
 
     let state = AppState {
@@ -1148,15 +1170,17 @@ fn bench_model(
         }
     };
     eprintln!("Model loaded. Running benchmark mode: {mode}");
-    eprintln!("  prompt_len={prompt_len}  decode_tokens={decode_tokens}  warmup={warmup}  iters={iters}");
+    eprintln!(
+        "  prompt_len={prompt_len}  decode_tokens={decode_tokens}  warmup={warmup}  iters={iters}"
+    );
     eprintln!();
 
     let mut results: Vec<bench::BenchResult> = Vec::new();
 
     let run_prefill = matches!(mode, "all" | "prefill");
-    let run_decode  = matches!(mode, "all" | "decode");
-    let run_conc    = matches!(mode, "all" | "concurrency");
-    let run_cache   = matches!(mode, "all" | "cache-format");
+    let run_decode = matches!(mode, "all" | "decode");
+    let run_conc = matches!(mode, "all" | "concurrency");
+    let run_cache = matches!(mode, "all" | "cache-format");
 
     if run_prefill {
         eprintln!("  [1/4] Prefill benchmark...");
@@ -1164,7 +1188,13 @@ fn bench_model(
     }
     if run_decode {
         eprintln!("  [2/4] Decode benchmark...");
-        results.push(bench::run_decode_bench(&model, prompt_len, decode_tokens, warmup, iters));
+        results.push(bench::run_decode_bench(
+            &model,
+            prompt_len,
+            decode_tokens,
+            warmup,
+            iters,
+        ));
     }
     if run_conc {
         eprintln!("  [3/4] Concurrency benchmark (1..={max_concurrent} sessions)...");
@@ -1174,13 +1204,26 @@ fn bench_model(
             .collect();
         for n in levels {
             eprint!("    n={n}... ");
-            results.push(bench::run_concurrency_bench(&model, n, prompt_len, decode_tokens, warmup, iters));
+            results.push(bench::run_concurrency_bench(
+                &model,
+                n,
+                prompt_len,
+                decode_tokens,
+                warmup,
+                iters,
+            ));
             eprintln!("done");
         }
     }
     if run_cache {
         eprintln!("  [4/4] Cache-format benchmark (f32 vs q8)...");
-        results.extend(bench::run_cache_format_bench(&model, prompt_len, decode_tokens, warmup, iters));
+        results.extend(bench::run_cache_format_bench(
+            &model,
+            prompt_len,
+            decode_tokens,
+            warmup,
+            iters,
+        ));
     }
 
     eprintln!();

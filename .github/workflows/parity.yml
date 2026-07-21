@@ -1,0 +1,60 @@
+name: Golden parity vs llama.cpp
+
+# Greedy-decode the same prompts through Glint and llama.cpp and require
+# byte-identical output. This anchors the whole stack — GGUF parsing,
+# tokenizer, quantized kernels (SIMD on this x86_64 runner), RoPE/GQA
+# attention, and greedy sampling — against the reference implementation.
+#
+# Runs weekly and on demand rather than per-push: it downloads ~450 MB of
+# models (cached between runs) and builds llama.cpp.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 6 * * 1" # Mondays 06:17 UTC
+
+jobs:
+  parity:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build glint (release)
+        run: cargo build --release
+
+      - name: Install llama.cpp
+        run: |
+          curl -sL -o llama.tar.gz \
+            https://github.com/ggml-org/llama.cpp/releases/latest/download/llama-bin-ubuntu-x64.tar.gz \
+            && tar xzf llama.tar.gz || {
+            # Fall back to building from source if the release asset moved.
+            git clone --depth 1 https://github.com/ggml-org/llama.cpp
+            cmake -S llama.cpp -B llama.cpp/build -DCMAKE_BUILD_TYPE=Release
+            cmake --build llama.cpp/build -j --target llama-cli
+            mkdir -p build/bin && cp llama.cpp/build/bin/llama-cli build/bin/
+          }
+          echo "$GITHUB_WORKSPACE/build/bin" >> "$GITHUB_PATH"
+
+      - name: Cache models
+        uses: actions/cache@v4
+        with:
+          path: models
+          key: parity-models-smollm2-135m-v1
+
+      - name: Download models (cache miss only)
+        run: |
+          mkdir -p models
+          for q in Q8_0 Q4_K_M Q2_K Q3_K_M; do
+            f="models/SmolLM2-135M-Instruct-$q.gguf"
+            [ -f "$f" ] || curl -sL --retry 3 -o "$f" \
+              "https://huggingface.co/bartowski/SmolLM2-135M-Instruct-GGUF/resolve/main/SmolLM2-135M-Instruct-$q.gguf"
+            head -c 4 "$f" | grep -q GGUF
+          done
+
+      - name: Parity check (all quant formats)
+        run: |
+          fail=0
+          for q in Q8_0 Q4_K_M Q2_K Q3_K_M; do
+            scripts/golden_parity.sh "models/SmolLM2-135M-Instruct-$q.gguf" || fail=1
+          done
+          exit $fail

@@ -16,7 +16,6 @@ use crate::model::lora_registry::AdapterRegistry;
 use crate::model::tokenizer::Tokenizer;
 use crate::transformer::TransformerWeights;
 
-
 /// All the data needed to serve inference requests.
 ///
 /// Created once at startup and shared across all request handlers via `Arc`.

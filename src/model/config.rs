@@ -39,11 +39,15 @@ impl ModelConfig {
         let arch = &architecture;
 
         let get_u32 = |key: &str| -> Option<u32> {
-            metadata.get(&format!("{arch}.{key}")).and_then(|v| v.as_u32())
+            metadata
+                .get(&format!("{arch}.{key}"))
+                .and_then(|v| v.as_u32())
         };
 
         let get_f32 = |key: &str| -> Option<f32> {
-            metadata.get(&format!("{arch}.{key}")).and_then(|v| v.as_f32())
+            metadata
+                .get(&format!("{arch}.{key}"))
+                .and_then(|v| v.as_f32())
         };
 
         let context_length = get_u32("context_length")?;
@@ -63,8 +67,8 @@ impl ModelConfig {
         let rms_norm_eps = get_f32("attention.layer_norm_rms_epsilon").unwrap_or(1e-5);
         let rope_freq_base = get_f32("rope.freq_base");
         let sliding_window = get_u32("sliding_window");
-        let rope_scaling_factor = get_f32("rope_scaling.factor")
-            .or_else(|| get_f32("rope.scaling.factor"));
+        let rope_scaling_factor =
+            get_f32("rope_scaling.factor").or_else(|| get_f32("rope.scaling.factor"));
         let partial_rotary_factor = get_f32("partial_rotary_factor");
 
         let chat_template = metadata

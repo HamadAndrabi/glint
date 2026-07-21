@@ -83,3 +83,13 @@ Constraint state is rebuilt from the stored generated suffix, so constrained gen
 - `CacheFormat::Q8` snapshots preserve the Q8 KV cache format; Glint validates the cache format before import.
 - The snapshot format is versioned. Older blobs may need re-export if the format changes.
 - The session API is synchronous; higher-level async/server surfaces build on top of it.
+
+### Importing untrusted snapshots
+
+A snapshot blob is treated as fully untrusted input (it may cross the C FFI / WASM
+boundary). `import_snapshot_bytes()` reads every length and offset field from the
+header with overflow-checked, saturating arithmetic and clamps any file-supplied
+count to the blob's actual byte length before allocating, so a hostile or corrupt
+header cannot wrap a bounds check or trigger an unbounded allocation. Use
+`peek_snapshot_metadata()` to read a blob's identity/dimensions before committing to
+a full import. This importer is covered by the `snapshot_import` fuzz target.

@@ -33,10 +33,10 @@ impl LoraAdapter {
     ///
     /// `x.len()` must equal `in_dim`; `out.len()` must equal `out_dim`.
     pub fn apply(&self, x: &[f32], out: &mut [f32]) {
-        let rank    = self.a.shape()[0];
-        let in_dim  = self.a.shape()[1];
+        let rank = self.a.shape()[0];
+        let in_dim = self.a.shape()[1];
         let out_dim = self.b.shape()[0];
-        debug_assert_eq!(x.len(),   in_dim,  "lora A in_dim mismatch");
+        debug_assert_eq!(x.len(), in_dim, "lora A in_dim mismatch");
         debug_assert_eq!(out.len(), out_dim, "lora B out_dim mismatch");
 
         let a_data = self.a.data();
@@ -51,7 +51,7 @@ impl LoraAdapter {
 
         // out += scale * B @ tmp
         for o in 0..out_dim {
-            let row   = &b_data[o * rank..(o + 1) * rank];
+            let row = &b_data[o * rank..(o + 1) * rank];
             let delta: f32 = row.iter().zip(&tmp).map(|(b, t)| b * t).sum();
             out[o] += self.scale * delta;
         }
@@ -63,13 +63,13 @@ impl LoraAdapter {
 /// Each field is `None` when the adapter file does not target that projection.
 #[derive(Default, Debug)]
 pub struct LoraLayerAdapters {
-    pub attn_q:      Option<LoraAdapter>,
-    pub attn_k:      Option<LoraAdapter>,
-    pub attn_v:      Option<LoraAdapter>,
+    pub attn_q: Option<LoraAdapter>,
+    pub attn_k: Option<LoraAdapter>,
+    pub attn_v: Option<LoraAdapter>,
     pub attn_output: Option<LoraAdapter>,
-    pub ffn_gate:    Option<LoraAdapter>,
-    pub ffn_up:      Option<LoraAdapter>,
-    pub ffn_down:    Option<LoraAdapter>,
+    pub ffn_gate: Option<LoraAdapter>,
+    pub ffn_up: Option<LoraAdapter>,
+    pub ffn_down: Option<LoraAdapter>,
 }
 
 /// All LoRA adapters loaded from a GGUF adapter file.
@@ -85,7 +85,8 @@ impl LoraWeights {
     /// Returns `None` if the file contains no `lora_a`/`lora_b` tensors.
     pub fn load(model: &GgufModel, n_layers: usize) -> Option<Self> {
         // Optional alpha from metadata — 0 means "use rank" (scale = 1.0).
-        let alpha: f32 = model.metadata
+        let alpha: f32 = model
+            .metadata
             .get("adapter.lora.alpha")
             .and_then(|v| v.as_f32())
             .unwrap_or(0.0);
@@ -115,27 +116,39 @@ impl LoraWeights {
             .collect();
 
         for (base, a) in a_map {
-            let Some(b) = b_map.remove(&base) else { continue };
-            let rank  = a.shape()[0];
-            let scale = if alpha > 0.0 { alpha / rank as f32 } else { 1.0 };
+            let Some(b) = b_map.remove(&base) else {
+                continue;
+            };
+            let rank = a.shape()[0];
+            let scale = if alpha > 0.0 {
+                alpha / rank as f32
+            } else {
+                1.0
+            };
             let adapter = LoraAdapter { a, b, scale };
 
             // Parse "blk.{i}.{proj}.weight" or "blk.{i}.{proj}"
             let parts: Vec<&str> = base.split('.').collect();
-            if parts.len() < 3 || parts[0] != "blk" { continue }
-            let Ok(layer_idx) = parts[1].parse::<usize>() else { continue };
-            if layer_idx >= n_layers { continue }
+            if parts.len() < 3 || parts[0] != "blk" {
+                continue;
+            }
+            let Ok(layer_idx) = parts[1].parse::<usize>() else {
+                continue;
+            };
+            if layer_idx >= n_layers {
+                continue;
+            }
 
             let proj = parts[2..].join(".");
-            let ll   = &mut layers[layer_idx];
+            let ll = &mut layers[layer_idx];
             match proj.as_str() {
-                "attn_q.weight"      | "attn_q"      => ll.attn_q      = Some(adapter),
-                "attn_k.weight"      | "attn_k"      => ll.attn_k      = Some(adapter),
-                "attn_v.weight"      | "attn_v"      => ll.attn_v      = Some(adapter),
+                "attn_q.weight" | "attn_q" => ll.attn_q = Some(adapter),
+                "attn_k.weight" | "attn_k" => ll.attn_k = Some(adapter),
+                "attn_v.weight" | "attn_v" => ll.attn_v = Some(adapter),
                 "attn_output.weight" | "attn_output" => ll.attn_output = Some(adapter),
-                "ffn_gate.weight"    | "ffn_gate"    => ll.ffn_gate    = Some(adapter),
-                "ffn_up.weight"      | "ffn_up"      => ll.ffn_up      = Some(adapter),
-                "ffn_down.weight"    | "ffn_down"    => ll.ffn_down    = Some(adapter),
+                "ffn_gate.weight" | "ffn_gate" => ll.ffn_gate = Some(adapter),
+                "ffn_up.weight" | "ffn_up" => ll.ffn_up = Some(adapter),
+                "ffn_down.weight" | "ffn_down" => ll.ffn_down = Some(adapter),
                 _ => {}
             }
         }
@@ -150,7 +163,13 @@ impl LoraWeights {
 mod tests {
     use super::*;
 
-    fn adapter(a_data: Vec<f32>, a_shape: &[usize], b_data: Vec<f32>, b_shape: &[usize], scale: f32) -> LoraAdapter {
+    fn adapter(
+        a_data: Vec<f32>,
+        a_shape: &[usize],
+        b_data: Vec<f32>,
+        b_shape: &[usize],
+        scale: f32,
+    ) -> LoraAdapter {
         LoraAdapter {
             a: Tensor::from_vec(a_data, a_shape),
             b: Tensor::from_vec(b_data, b_shape),
@@ -164,7 +183,7 @@ mod tests {
         // A = [[1,0]], B = [[1],[0]], scale=1.0  =>  B@A = [[1,0],[0,0]]
         // x=[3,4] => A@x=[3], B@[3]=[3,0]
         let ad = adapter(vec![1.0, 0.0], &[1, 2], vec![1.0, 0.0], &[2, 1], 1.0);
-        let x  = [3.0f32, 4.0];
+        let x = [3.0f32, 4.0];
         let mut out = [0.0f32, 0.0];
         ad.apply(&x, &mut out);
         assert!((out[0] - 3.0).abs() < 1e-6, "out[0]={}", out[0]);
@@ -187,8 +206,10 @@ mod tests {
         // rank=2, in_dim=2, out_dim=2
         // A = [[1,0],[0,1]], B = [[1,0],[0,1]], scale=1 => identity
         let ad = adapter(
-            vec![1.0, 0.0,  0.0, 1.0], &[2, 2],
-            vec![1.0, 0.0,  0.0, 1.0], &[2, 2],
+            vec![1.0, 0.0, 0.0, 1.0],
+            &[2, 2],
+            vec![1.0, 0.0, 0.0, 1.0],
+            &[2, 2],
             1.0,
         );
         let x = [3.0f32, 7.0];

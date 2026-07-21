@@ -367,7 +367,7 @@ impl EmbeddingInput {
     pub fn as_strings(&self) -> Vec<&str> {
         match self {
             EmbeddingInput::Single(s) => vec![s.as_str()],
-            EmbeddingInput::Batch(v)  => v.iter().map(String::as_str).collect(),
+            EmbeddingInput::Batch(v) => v.iter().map(String::as_str).collect(),
         }
     }
 }

@@ -23,7 +23,7 @@ use std::time::Instant;
 pub struct Metrics {
     // ── Throughput ────────────────────────────────────────────────────────────
     /// Total completed inference requests.
-    pub requests_total:   AtomicU64,
+    pub requests_total: AtomicU64,
     /// Total tokens generated across all requests.
     pub tokens_generated: AtomicU64,
 
@@ -31,37 +31,43 @@ pub struct Metrics {
     /// Sum of end-to-end request durations in milliseconds.
     pub total_latency_ms: AtomicU64,
     /// Sum of time-to-first-token durations in microseconds.
-    pub ttft_total_us:    AtomicU64,
+    pub ttft_total_us: AtomicU64,
     /// Sum of decode-phase durations in microseconds.
-    pub decode_total_us:  AtomicU64,
+    pub decode_total_us: AtomicU64,
 
     // ── Errors ────────────────────────────────────────────────────────────────
     /// Requests that returned an HTTP error response.
-    pub requests_failed:  AtomicU64,
+    pub requests_failed: AtomicU64,
 
     // ── Session concurrency ───────────────────────────────────────────────────
     /// Requests currently in flight (submitted but not yet completed).
-    pub active_sessions:  AtomicI64,
+    pub active_sessions: AtomicI64,
     /// Requests submitted to the engine but not yet past the prefill stage
     /// (i.e. first token not yet delivered to the client).
-    pub queue_depth:      AtomicI64,
+    pub queue_depth: AtomicI64,
 
     // ── Server uptime ─────────────────────────────────────────────────────────
     pub started_at: Instant,
 }
 
+impl Default for Metrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Metrics {
     pub fn new() -> Self {
         Self {
-            requests_total:   AtomicU64::new(0),
+            requests_total: AtomicU64::new(0),
             tokens_generated: AtomicU64::new(0),
             total_latency_ms: AtomicU64::new(0),
-            ttft_total_us:    AtomicU64::new(0),
-            decode_total_us:  AtomicU64::new(0),
-            requests_failed:  AtomicU64::new(0),
-            active_sessions:  AtomicI64::new(0),
-            queue_depth:      AtomicI64::new(0),
-            started_at:       Instant::now(),
+            ttft_total_us: AtomicU64::new(0),
+            decode_total_us: AtomicU64::new(0),
+            requests_failed: AtomicU64::new(0),
+            active_sessions: AtomicI64::new(0),
+            queue_depth: AtomicI64::new(0),
+            started_at: Instant::now(),
         }
     }
 
@@ -71,7 +77,8 @@ impl Metrics {
     pub fn record(&self, tokens: u64, latency_ms: u64) {
         self.requests_total.fetch_add(1, Ordering::Relaxed);
         self.tokens_generated.fetch_add(tokens, Ordering::Relaxed);
-        self.total_latency_ms.fetch_add(latency_ms, Ordering::Relaxed);
+        self.total_latency_ms
+            .fetch_add(latency_ms, Ordering::Relaxed);
         self.decode_total_us
             .fetch_add(latency_ms.saturating_mul(1_000), Ordering::Relaxed);
     }

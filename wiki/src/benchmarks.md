@@ -30,6 +30,11 @@ The benchmark CLI prints human-readable summaries and can emit JSON with `--outp
 
 Measured on LLaMA-3 8B scale (matrix representing a single attention or FFN projection layer), single thread plus rayon parallel dispatch. CPU: AMD Ryzen 7 with AVX2 + FMA.
 
+> **Hardware caveat:** absolute numbers are machine-dependent (memory bandwidth,
+> core count, cache sizes). Treat the table as *relative ordering* between formats,
+> not a cross-machine baseline — reproduce on your own hardware with
+> `cargo bench --bench matvec`.
+
 | Format | Throughput | Time per call |
 |--------|-----------|---------------|
 | Q4_0 | 24.4 Gelem/s | 687 µs |
@@ -122,3 +127,11 @@ For forward-pass changes, time a full generation:
 ```bash
 time glint run -f model.gguf -p "..." -m 200
 ```
+
+### Correctness regressions
+
+Performance work must not change *what* the model emits. The golden-parity harness
+guards this: `scripts/golden_parity.sh MODEL.gguf` greedy-decodes a fixed prompt
+through both Glint and llama.cpp and requires byte-identical output, so a kernel
+change that quietly perturbs the numerics fails loudly. See
+[Contributing → Correctness Anchors](./contributing.md) for details.

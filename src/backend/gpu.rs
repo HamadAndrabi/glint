@@ -19,8 +19,8 @@ use std::sync::Arc;
 
 use wgpu::util::DeviceExt;
 
-use crate::error::GlintError;
 use super::pipeline::{Pipeline, PipelineKind};
+use crate::error::GlintError;
 
 /// A handle to a GPU-resident buffer, identified by a user-chosen string key.
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
@@ -109,24 +109,28 @@ impl GpuBackend {
     /// Used at model-load time to transfer quantized weight matrices to the
     /// GPU. The buffer is created with STORAGE | COPY_SRC usage.
     pub fn upload_buffer(&mut self, name: &str, data: &[u8]) {
-        let buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some(name),
-            contents: data,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        });
+        let buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(name),
+                contents: data,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            });
         self.buffers.insert(name.to_string(), buffer);
     }
 
     /// Upload f32 data into a GPU storage buffer.
     pub fn upload_f32(&mut self, name: &str, data: &[f32]) {
         let bytes: &[u8] = bytemuck::cast_slice(data);
-        let buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some(name),
-            contents: bytes,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_SRC
-                | wgpu::BufferUsages::COPY_DST,
-        });
+        let buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(name),
+                contents: bytes,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_SRC
+                    | wgpu::BufferUsages::COPY_DST,
+            });
         self.buffers.insert(name.to_string(), buffer);
     }
 
@@ -284,27 +288,35 @@ impl GpuBackend {
 
         // Params: [n_heads, n_kv_heads, head_dim, seq_len, scale_bits]
         let params_data: [u32; 5] = [n_heads, n_kv_heads, head_dim, seq_len, scale.to_bits()];
-        let params_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("attn-params"),
-            contents: bytemuck::cast_slice(&params_data),
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
+        let params_buf = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("attn-params"),
+                contents: bytemuck::cast_slice(&params_data),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
 
-        let q_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("attn-q"),
-            contents: bytemuck::cast_slice(q),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-        let k_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("attn-k"),
-            contents: bytemuck::cast_slice(k),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-        let v_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("attn-v"),
-            contents: bytemuck::cast_slice(v),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
+        let q_buf = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("attn-q"),
+                contents: bytemuck::cast_slice(q),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+        let k_buf = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("attn-k"),
+                contents: bytemuck::cast_slice(k),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+        let v_buf = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("attn-v"),
+                contents: bytemuck::cast_slice(v),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
 
         let output_size = (n_heads as usize * head_dim as usize) * std::mem::size_of::<f32>();
         let out_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -318,18 +330,35 @@ impl GpuBackend {
             label: Some("attn-bg"),
             layout: &pipeline.pipeline.get_bind_group_layout(0),
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: params_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: q_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: k_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: v_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 4, resource: out_buf.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: q_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: k_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: v_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: out_buf.as_entire_binding(),
+                },
             ],
         });
 
         // One workgroup per query head
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("attn-dispatch"),
-        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("attn-dispatch"),
+            });
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("attention"),
@@ -351,7 +380,9 @@ impl GpuBackend {
 
         let slice = staging.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |r| { tx.send(r).ok(); });
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            tx.send(r).ok();
+        });
         self.device.poll(wgpu::Maintain::Wait);
         rx.recv()
             .map_err(|e| GlintError::GpuBufferError(format!("channel: {e}")))?
@@ -389,12 +420,9 @@ impl GpuBackend {
             .get(&kind)
             .ok_or_else(|| GlintError::GpuShaderError(format!("pipeline {kind:?} not found")))?;
 
-        let weights = self
-            .buffers
-            .get(weight_buf)
-            .ok_or_else(|| {
-                GlintError::GpuBufferError(format!("weight buffer '{weight_buf}' not found"))
-            })?;
+        let weights = self.buffers.get(weight_buf).ok_or_else(|| {
+            GlintError::GpuBufferError(format!("weight buffer '{weight_buf}' not found"))
+        })?;
 
         // Uniform params
         let params = [rows, cols];
@@ -420,8 +448,7 @@ impl GpuBackend {
         let output_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("matvec-output"),
             size: output_size as u64,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_SRC,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
 
@@ -494,12 +521,7 @@ impl GpuBackend {
     }
 
     /// RMS normalization on GPU.
-    pub fn rms_norm(
-        &self,
-        x: &[f32],
-        weight: &[f32],
-        eps: f32,
-    ) -> Result<Vec<f32>, GlintError> {
+    pub fn rms_norm(&self, x: &[f32], weight: &[f32], eps: f32) -> Result<Vec<f32>, GlintError> {
         let n = x.len() as u32;
         let pipeline = self
             .pipelines
@@ -606,11 +628,7 @@ impl GpuBackend {
     }
 
     /// Fused SiLU + element-wise multiply on GPU (SwiGLU FFN).
-    pub fn silu_mul(
-        &self,
-        gate: &[f32],
-        up: &[f32],
-    ) -> Result<Vec<f32>, GlintError> {
+    pub fn silu_mul(&self, gate: &[f32], up: &[f32]) -> Result<Vec<f32>, GlintError> {
         let n = gate.len() as u32;
         let pipeline = self
             .pipelines
@@ -700,7 +718,9 @@ impl GpuBackend {
 
         let slice = staging.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |r| { tx.send(r).ok(); });
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            tx.send(r).ok();
+        });
         self.device.poll(wgpu::Maintain::Wait);
         rx.recv()
             .map_err(|e| GlintError::GpuBufferError(format!("channel: {e}")))?
@@ -781,9 +801,7 @@ impl GpuBackend {
         let workgroups = (n + 255) / 256;
         let mut encoder = self
             .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("add"),
-            });
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("add") });
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("add"),
@@ -805,7 +823,9 @@ impl GpuBackend {
 
         let slice = staging.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |r| { tx.send(r).ok(); });
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            tx.send(r).ok();
+        });
         self.device.poll(wgpu::Maintain::Wait);
         rx.recv()
             .map_err(|e| GlintError::GpuBufferError(format!("channel: {e}")))?
@@ -859,10 +879,13 @@ impl GpuBackend {
         let pipeline = self
             .pipelines
             .get(&PipelineKind::AttentionResident)
-            .ok_or_else(|| GlintError::GpuShaderError("AttentionResident pipeline not found".into()))?;
+            .ok_or_else(|| {
+                GlintError::GpuShaderError("AttentionResident pipeline not found".into())
+            })?;
 
         // kv_layer_off: offset in floats to this layer's start in the K/V buffer.
-        let kv_layer_off = (layer_idx * kv_buf.max_seq_len * kv_buf.n_kv_heads * kv_buf.head_dim) as u32;
+        let kv_layer_off =
+            (layer_idx * kv_buf.max_seq_len * kv_buf.n_kv_heads * kv_buf.head_dim) as u32;
 
         // Params: [n_heads, n_kv_heads, head_dim, seq_len (attend_len), scale_bits, kv_layer_off, window_start]
         let params_data: [u32; 7] = [
@@ -874,17 +897,21 @@ impl GpuBackend {
             kv_layer_off,
             window_start as u32,
         ];
-        let params_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("attn-res-params"),
-            contents: bytemuck::cast_slice(&params_data),
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
+        let params_buf = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("attn-res-params"),
+                contents: bytemuck::cast_slice(&params_data),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
 
-        let q_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("attn-res-q"),
-            contents: bytemuck::cast_slice(q),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
+        let q_buf = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("attn-res-q"),
+                contents: bytemuck::cast_slice(q),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
 
         let embed_dim = n_heads as usize * head_dim as usize;
         let output_size = (embed_dim * std::mem::size_of::<f32>()) as u64;
@@ -899,17 +926,34 @@ impl GpuBackend {
             label: Some("attn-res-bg"),
             layout: &pipeline.pipeline.get_bind_group_layout(0),
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: params_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: q_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: kv_buf.k_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: kv_buf.v_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 4, resource: out_buf.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: q_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: kv_buf.k_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: kv_buf.v_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: out_buf.as_entire_binding(),
+                },
             ],
         });
 
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("attn-res-dispatch"),
-        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("attn-res-dispatch"),
+            });
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("attention-resident"),
@@ -931,7 +975,9 @@ impl GpuBackend {
 
         let slice = staging.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |r| { tx.send(r).ok(); });
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            tx.send(r).ok();
+        });
         self.device.poll(wgpu::Maintain::Wait);
         rx.recv()
             .map_err(|e| GlintError::GpuBufferError(format!("channel: {e}")))?
@@ -985,12 +1031,12 @@ pub struct GpuKvBuffer {
 /// - `export_raw` / `import_raw` (snapshot support)
 pub struct GpuKvCache {
     pub(crate) device: Arc<wgpu::Device>,
-    pub(crate) queue:  Arc<wgpu::Queue>,
+    pub(crate) queue: Arc<wgpu::Queue>,
     pub(crate) gpu_buf: GpuKvBuffer,
     // CPU mirror — kept in sync with GPU on every write.
     pub(crate) k: Vec<Vec<f32>>,
     pub(crate) v: Vec<Vec<f32>>,
-    pub(crate) kv_dim: usize,     // n_kv_heads * head_dim
+    pub(crate) kv_dim: usize, // n_kv_heads * head_dim
     pub(crate) max_seq_len: usize,
     pub(crate) len: usize,
 }
@@ -1033,9 +1079,13 @@ impl GpuBackend {
 
         GpuKvCache {
             device: Arc::clone(&self.device),
-            queue:  Arc::clone(&self.queue),
+            queue: Arc::clone(&self.queue),
             gpu_buf,
-            k, v, kv_dim, max_seq_len, len: 0,
+            k,
+            v,
+            kv_dim,
+            max_seq_len,
+            len: 0,
         }
     }
 }
@@ -1159,7 +1209,11 @@ mod tests {
         // CPU reference
         let ss: f32 = x.iter().map(|v| v * v).sum();
         let inv_rms = 1.0 / (ss / x.len() as f32 + eps).sqrt();
-        let expected: Vec<f32> = x.iter().zip(w.iter()).map(|(&xi, &wi)| xi * inv_rms * wi).collect();
+        let expected: Vec<f32> = x
+            .iter()
+            .zip(w.iter())
+            .map(|(&xi, &wi)| xi * inv_rms * wi)
+            .collect();
 
         for (i, (&got, &exp)) in result.iter().zip(expected.iter()).enumerate() {
             assert!(

@@ -13,12 +13,12 @@
 //! If rejected, sample from the residual distribution `max(0, p(x) - q(x)) / Z`.
 //! If all `k` accepted, sample one extra token from target logits.
 
+use super::{forward_one, forward_prefill_all, TransformerWeights};
 use crate::backend::GpuBackend;
 use crate::cache::{KvCache, KvStore};
 use crate::model::config::ModelConfig;
 use crate::sampling::Xorshift64;
 use crate::tensor::{softmax, Tensor};
-use super::{TransformerWeights, forward_one, forward_prefill_all};
 
 /// Run speculative decoding with a draft model and a target model.
 ///
@@ -67,8 +67,22 @@ pub fn speculative_decode(
 
     // Prefill both caches with the prompt
     // Draft model always runs on CPU; target model uses GPU if available.
-    forward_prefill_all(draft_weights,  draft_config,  prompt_tokens, &mut draft_cache,  0, &mut None);
-    forward_prefill_all(target_weights, target_config, prompt_tokens, &mut target_cache, 0, gpu);
+    forward_prefill_all(
+        draft_weights,
+        draft_config,
+        prompt_tokens,
+        &mut draft_cache,
+        0,
+        &mut None,
+    );
+    forward_prefill_all(
+        target_weights,
+        target_config,
+        prompt_tokens,
+        &mut target_cache,
+        0,
+        gpu,
+    );
 
     let mut tokens = prompt_tokens.to_vec();
     let rng_seed = seed.unwrap_or_else(|| {
@@ -91,19 +105,25 @@ pub fn speculative_decode(
         // 1. Draft: generate `lookahead` tokens speculatively
         let k = lookahead.min(max_new_tokens - generated);
         let mut draft_tokens = Vec::with_capacity(k);
-        let mut draft_probs  = Vec::with_capacity(k); // full prob vector for each draft step
+        let mut draft_probs = Vec::with_capacity(k); // full prob vector for each draft step
 
-        let mut draft_pos = current_len;
-        for _ in 0..k {
-            let logits = forward_one(draft_weights, draft_config, *tokens.last().unwrap_or(&0), draft_pos - 1, &mut draft_cache, &mut None);
+        for step in 0..k {
+            let draft_pos = current_len + step;
+            let logits = forward_one(
+                draft_weights,
+                draft_config,
+                *tokens.last().unwrap_or(&0),
+                draft_pos - 1,
+                &mut draft_cache,
+                &mut None,
+            );
             // Draft uses temperature sampling to get probabilities
             let probs = softmax_with_temp(logits.data(), temperature);
             let sampled = sample_from_probs(&probs, &mut rng);
             draft_tokens.push(sampled);
             draft_probs.push(probs); // store full distribution for residual correction
-            // Tentatively add to token list so the next draft step sees context
+                                     // Tentatively add to token list so the next draft step sees context
             tokens.push(sampled);
-            draft_pos += 1;
         }
 
         // Roll back tokens to current_len — we verify before committing
@@ -131,7 +151,7 @@ pub fn speculative_decode(
         for i in 0..k {
             let target_probs = softmax_with_temp(target_logits[i].data(), temperature);
             let q = draft_probs[i][draft_tokens[i] as usize]; // draft prob at sampled token
-            let p = target_probs[draft_tokens[i] as usize];   // target prob at draft choice
+            let p = target_probs[draft_tokens[i] as usize]; // target prob at draft choice
 
             let accept_prob = (p / (q + 1e-10)).min(1.0);
             if rng.next_f32() < accept_prob {
@@ -162,7 +182,9 @@ pub fn speculative_decode(
         if let Some(bonus) = bonus_token {
             tokens.push(bonus);
             generated += 1;
-            if bonus == eos_token { break; }
+            if bonus == eos_token {
+                break;
+            }
         }
 
         // Sync both caches to accepted token count
@@ -172,11 +194,27 @@ pub fn speculative_decode(
         // Re-prefill both caches with the newly accepted tokens
         let new_tokens = &tokens[current_len..new_len];
         if !new_tokens.is_empty() {
-            forward_prefill_all(draft_weights,  draft_config,  new_tokens, &mut draft_cache,  current_len, &mut None);
-            forward_prefill_all(target_weights, target_config, new_tokens, &mut target_cache, current_len, gpu);
+            forward_prefill_all(
+                draft_weights,
+                draft_config,
+                new_tokens,
+                &mut draft_cache,
+                current_len,
+                &mut None,
+            );
+            forward_prefill_all(
+                target_weights,
+                target_config,
+                new_tokens,
+                &mut target_cache,
+                current_len,
+                gpu,
+            );
         }
 
-        if tokens.last() == Some(&eos_token) { break; }
+        if tokens.last() == Some(&eos_token) {
+            break;
+        }
     }
 
     tokens
@@ -187,9 +225,12 @@ pub fn speculative_decode(
 fn softmax_with_temp(logits: &[f32], temperature: f32) -> Vec<f32> {
     if temperature <= 0.0 {
         // Greedy: one-hot on argmax
-        let max_idx = logits.iter().enumerate()
+        let max_idx = logits
+            .iter()
+            .enumerate()
             .max_by(|(_, a), (_, b)| a.total_cmp(b))
-            .map(|(i, _)| i).unwrap_or(0);
+            .map(|(i, _)| i)
+            .unwrap_or(0);
         let mut out = vec![0.0f32; logits.len()];
         out[max_idx] = 1.0;
         return out;
@@ -201,14 +242,22 @@ fn softmax_with_temp(logits: &[f32], temperature: f32) -> Vec<f32> {
 
 /// Compute the normalised residual `max(0, p - q) / Z`.
 fn residual_distribution(p: &[f32], q: &[f32]) -> Vec<f32> {
-    let mut residual: Vec<f32> = p.iter().zip(q).map(|(&pi, &qi)| (pi - qi).max(0.0)).collect();
+    let mut residual: Vec<f32> = p
+        .iter()
+        .zip(q)
+        .map(|(&pi, &qi)| (pi - qi).max(0.0))
+        .collect();
     let z: f32 = residual.iter().sum();
     if z > 0.0 {
-        for r in &mut residual { *r /= z; }
+        for r in &mut residual {
+            *r /= z;
+        }
     } else {
         // Fall back to uniform if residual is empty
         let n = residual.len() as f32;
-        for r in &mut residual { *r = 1.0 / n; }
+        for r in &mut residual {
+            *r = 1.0 / n;
+        }
     }
     residual
 }

@@ -10,7 +10,13 @@ pub fn matmul(a: &Tensor, b: &Tensor) -> Tensor {
     assert_eq!(b.ndim(), 2, "matmul requires 2D tensors");
     let m = a.shape()[0];
     let k = a.shape()[1];
-    assert_eq!(k, b.shape()[0], "Inner dimensions must match: {} vs {}", k, b.shape()[0]);
+    assert_eq!(
+        k,
+        b.shape()[0],
+        "Inner dimensions must match: {} vs {}",
+        k,
+        b.shape()[0]
+    );
     let n = b.shape()[1];
 
     let mut out = Tensor::zeros(&[m, n]);
@@ -194,12 +200,21 @@ mod tests {
     use super::*;
 
     fn approx_eq(a: &[f32], b: &[f32], tol: f32) {
-        assert_eq!(a.len(), b.len(), "Length mismatch: {} vs {}", a.len(), b.len());
+        assert_eq!(
+            a.len(),
+            b.len(),
+            "Length mismatch: {} vs {}",
+            a.len(),
+            b.len()
+        );
         for (i, (&x, &y)) in a.iter().zip(b).enumerate() {
             assert!(
                 (x - y).abs() < tol,
                 "Mismatch at index {}: {} vs {} (diff {})",
-                i, x, y, (x - y).abs()
+                i,
+                x,
+                y,
+                (x - y).abs()
             );
         }
     }
@@ -260,7 +275,11 @@ mod tests {
         let expected_rsqrt = 1.0 / (14.0f32 / 3.0).sqrt();
         approx_eq(
             result.data(),
-            &[1.0 * expected_rsqrt, 2.0 * expected_rsqrt, 3.0 * expected_rsqrt],
+            &[
+                1.0 * expected_rsqrt,
+                2.0 * expected_rsqrt,
+                3.0 * expected_rsqrt,
+            ],
             1e-5,
         );
     }

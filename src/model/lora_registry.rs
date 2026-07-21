@@ -24,26 +24,22 @@ pub struct AdapterRegistry {
 impl AdapterRegistry {
     /// Create an empty registry.
     pub fn new() -> Self {
-        Self { adapters: HashMap::new() }
+        Self {
+            adapters: HashMap::new(),
+        }
     }
 
     /// Load a GGUF LoRA adapter file and add it to the registry under `name`.
     ///
     /// `n_layers` must match the base model's layer count so that per-layer
     /// adapter arrays are allocated at the right size.
-    pub fn register(
-        &mut self,
-        name: &str,
-        path: &Path,
-        n_layers: usize,
-    ) -> Result<(), GlintError> {
-        let gguf = GgufModel::load(path)
-            .map_err(|e| GlintError::TensorReadError {
-                name: name.to_string(),
-                detail: e.to_string(),
-            })?;
-        let weights = LoraWeights::load(&gguf, n_layers)
-            .ok_or_else(|| GlintError::TensorReadError {
+    pub fn register(&mut self, name: &str, path: &Path, n_layers: usize) -> Result<(), GlintError> {
+        let gguf = GgufModel::load(path).map_err(|e| GlintError::TensorReadError {
+            name: name.to_string(),
+            detail: e.to_string(),
+        })?;
+        let weights =
+            LoraWeights::load(&gguf, n_layers).ok_or_else(|| GlintError::TensorReadError {
                 name: name.to_string(),
                 detail: "no lora_a/lora_b tensors found in adapter file".to_string(),
             })?;

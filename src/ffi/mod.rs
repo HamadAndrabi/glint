@@ -11,6 +11,23 @@
 //!   called exactly once.  After `free`, the pointer is dangling — never use it.
 //! * `const GlintModel*` / `const GlintSession*` parameters are borrowed for
 //!   the duration of the call only; the caller retains ownership.
+//! * Every entry point runs inside `catch_unwind`: an internal Rust panic is
+//!   caught at the boundary (unwinding across FFI is undefined behaviour),
+//!   turned into the error string, and reported as `NULL` / -1. A panic never
+//!   propagates into the C caller and never aborts the host process.
+//!
+//! # Thread-safety
+//!
+//! * `GlintModel*` is read-only after load and may be shared across threads:
+//!   any number of threads may call functions that take `const GlintModel*`
+//!   concurrently.
+//! * `GlintSession*` is **not** thread-safe. A session owns mutable KV-cache
+//!   and RNG state; calling `glint_generate` / `glint_stream_generate` /
+//!   `glint_snapshot_export` on the same session from two threads at once is a
+//!   data race (undefined behaviour). Use one session per thread, or serialise
+//!   access with your own lock.
+//! * The error string returned by `glint_last_error()` is thread-local: each
+//!   thread sees only errors from its own calls.
 //!
 //! # Example (C)
 //! ```c
@@ -27,6 +44,12 @@
 //! glint_session_free(s);
 //! glint_model_free(m);
 //! ```
+
+// The caller-obligation ("# Safety") contract for every entry point is stated
+// once in the module header above (null-checking, ownership, borrow lifetimes,
+// thread-safety, panic containment) rather than repeated on each `#[no_mangle]`
+// function, so the per-function `missing_safety_doc` lint is allowed here.
+#![allow(clippy::missing_safety_doc)]
 
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_void};
@@ -49,7 +72,9 @@ fn set_error(msg: impl std::fmt::Display) {
 }
 
 fn clear_error() {
-    LAST_ERROR.with(|e| { *e.borrow_mut() = None; });
+    LAST_ERROR.with(|e| {
+        *e.borrow_mut() = None;
+    });
 }
 
 // ── Opaque handle types ───────────────────────────────────────────────────────
@@ -67,7 +92,7 @@ pub struct GlintSessionHandle {
 
 /// Opaque handle to a KV snapshot. Free with `glint_snapshot_free`.
 pub struct GlintSnapshotHandle {
-    snap:  KvSnapshot,
+    snap: KvSnapshot,
     bytes: Vec<u8>,
 }
 
@@ -83,15 +108,15 @@ pub struct GlintSnapshotHandle {
 #[repr(C)]
 pub struct GlintSamplerOptions {
     /// Sampling temperature. 0.0 = greedy, >0 = stochastic.
-    pub temperature:    f32,
+    pub temperature: f32,
     /// Top-k filtering. 0 = disabled.
-    pub top_k:          usize,
+    pub top_k: usize,
     /// Top-p nucleus filtering. 0.0 / 1.0 = disabled.
-    pub top_p:          f32,
+    pub top_p: f32,
     /// Repetition penalty. 1.0 = disabled.
     pub repeat_penalty: f32,
     /// PRNG seed. 0 = seed from system time.
-    pub seed:           u64,
+    pub seed: u64,
     /// Maximum new tokens to generate.
     pub max_new_tokens: usize,
 }
@@ -99,14 +124,26 @@ pub struct GlintSamplerOptions {
 impl GlintSamplerOptions {
     fn to_generation_opts(&self, cache_fmt: CacheFormat) -> GenerationOptions {
         GenerationOptions {
-            max_new_tokens: if self.max_new_tokens == 0 { 256 } else { self.max_new_tokens },
+            max_new_tokens: if self.max_new_tokens == 0 {
+                256
+            } else {
+                self.max_new_tokens
+            },
             sampler_cfg: SamplerConfig {
-                temperature:    self.temperature,
-                top_k:          self.top_k,
-                top_p:          if self.top_p == 0.0 { 1.0 } else { self.top_p },
-                repeat_penalty: if self.repeat_penalty == 0.0 { 1.0 } else { self.repeat_penalty },
-                seed:           if self.seed == 0 { None } else { Some(self.seed) },
-                min_p:          0.0,
+                temperature: self.temperature,
+                top_k: self.top_k,
+                top_p: if self.top_p == 0.0 { 1.0 } else { self.top_p },
+                repeat_penalty: if self.repeat_penalty == 0.0 {
+                    1.0
+                } else {
+                    self.repeat_penalty
+                },
+                seed: if self.seed == 0 {
+                    None
+                } else {
+                    Some(self.seed)
+                },
+                min_p: 0.0,
             },
             cache_format: cache_fmt,
             constraint: None,
@@ -126,10 +163,26 @@ macro_rules! null_check {
     };
 }
 
+/// Run an FFI body under `catch_unwind`, returning `$default` if it panics.
+///
+/// Unwinding across an `extern "C"` boundary is undefined behaviour, so every
+/// entry point funnels through here. `AssertUnwindSafe` is sound because on the
+/// panic path we return an error sentinel and touch no partially-mutated state;
+/// the caller observes only success-or-error, never a torn value.
+fn ffi_guard<T>(default: T, f: impl FnOnce() -> T) -> T {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(v) => v,
+        Err(_) => {
+            set_error("internal panic caught at FFI boundary");
+            default
+        }
+    }
+}
+
 fn parse_cache_format(s: &CStr) -> Option<CacheFormat> {
     match s.to_str().ok()? {
-        "q8" | "Q8"   => Some(CacheFormat::Q8),
-        _              => Some(CacheFormat::F32), // default
+        "q8" | "Q8" => Some(CacheFormat::Q8),
+        _ => Some(CacheFormat::F32), // default
     }
 }
 
@@ -141,25 +194,35 @@ fn parse_cache_format(s: &CStr) -> Option<CacheFormat> {
 /// `glint_last_error()` for details).  Must be freed with `glint_model_free`.
 #[no_mangle]
 pub unsafe extern "C" fn glint_model_load(path: *const c_char) -> *mut GlintModelHandle {
-    null_check!(path, std::ptr::null_mut());
-    clear_error();
-    let path_cstr = unsafe { CStr::from_ptr(path) };
-    let path_str  = match path_cstr.to_str() {
-        Ok(s)  => s,
-        Err(e) => { set_error(e); return std::ptr::null_mut(); }
-    };
-    match Model::load(std::path::Path::new(path_str)) {
-        Ok(m)  => Box::into_raw(Box::new(GlintModelHandle(m))),
-        Err(e) => { set_error(e); std::ptr::null_mut() }
-    }
+    ffi_guard(std::ptr::null_mut(), || {
+        null_check!(path, std::ptr::null_mut());
+        clear_error();
+        let path_cstr = unsafe { CStr::from_ptr(path) };
+        let path_str = match path_cstr.to_str() {
+            Ok(s) => s,
+            Err(e) => {
+                set_error(e);
+                return std::ptr::null_mut();
+            }
+        };
+        match Model::load(std::path::Path::new(path_str)) {
+            Ok(m) => Box::into_raw(Box::new(GlintModelHandle(m))),
+            Err(e) => {
+                set_error(e);
+                std::ptr::null_mut()
+            }
+        }
+    })
 }
 
 /// Free a model handle.  No-op if `model` is `NULL`.
 #[no_mangle]
 pub unsafe extern "C" fn glint_model_free(model: *mut GlintModelHandle) {
-    if !model.is_null() {
-        drop(unsafe { Box::from_raw(model) });
-    }
+    ffi_guard((), || {
+        if !model.is_null() {
+            drop(unsafe { Box::from_raw(model) });
+        }
+    })
 }
 
 // ── Session ───────────────────────────────────────────────────────────────────
@@ -170,35 +233,39 @@ pub unsafe extern "C" fn glint_model_free(model: *mut GlintModelHandle) {
 /// Returns `NULL` on failure.  Must be freed with `glint_session_free`.
 #[no_mangle]
 pub unsafe extern "C" fn glint_session_new(
-    model:        *const GlintModelHandle,
+    model: *const GlintModelHandle,
     sampler_opts: *const GlintSamplerOptions,
     cache_format: *const c_char,
 ) -> *mut GlintSessionHandle {
-    null_check!(model, std::ptr::null_mut());
-    null_check!(sampler_opts, std::ptr::null_mut());
-    clear_error();
+    ffi_guard(std::ptr::null_mut(), || {
+        null_check!(model, std::ptr::null_mut());
+        null_check!(sampler_opts, std::ptr::null_mut());
+        clear_error();
 
-    let fmt = if cache_format.is_null() {
-        CacheFormat::F32
-    } else {
-        let cs = unsafe { CStr::from_ptr(cache_format) };
-        parse_cache_format(cs).unwrap_or(CacheFormat::F32)
-    };
+        let fmt = if cache_format.is_null() {
+            CacheFormat::F32
+        } else {
+            let cs = unsafe { CStr::from_ptr(cache_format) };
+            parse_cache_format(cs).unwrap_or(CacheFormat::F32)
+        };
 
-    let sopts = unsafe { &*sampler_opts };
-    let opts  = sopts.to_generation_opts(fmt);
-    let m     = unsafe { &(*model).0 };
-    let session = m.new_session(&opts);
+        let sopts = unsafe { &*sampler_opts };
+        let opts = sopts.to_generation_opts(fmt);
+        let m = unsafe { &(*model).0 };
+        let session = m.new_session(&opts);
 
-    Box::into_raw(Box::new(GlintSessionHandle { session, opts }))
+        Box::into_raw(Box::new(GlintSessionHandle { session, opts }))
+    })
 }
 
 /// Free a session handle.  No-op if `session` is `NULL`.
 #[no_mangle]
 pub unsafe extern "C" fn glint_session_free(session: *mut GlintSessionHandle) {
-    if !session.is_null() {
-        drop(unsafe { Box::from_raw(session) });
-    }
+    ffi_guard((), || {
+        if !session.is_null() {
+            drop(unsafe { Box::from_raw(session) });
+        }
+    })
 }
 
 // ── Generation ────────────────────────────────────────────────────────────────
@@ -211,46 +278,56 @@ pub unsafe extern "C" fn glint_session_free(session: *mut GlintSessionHandle) {
 /// Generated token ids are written to `out_tokens[0..return_value]`.
 #[no_mangle]
 pub unsafe extern "C" fn glint_generate(
-    model:          *const GlintModelHandle,
-    session:        *mut GlintSessionHandle,
-    prompt:         *const c_char,
+    model: *const GlintModelHandle,
+    session: *mut GlintSessionHandle,
+    prompt: *const c_char,
     max_new_tokens: usize,
-    out_tokens:     *mut u32,
-    out_capacity:   usize,
+    out_tokens: *mut u32,
+    out_capacity: usize,
 ) -> c_int {
-    null_check!(model,      -1);
-    null_check!(session,    -1);
-    null_check!(prompt,     -1);
-    null_check!(out_tokens, -1);
-    clear_error();
+    ffi_guard(-1, || {
+        null_check!(model, -1);
+        null_check!(session, -1);
+        null_check!(prompt, -1);
+        null_check!(out_tokens, -1);
+        clear_error();
 
-    let m   = unsafe { &(*model).0 };
-    let s   = unsafe { &mut *session };
-    let cs  = unsafe { CStr::from_ptr(prompt) };
-    let txt = match cs.to_str() {
-        Ok(t)  => t,
-        Err(e) => { set_error(e); return -1; }
-    };
+        let m = unsafe { &(*model).0 };
+        let s = unsafe { &mut *session };
+        let cs = unsafe { CStr::from_ptr(prompt) };
+        let txt = match cs.to_str() {
+            Ok(t) => t,
+            Err(e) => {
+                set_error(e);
+                return -1;
+            }
+        };
 
-    let mut opts = s.opts.clone();
-    if max_new_tokens > 0 { opts.max_new_tokens = max_new_tokens; }
+        let mut opts = s.opts.clone();
+        if max_new_tokens > 0 {
+            opts.max_new_tokens = max_new_tokens;
+        }
 
-    s.opts = opts.clone();
-    s.session = m.new_session(&opts);
-    match m.prefill(&mut s.session, txt, &mut None) {
-        Ok(()) => {}
-        Err(e) => { set_error(e); return -1; }
-    }
+        s.opts = opts.clone();
+        s.session = m.new_session(&opts);
+        match m.prefill(&mut s.session, txt, &mut None) {
+            Ok(()) => {}
+            Err(e) => {
+                set_error(e);
+                return -1;
+            }
+        }
 
-    let mut tokens = Vec::new();
-    while let Some(tok) = m.decode_one(&mut s.session, &mut None) {
-        tokens.push(tok);
-    }
+        let mut tokens = Vec::new();
+        while let Some(tok) = m.decode_one(&mut s.session, &mut None) {
+            tokens.push(tok);
+        }
 
-    let n = tokens.len().min(out_capacity);
-    let out = unsafe { std::slice::from_raw_parts_mut(out_tokens, n) };
-    out.copy_from_slice(&tokens[..n]);
-    n as c_int
+        let n = tokens.len().min(out_capacity);
+        let out = unsafe { std::slice::from_raw_parts_mut(out_tokens, n) };
+        out.copy_from_slice(&tokens[..n]);
+        n as c_int
+    })
 }
 
 /// Streaming generation with a per-token callback.
@@ -260,51 +337,61 @@ pub unsafe extern "C" fn glint_generate(
 /// Returns total tokens generated, or -1 on error.
 #[no_mangle]
 pub unsafe extern "C" fn glint_stream_generate(
-    model:          *const GlintModelHandle,
-    session:        *mut GlintSessionHandle,
-    prompt:         *const c_char,
+    model: *const GlintModelHandle,
+    session: *mut GlintSessionHandle,
+    prompt: *const c_char,
     max_new_tokens: usize,
-    on_token:       Option<unsafe extern "C" fn(u32, *mut c_void) -> c_int>,
-    userdata:       *mut c_void,
+    on_token: Option<unsafe extern "C" fn(u32, *mut c_void) -> c_int>,
+    userdata: *mut c_void,
 ) -> c_int {
-    null_check!(model,   -1);
-    null_check!(session, -1);
-    null_check!(prompt,  -1);
-    clear_error();
+    ffi_guard(-1, || {
+        null_check!(model, -1);
+        null_check!(session, -1);
+        null_check!(prompt, -1);
+        clear_error();
 
-    let callback = match on_token {
-        Some(f) => f,
-        None    => { set_error("on_token callback is null"); return -1; }
-    };
+        let callback = match on_token {
+            Some(f) => f,
+            None => {
+                set_error("on_token callback is null");
+                return -1;
+            }
+        };
 
-    let m   = unsafe { &(*model).0 };
-    let s   = unsafe { &mut *session };
-    let cs  = unsafe { CStr::from_ptr(prompt) };
-    let txt = match cs.to_str() {
-        Ok(t)  => t,
-        Err(e) => { set_error(e); return -1; }
-    };
+        let m = unsafe { &(*model).0 };
+        let s = unsafe { &mut *session };
+        let cs = unsafe { CStr::from_ptr(prompt) };
+        let txt = match cs.to_str() {
+            Ok(t) => t,
+            Err(e) => {
+                set_error(e);
+                return -1;
+            }
+        };
 
-    let mut opts = s.opts.clone();
-    if max_new_tokens > 0 { opts.max_new_tokens = max_new_tokens; }
-
-    s.opts = opts.clone();
-    s.session = m.new_session(&opts);
-    if let Err(e) = m.prefill(&mut s.session, txt, &mut None) {
-        set_error(e);
-        return -1;
-    }
-
-    let mut count = 0i32;
-    while let Some(tok) = m.decode_one(&mut s.session, &mut None) {
-        count += 1;
-        // SAFETY: callback and userdata are valid for the duration of this call.
-        let stop = unsafe { callback(tok, userdata) };
-        if stop != 0 {
-            break;
+        let mut opts = s.opts.clone();
+        if max_new_tokens > 0 {
+            opts.max_new_tokens = max_new_tokens;
         }
-    }
-    count
+
+        s.opts = opts.clone();
+        s.session = m.new_session(&opts);
+        if let Err(e) = m.prefill(&mut s.session, txt, &mut None) {
+            set_error(e);
+            return -1;
+        }
+
+        let mut count = 0i32;
+        while let Some(tok) = m.decode_one(&mut s.session, &mut None) {
+            count += 1;
+            // SAFETY: callback and userdata are valid for the duration of this call.
+            let stop = unsafe { callback(tok, userdata) };
+            if stop != 0 {
+                break;
+            }
+        }
+        count
+    })
 }
 
 // ── Snapshots ─────────────────────────────────────────────────────────────────
@@ -315,20 +402,28 @@ pub unsafe extern "C" fn glint_stream_generate(
 /// Must be freed with `glint_snapshot_free`.
 #[no_mangle]
 pub unsafe extern "C" fn glint_snapshot_export(
-    model:   *const GlintModelHandle,
+    model: *const GlintModelHandle,
     session: *const GlintSessionHandle,
 ) -> *mut GlintSnapshotHandle {
-    null_check!(model,   std::ptr::null_mut());
-    null_check!(session, std::ptr::null_mut());
-    clear_error();
+    ffi_guard(std::ptr::null_mut(), || {
+        null_check!(model, std::ptr::null_mut());
+        null_check!(session, std::ptr::null_mut());
+        clear_error();
 
-    let m = unsafe { &(*model).0 };
-    let s = unsafe { &(*session).session };
+        let m = unsafe { &(*model).0 };
+        let s = unsafe { &(*session).session };
 
-    match m.export_session(s).and_then(|bytes| m.import_snapshot_bytes(&bytes).map(|snap| (bytes, snap))) {
-        Ok((bytes, snap)) => Box::into_raw(Box::new(GlintSnapshotHandle { snap, bytes })),
-        Err(e) => { set_error(e); std::ptr::null_mut() }
-    }
+        match m
+            .export_session(s)
+            .and_then(|bytes| m.import_snapshot_bytes(&bytes).map(|snap| (bytes, snap)))
+        {
+            Ok((bytes, snap)) => Box::into_raw(Box::new(GlintSnapshotHandle { snap, bytes })),
+            Err(e) => {
+                set_error(e);
+                std::ptr::null_mut()
+            }
+        }
+    })
 }
 
 /// Restore a session from a snapshot.
@@ -337,40 +432,46 @@ pub unsafe extern "C" fn glint_snapshot_export(
 /// Must be freed with `glint_session_free`.
 #[no_mangle]
 pub unsafe extern "C" fn glint_snapshot_import(
-    model:        *const GlintModelHandle,
-    snapshot:     *const GlintSnapshotHandle,
+    model: *const GlintModelHandle,
+    snapshot: *const GlintSnapshotHandle,
     sampler_opts: *const GlintSamplerOptions,
 ) -> *mut GlintSessionHandle {
-    null_check!(model,        std::ptr::null_mut());
-    null_check!(snapshot,     std::ptr::null_mut());
-    null_check!(sampler_opts, std::ptr::null_mut());
-    clear_error();
+    ffi_guard(std::ptr::null_mut(), || {
+        null_check!(model, std::ptr::null_mut());
+        null_check!(snapshot, std::ptr::null_mut());
+        null_check!(sampler_opts, std::ptr::null_mut());
+        clear_error();
 
-    let m    = unsafe { &(*model).0 };
-    let snap = unsafe { &(*snapshot).snap };
-    let so   = unsafe { &*sampler_opts };
-    let opts = so.to_generation_opts(snap.meta.cache_format);
+        let m = unsafe { &(*model).0 };
+        let snap = unsafe { &(*snapshot).snap };
+        let so = unsafe { &*sampler_opts };
+        let opts = so.to_generation_opts(snap.meta.cache_format);
 
-    // Re-deserialise from the stored bytes so we get a fresh KvSnapshot to move.
-    let meta = crate::session::snapshot::SnapshotMetadata {
-        model_hash:  m.model_hash,
-        context_len: m.config.context_length,
-        n_layers:    m.config.block_count,
-        n_kv_heads:  m.config.head_count_kv,
-        head_dim:    m.config.head_dim(),
-        cache_format: snap.meta.cache_format,
-    };
+        // Re-deserialise from the stored bytes so we get a fresh KvSnapshot to move.
+        let meta = crate::session::snapshot::SnapshotMetadata {
+            model_hash: m.model_hash,
+            context_len: m.config.context_length,
+            n_layers: m.config.block_count,
+            n_kv_heads: m.config.head_count_kv,
+            head_dim: m.config.head_dim(),
+            cache_format: snap.meta.cache_format,
+        };
 
-    let bytes = unsafe { &(*snapshot).bytes };
-    match crate::session::snapshot::import_snapshot(bytes, &meta) {
-        Ok(fresh_snap) => {
-            match m.restore_session(fresh_snap, opts.clone()) {
+        let bytes = unsafe { &(*snapshot).bytes };
+        match crate::session::snapshot::import_snapshot(bytes, &meta) {
+            Ok(fresh_snap) => match m.restore_session(fresh_snap, opts.clone()) {
                 Ok(session) => Box::into_raw(Box::new(GlintSessionHandle { session, opts })),
-                Err(e)      => { set_error(e); std::ptr::null_mut() }
+                Err(e) => {
+                    set_error(e);
+                    std::ptr::null_mut()
+                }
+            },
+            Err(e) => {
+                set_error(e);
+                std::ptr::null_mut()
             }
         }
-        Err(e) => { set_error(e); std::ptr::null_mut() }
-    }
+    })
 }
 
 /// Serialise a snapshot to a caller-supplied byte buffer.
@@ -380,25 +481,31 @@ pub unsafe extern "C" fn glint_snapshot_import(
 #[no_mangle]
 pub unsafe extern "C" fn glint_snapshot_serialize(
     snapshot: *const GlintSnapshotHandle,
-    buf:      *mut u8,
-    buf_len:  usize,
+    buf: *mut u8,
+    buf_len: usize,
 ) -> c_int {
-    null_check!(snapshot, -1);
-    clear_error();
+    ffi_guard(-1, || {
+        null_check!(snapshot, -1);
+        clear_error();
 
-    let h   = unsafe { &*snapshot };
-    let src = &h.bytes;
+        let h = unsafe { &*snapshot };
+        let src = &h.bytes;
 
-    if buf.is_null() || buf_len == 0 {
-        return src.len() as c_int;
-    }
-    if buf_len < src.len() {
-        set_error(format!("buffer too small: need {} bytes, got {}", src.len(), buf_len));
-        return -1;
-    }
-    let dst = unsafe { std::slice::from_raw_parts_mut(buf, src.len()) };
-    dst.copy_from_slice(src);
-    src.len() as c_int
+        if buf.is_null() || buf_len == 0 {
+            return src.len() as c_int;
+        }
+        if buf_len < src.len() {
+            set_error(format!(
+                "buffer too small: need {} bytes, got {}",
+                src.len(),
+                buf_len
+            ));
+            return -1;
+        }
+        let dst = unsafe { std::slice::from_raw_parts_mut(buf, src.len()) };
+        dst.copy_from_slice(src);
+        src.len() as c_int
+    })
 }
 
 /// Deserialise a snapshot from bytes.
@@ -414,75 +521,46 @@ pub unsafe extern "C" fn glint_snapshot_deserialize(
     buf: *const u8,
     len: usize,
 ) -> *mut GlintSnapshotHandle {
-    null_check!(buf, std::ptr::null_mut());
-    clear_error();
+    ffi_guard(std::ptr::null_mut(), || {
+        null_check!(buf, std::ptr::null_mut());
+        clear_error();
 
-    let bytes = unsafe { std::slice::from_raw_parts(buf, len) };
+        let bytes = unsafe { std::slice::from_raw_parts(buf, len) };
+        let stored = bytes.to_vec();
 
-    // Parse just the header to read metadata (use a dummy meta with zeroed hash
-    // so we can read the structure without a model).
-    // A real application will call glint_snapshot_import which re-verifies against the model.
-    let dummy_meta = crate::session::snapshot::SnapshotMetadata {
-        model_hash:  0,
-        context_len: 0,
-        n_layers:    0,
-        n_kv_heads:  0,
-        head_dim:    0,
-        cache_format: crate::session::CacheFormat::F32,
-    };
-    // We can't fully validate without a model, so attempt a partial parse.
-    // The import step (glint_snapshot_import) will do full validation.
-    // For raw storage we just need to keep the bytes.
-    let _ = dummy_meta; // kept for documentation
+        // Read the header through the crate's single header parser (validates magic
+        // and version) rather than re-deriving byte offsets here — the two must
+        // never drift. The metadata is taken from the blob itself; full validation
+        // against a specific model happens later in `glint_snapshot_import`.
+        let meta = match crate::session::snapshot::peek_snapshot_metadata(&stored) {
+            Ok(m) => m,
+            Err(e) => {
+                set_error(e);
+                return std::ptr::null_mut();
+            }
+        };
 
-    // Just wrap the raw bytes; validation happens in glint_snapshot_import.
-    // We need a valid KvSnapshot to populate the handle. Try parsing with relaxed checks.
-    // Use a sentinel that will fail model-hash check on import (correct behaviour).
-    let stored = bytes.to_vec();
-
-    // Attempt a partial parse to verify the blob is structurally sound.
-    const MAGIC: &[u8] = b"GLNTSNAP";
-    if stored.len() < 8 || &stored[..8] != MAGIC {
-        set_error("invalid snapshot magic — not a Glint snapshot");
-        return std::ptr::null_mut();
-    }
-
-    // Build a minimal KvSnapshot by attempting import with a lenient meta.
-    // Since we don't know the model hash, we use 0 and let the import fail
-    // only on hash mismatch (which is correct — the full validate is in import).
-    // We read the model_hash from offset 12 in the blob (after magic+version).
-    if stored.len() < 37 { set_error("snapshot truncated"); return std::ptr::null_mut(); }
-    let stored_hash = u64::from_le_bytes(stored[12..20].try_into().unwrap());
-    let stored_ctx  = u32::from_le_bytes(stored[20..24].try_into().unwrap());
-    let stored_nl   = u32::from_le_bytes(stored[24..28].try_into().unwrap());
-    let stored_nkv  = u32::from_le_bytes(stored[28..32].try_into().unwrap());
-    let stored_hd   = u32::from_le_bytes(stored[32..36].try_into().unwrap());
-    let fmt_tag     = stored[36];
-    let stored_fmt  = match fmt_tag {
-        1 => crate::session::CacheFormat::Q8,
-        _ => crate::session::CacheFormat::F32,
-    };
-    let meta = crate::session::snapshot::SnapshotMetadata {
-        model_hash:  stored_hash,
-        context_len: stored_ctx,
-        n_layers:    stored_nl,
-        n_kv_heads:  stored_nkv,
-        head_dim:    stored_hd,
-        cache_format: stored_fmt,
-    };
-
-    match crate::session::snapshot::import_snapshot(&stored, &meta) {
-        Ok(snap)  => Box::into_raw(Box::new(GlintSnapshotHandle { snap, bytes: stored })),
-        Err(e)    => { set_error(e); std::ptr::null_mut() }
-    }
+        match crate::session::snapshot::import_snapshot(&stored, &meta) {
+            Ok(snap) => Box::into_raw(Box::new(GlintSnapshotHandle {
+                snap,
+                bytes: stored,
+            })),
+            Err(e) => {
+                set_error(e);
+                std::ptr::null_mut()
+            }
+        }
+    })
 }
 
 /// Free a snapshot handle.  No-op if `snapshot` is `NULL`.
 #[no_mangle]
 pub unsafe extern "C" fn glint_snapshot_free(snapshot: *mut GlintSnapshotHandle) {
-    if !snapshot.is_null() {
-        drop(unsafe { Box::from_raw(snapshot) });
-    }
+    ffi_guard((), || {
+        if !snapshot.is_null() {
+            drop(unsafe { Box::from_raw(snapshot) });
+        }
+    })
 }
 
 // ── Error reporting ───────────────────────────────────────────────────────────
@@ -497,7 +575,7 @@ pub extern "C" fn glint_last_error() -> *const c_char {
         e.borrow()
             .as_ref()
             .map(|cs| cs.as_ptr())
-            .unwrap_or(b"\0".as_ptr().cast())
+            .unwrap_or(c"".as_ptr())
     })
 }
 
@@ -537,11 +615,30 @@ mod tests {
     #[test]
     fn test_session_new_null_model_returns_null() {
         let opts = GlintSamplerOptions {
-            temperature: 0.0, top_k: 0, top_p: 1.0,
-            repeat_penalty: 1.0, seed: 0, max_new_tokens: 64,
+            temperature: 0.0,
+            top_k: 0,
+            top_p: 1.0,
+            repeat_penalty: 1.0,
+            seed: 0,
+            max_new_tokens: 64,
         };
         let ptr = unsafe { glint_session_new(std::ptr::null(), &opts, std::ptr::null()) };
         assert!(ptr.is_null());
+    }
+
+    #[test]
+    fn test_ffi_guard_catches_panic() {
+        clear_error();
+        // Silence the default panic hook so this expected panic doesn't spam
+        // test output; restore it afterwards.
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let r = ffi_guard(-1i32, || panic!("boom"));
+        std::panic::set_hook(prev);
+
+        assert_eq!(r, -1, "guard must return the default on panic, not unwind");
+        let err = unsafe { CStr::from_ptr(glint_last_error()) };
+        assert!(err.to_str().unwrap().contains("panic"));
     }
 
     #[test]

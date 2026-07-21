@@ -10,21 +10,94 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build-and-test:
-    runs-on: ubuntu-latest
-
+  # Build + test the default surface AND the C FFI surface on both an x86_64
+  # runner (exercises the AVX2/FMA SIMD kernels) and an ARM64 runner (exercises
+  # the scalar fallback path, which the SIMD code is cfg'd out of). Previously
+  # only a single x86_64 Ubuntu runner ran, so the scalar path and the cffi
+  # tests were never covered in CI.
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest   # x86_64 → SIMD kernels
+          - os: macos-14        # arm64  → scalar fallback
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
       - name: Build
         run: cargo build --verbose
-      - name: Run tests
+      - name: Test (default features)
         run: cargo test --verbose
+      - name: Test (C FFI feature)
+        run: cargo test --verbose --features cffi
+
+  # Formatting + lint gate. Clippy is run with `-D warnings` so any new warning
+  # fails the build; both the default and cffi feature sets are linted because
+  # the FFI module only compiles under `--features cffi`.
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Format check
+        run: cargo fmt --all --check
+      # The library surface is warning-clean and gated at -D warnings. The
+      # binary, benches, and test targets still carry pre-existing lint debt;
+      # extending the gate to --all-targets is a tracked follow-up.
+      - name: Clippy (library, default features)
+        run: cargo clippy --lib -- -D warnings
+      - name: Clippy (library, C FFI feature)
+        run: cargo clippy --lib --features cffi -- -D warnings
+
+  # Build the fuzz targets (GGUF parser + snapshot importer) so they cannot rot.
+  # A short smoke run on each catches crashes without gating the pipeline on a
+  # long fuzzing budget.
+  fuzz-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - name: Build fuzz targets
+        run: cargo fuzz build
+      - name: Smoke-run gguf_parse
+        run: cargo fuzz run gguf_parse -- -runs=20000 -max_total_time=60
+      - name: Smoke-run snapshot_import
+        run: cargo fuzz run snapshot_import -- -runs=20000 -max_total_time=60
+
+  # Run the unsafe-heavy, pure-compute modules under Miri to catch undefined
+  # behaviour (out-of-bounds reads, invalid transmutes) that tests running on
+  # real hardware cannot see. Scoped to tensor:: and cache:: — the modules
+  # with raw-pointer code — because mmap-backed tests (model::gguf) use
+  # syscalls Miri does not model. SIMD kernels are skipped automatically:
+  # is_x86_feature_detected! reports false under Miri, so the scalar paths
+  # (the same ones the ARM runner exercises natively) are what get checked.
+  miri:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      # --no-default-features: the server stack is irrelevant to these modules,
+      # and rayon is excluded because crossbeam-epoch's pointer tricks trip a
+      # known Stacked Borrows false positive under Miri. Single-threaded runs
+      # still cover every unsafe block in glint's own tensor/cache code.
+      - name: Miri (tensor + cache modules)
+        run: cargo miri test --no-default-features --lib -- tensor:: cache::
 
   check-vulkan:
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
       - name: Check Vulkan feature
         run: cargo check --verbose --features vulkan
 
@@ -32,9 +105,9 @@ jobs:
     runs-on: ubuntu-latest
     env:
       PYO3_PYTHON: python3
-
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -43,11 +116,11 @@ jobs:
 
   check-wasm:
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v4
-      - name: Add wasm target
-        run: rustup target add wasm32-unknown-unknown
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
       - uses: taiki-e/install-action@v2
         with:
           tool: wasm-pack

@@ -29,8 +29,7 @@ use crate::model::tokenizer::Tokenizer;
 use crate::sampling::SamplerConfig;
 use crate::session::snapshot::{
     export_snapshot_with_meta, import_snapshot, model_hash, peek_snapshot_cache_format,
-    restore_session, KvSnapshot,
-    SnapshotMetadata,
+    restore_session, KvSnapshot, SnapshotMetadata,
 };
 use crate::session::{CacheFormat, Session, SessionOptions};
 use crate::transformer::{forward_one_lora, forward_prefill_lora, TransformerWeights};
@@ -43,8 +42,8 @@ use crate::transformer::{forward_one_lora, forward_prefill_lora, TransformerWeig
 #[derive(Clone, Debug)]
 pub struct GenerationOptions {
     pub max_new_tokens: usize,
-    pub sampler_cfg:    SamplerConfig,
-    pub cache_format:   CacheFormat,
+    pub sampler_cfg: SamplerConfig,
+    pub cache_format: CacheFormat,
     /// Optional structured-output constraint.
     ///
     /// `None` = unconstrained (default).
@@ -61,10 +60,10 @@ impl Default for GenerationOptions {
     fn default() -> Self {
         Self {
             max_new_tokens: 256,
-            sampler_cfg:    SamplerConfig::default(),
-            cache_format:   CacheFormat::F32,
-            constraint:     None,
-            lora_adapter:   None,
+            sampler_cfg: SamplerConfig::default(),
+            cache_format: CacheFormat::F32,
+            constraint: None,
+            lora_adapter: None,
         }
     }
 }
@@ -76,9 +75,9 @@ impl Default for GenerationOptions {
 /// Weights and config are `Arc`-wrapped so the model can be cloned cheaply
 /// (e.g. across threads) without copying large weight tensors.
 pub struct Model {
-    pub weights:    Arc<TransformerWeights>,
-    pub config:     Arc<ModelConfig>,
-    pub tokenizer:  Arc<Tokenizer>,
+    pub weights: Arc<TransformerWeights>,
+    pub config: Arc<ModelConfig>,
+    pub tokenizer: Arc<Tokenizer>,
     /// FNV-64 hash of (file path bytes || file size LE u64).
     /// Used to verify that a [`KvSnapshot`] was created from the same file.
     pub model_hash: u64,
@@ -90,24 +89,24 @@ impl Model {
     /// Load a GGUF model from `path`.
     pub fn load(path: &Path) -> Result<Self, GlintError> {
         let path_str = path.to_string_lossy().into_owned();
-        let gguf = GgufModel::load(path)
-            .map_err(|e| GlintError::TensorReadError { name: "model".into(), detail: e.to_string() })?;
+        let gguf = GgufModel::load(path).map_err(|e| GlintError::TensorReadError {
+            name: "model".into(),
+            detail: e.to_string(),
+        })?;
 
-        let file_size = std::fs::metadata(path)
-            .map(|m| m.len())
-            .unwrap_or(0);
+        let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
         let hash = model_hash(&path_str, file_size);
 
-        let config = ModelConfig::from_metadata(&gguf.metadata)
-            .ok_or(GlintError::MissingModelConfig)?;
+        let config =
+            ModelConfig::from_metadata(&gguf.metadata).ok_or(GlintError::MissingModelConfig)?;
 
         let tokenizer = Tokenizer::from_gguf(&gguf)?;
-        let weights   = TransformerWeights::load(&gguf, &config)?;
+        let weights = TransformerWeights::load(&gguf, &config)?;
 
         Ok(Self {
-            weights:    Arc::new(weights),
-            config:     Arc::new(config),
-            tokenizer:  Arc::new(tokenizer),
+            weights: Arc::new(weights),
+            config: Arc::new(config),
+            tokenizer: Arc::new(tokenizer),
             model_hash: hash,
             adapter_registry: AdapterRegistry::new(),
         })
@@ -120,12 +119,9 @@ impl Model {
     /// After registration, pass the same `name` via
     /// [`GenerationOptions::lora_adapter`] (as `Some(Arc<LoraWeights>)`)
     /// or retrieve it with `model.adapter_registry.get(name)`.
-    pub fn register_lora(
-        &mut self,
-        name: &str,
-        path: &std::path::Path,
-    ) -> Result<(), GlintError> {
-        self.adapter_registry.register(name, path, self.config.block_count as usize)
+    pub fn register_lora(&mut self, name: &str, path: &std::path::Path) -> Result<(), GlintError> {
+        self.adapter_registry
+            .register(name, path, self.config.block_count as usize)
     }
 
     // ── Session lifecycle ────────────────────────────────────────────────────
@@ -134,14 +130,14 @@ impl Model {
     pub fn new_session(&self, opts: &GenerationOptions) -> Session {
         let mut session = Session::new(SessionOptions {
             max_new_tokens: opts.max_new_tokens,
-            sampler_cfg:    opts.sampler_cfg,
-            eos_token:      self.tokenizer.eos_token_id,
-            cache_format:   opts.cache_format,
+            sampler_cfg: opts.sampler_cfg,
+            eos_token: self.tokenizer.eos_token_id,
+            cache_format: opts.cache_format,
             context_length: self.config.context_length as usize,
-            n_layers:       self.config.block_count as usize,
-            n_kv_heads:     self.config.head_count_kv as usize,
-            head_dim:       self.config.head_dim() as usize,
-            lora_adapter:   opts.lora_adapter.clone(),
+            n_layers: self.config.block_count as usize,
+            n_kv_heads: self.config.head_count_kv as usize,
+            head_dim: self.config.head_dim() as usize,
+            lora_adapter: opts.lora_adapter.clone(),
         });
         if let Some(spec) = &opts.constraint {
             // Build a vocab index from the tokenizer's raw vocabulary strings.
@@ -149,7 +145,7 @@ impl Model {
                 .map(|i| self.tokenizer.decode_token(i as u32).to_owned())
                 .collect();
             let vi = VocabIndex::from_vocab(&vocab_strings);
-            session.constraint  = Some(build_constraint(spec, Arc::clone(&vi)));
+            session.constraint = Some(build_constraint(spec, Arc::clone(&vi)));
             session.vocab_index = Some(vi);
         }
         session
@@ -162,7 +158,7 @@ impl Model {
         prompt: &str,
         gpu: &mut Option<&mut GpuBackend>,
     ) -> Result<(), GlintError> {
-        let tokens = self.tokenizer.encode(prompt);
+        let tokens = self.tokenizer.encode_prompt(prompt);
         self.prefill_tokens(session, &tokens, gpu)
     }
 
@@ -207,18 +203,21 @@ impl Model {
             // empty one as a fallback if somehow missing.
             static EMPTY_VI: std::sync::OnceLock<std::sync::Arc<crate::constrained::VocabIndex>> =
                 std::sync::OnceLock::new();
-            let vi = session.vocab_index.as_ref()
-                .unwrap_or_else(|| EMPTY_VI.get_or_init(|| {
-                    crate::constrained::VocabIndex::from_vocab(&[])
-                }));
+            let vi = session.vocab_index.as_ref().unwrap_or_else(|| {
+                EMPTY_VI.get_or_init(|| crate::constrained::VocabIndex::from_vocab(&[]))
+            });
             let mask = constraint.allowed_tokens(&session.tokens, vi);
-            let tok  = session.sampler.sample_constrained(
-                session.last_logits.data(), &session.tokens, &mask,
+            let tok = session.sampler.sample_constrained(
+                session.last_logits.data(),
+                &session.tokens,
+                &mask,
             );
             constraint.advance(tok);
             tok
         } else {
-            session.sampler.sample(session.last_logits.data(), &session.tokens)
+            session
+                .sampler
+                .sample(session.last_logits.data(), &session.tokens)
         };
         session.tokens.push(next);
         if next == session.eos_token {
@@ -255,7 +254,9 @@ impl Model {
         let mut new_tokens = Vec::new();
         while let Some(tok) = self.decode_one(&mut session, gpu) {
             new_tokens.push(tok);
-            if tok == session.eos_token { break; }
+            if tok == session.eos_token {
+                break;
+            }
         }
         Ok(new_tokens)
     }
@@ -276,7 +277,9 @@ impl Model {
         while let Some(tok) = self.decode_one(&mut session, gpu) {
             new_tokens.push(tok);
             let stop = tok == session.eos_token || !on_token(tok);
-            if stop { break; }
+            if stop {
+                break;
+            }
         }
         Ok(new_tokens)
     }
@@ -305,14 +308,14 @@ impl Model {
     ) -> Result<Session, GlintError> {
         let session_opts = SessionOptions {
             max_new_tokens: opts.max_new_tokens,
-            sampler_cfg:    opts.sampler_cfg,
-            eos_token:      self.tokenizer.eos_token_id,
-            cache_format:   snap.meta.cache_format,
+            sampler_cfg: opts.sampler_cfg,
+            eos_token: self.tokenizer.eos_token_id,
+            cache_format: snap.meta.cache_format,
             context_length: self.config.context_length as usize,
-            n_layers:       self.config.block_count as usize,
-            n_kv_heads:     self.config.head_count_kv as usize,
-            head_dim:       self.config.head_dim() as usize,
-            lora_adapter:   opts.lora_adapter.clone(),
+            n_layers: self.config.block_count as usize,
+            n_kv_heads: self.config.head_count_kv as usize,
+            head_dim: self.config.head_dim() as usize,
+            lora_adapter: opts.lora_adapter.clone(),
         };
         let mut session = restore_session(snap, session_opts)?;
         if let Some(spec) = &opts.constraint {
@@ -357,11 +360,11 @@ impl Model {
 
     fn snapshot_meta(&self) -> SnapshotMetadata {
         SnapshotMetadata {
-            model_hash:  self.model_hash,
+            model_hash: self.model_hash,
             context_len: self.config.context_length,
-            n_layers:    self.config.block_count,
-            n_kv_heads:  self.config.head_count_kv,
-            head_dim:    self.config.head_dim(),
+            n_layers: self.config.block_count,
+            n_kv_heads: self.config.head_count_kv,
+            head_dim: self.config.head_dim(),
             cache_format: CacheFormat::F32,
         }
     }
@@ -396,26 +399,61 @@ mod tests {
         };
         let weights = TransformerWeights {
             token_embedding: QuantizedTensor::from_f32(
-                &(0..32).map(|i| i as f32 * 0.1).collect::<Vec<_>>(), 8, 4),
+                &(0..32).map(|i| i as f32 * 0.1).collect::<Vec<_>>(),
+                8,
+                4,
+            ),
             layers: vec![LayerWeights {
                 attn_norm: Tensor::from_vec(vec![1.0; 4], &[4]),
-                ffn_norm:  Tensor::from_vec(vec![1.0; 4], &[4]),
-                attn_q:      QuantizedTensor::from_f32(&(0..16).map(|i| i as f32 * 0.05 - 0.4).collect::<Vec<_>>(), 4, 4),
-                attn_k:      QuantizedTensor::from_f32(&(0..8).map(|i| i as f32 * 0.1 - 0.3).collect::<Vec<_>>(), 2, 4),
-                attn_v:      QuantizedTensor::from_f32(&(0..8).map(|i| i as f32 * 0.07 - 0.2).collect::<Vec<_>>(), 2, 4),
-                attn_output: QuantizedTensor::from_f32(&(0..16).map(|i| i as f32 * 0.03 - 0.2).collect::<Vec<_>>(), 4, 4),
-                ffn_gate: QuantizedTensor::from_f32(&(0..32).map(|i| i as f32 * 0.02 - 0.3).collect::<Vec<_>>(), 8, 4),
-                ffn_up:   QuantizedTensor::from_f32(&(0..32).map(|i| i as f32 * 0.015 - 0.2).collect::<Vec<_>>(), 8, 4),
-                ffn_down: QuantizedTensor::from_f32(&(0..32).map(|i| i as f32 * 0.01 - 0.15).collect::<Vec<_>>(), 4, 8),
+                ffn_norm: Tensor::from_vec(vec![1.0; 4], &[4]),
+                attn_q: QuantizedTensor::from_f32(
+                    &(0..16).map(|i| i as f32 * 0.05 - 0.4).collect::<Vec<_>>(),
+                    4,
+                    4,
+                ),
+                attn_k: QuantizedTensor::from_f32(
+                    &(0..8).map(|i| i as f32 * 0.1 - 0.3).collect::<Vec<_>>(),
+                    2,
+                    4,
+                ),
+                attn_v: QuantizedTensor::from_f32(
+                    &(0..8).map(|i| i as f32 * 0.07 - 0.2).collect::<Vec<_>>(),
+                    2,
+                    4,
+                ),
+                attn_output: QuantizedTensor::from_f32(
+                    &(0..16).map(|i| i as f32 * 0.03 - 0.2).collect::<Vec<_>>(),
+                    4,
+                    4,
+                ),
+                ffn_gate: QuantizedTensor::from_f32(
+                    &(0..32).map(|i| i as f32 * 0.02 - 0.3).collect::<Vec<_>>(),
+                    8,
+                    4,
+                ),
+                ffn_up: QuantizedTensor::from_f32(
+                    &(0..32).map(|i| i as f32 * 0.015 - 0.2).collect::<Vec<_>>(),
+                    8,
+                    4,
+                ),
+                ffn_down: QuantizedTensor::from_f32(
+                    &(0..32).map(|i| i as f32 * 0.01 - 0.15).collect::<Vec<_>>(),
+                    4,
+                    8,
+                ),
             }],
             output_norm: Tensor::from_vec(vec![1.0; 4], &[4]),
-            output:      QuantizedTensor::from_f32(&(0..32).map(|i| i as f32 * 0.1 - 1.6).collect::<Vec<_>>(), 8, 4),
+            output: QuantizedTensor::from_f32(
+                &(0..32).map(|i| i as f32 * 0.1 - 1.6).collect::<Vec<_>>(),
+                8,
+                4,
+            ),
             lora: None,
         };
         Model {
-            weights:    Arc::new(weights),
-            config:     Arc::new(config),
-            tokenizer:  Arc::new(Tokenizer::bare_for_test(8, 1, 2)),
+            weights: Arc::new(weights),
+            config: Arc::new(config),
+            tokenizer: Arc::new(Tokenizer::bare_for_test(8, 1, 2)),
             model_hash: 0,
             adapter_registry: AdapterRegistry::new(),
         }
@@ -424,8 +462,8 @@ mod tests {
     #[test]
     fn test_new_session_f32() {
         let model = make_tiny_model();
-        let opts  = GenerationOptions::default();
-        let s     = model.new_session(&opts);
+        let opts = GenerationOptions::default();
+        let s = model.new_session(&opts);
         assert!(s.tokens.is_empty());
         assert_eq!(s.eos_token, 2);
         assert_eq!(s.max_remaining, 256);
@@ -434,7 +472,7 @@ mod tests {
     #[test]
     fn test_prefill_tokens_sets_pos() {
         let model = make_tiny_model();
-        let opts  = GenerationOptions::default();
+        let opts = GenerationOptions::default();
         let mut s = model.new_session(&opts);
         model.prefill_tokens(&mut s, &[1, 3, 5], &mut None).unwrap();
         assert_eq!(s.tokens, vec![1, 3, 5]);
@@ -444,7 +482,10 @@ mod tests {
     #[test]
     fn test_decode_one_advances_session() {
         let model = make_tiny_model();
-        let opts  = GenerationOptions { max_new_tokens: 5, ..Default::default() };
+        let opts = GenerationOptions {
+            max_new_tokens: 5,
+            ..Default::default()
+        };
         let mut s = model.new_session(&opts);
         model.prefill_tokens(&mut s, &[1], &mut None).unwrap();
         let tok = model.decode_one(&mut s, &mut None);
@@ -456,9 +497,12 @@ mod tests {
     #[test]
     fn test_generate_returns_new_tokens_only() {
         let model = make_tiny_model();
-        let opts  = GenerationOptions {
+        let opts = GenerationOptions {
             max_new_tokens: 4,
-            sampler_cfg: SamplerConfig { seed: Some(42), ..Default::default() },
+            sampler_cfg: SamplerConfig {
+                seed: Some(42),
+                ..Default::default()
+            },
             ..Default::default()
         };
         // generate will error if tokenizer can't encode, but with our toy model
@@ -479,13 +523,18 @@ mod tests {
     #[test]
     fn test_snapshot_restore_rebuilds_last_logits() {
         let model = make_tiny_model();
-        let opts  = GenerationOptions {
+        let opts = GenerationOptions {
             max_new_tokens: 4,
-            sampler_cfg: SamplerConfig { seed: Some(7), ..Default::default() },
+            sampler_cfg: SamplerConfig {
+                seed: Some(7),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let mut original = model.new_session(&opts);
-        model.prefill_tokens(&mut original, &[1, 3], &mut None).unwrap();
+        model
+            .prefill_tokens(&mut original, &[1, 3], &mut None)
+            .unwrap();
         assert!(model.decode_one(&mut original, &mut None).is_some());
 
         let bytes = model.export_session(&original).unwrap();
@@ -500,12 +549,14 @@ mod tests {
     #[test]
     fn test_q8_snapshot_roundtrip_via_model_api() {
         let model = make_tiny_model();
-        let opts  = GenerationOptions {
+        let opts = GenerationOptions {
             cache_format: CacheFormat::Q8,
             ..Default::default()
         };
         let mut session = model.new_session(&opts);
-        model.prefill_tokens(&mut session, &[1, 3, 5], &mut None).unwrap();
+        model
+            .prefill_tokens(&mut session, &[1, 3, 5], &mut None)
+            .unwrap();
 
         let bytes = model.export_session(&session).unwrap();
         let snap = model.import_snapshot_bytes(&bytes).unwrap();
@@ -523,7 +574,9 @@ mod tests {
             ..Default::default()
         };
         let mut original = model.new_session(&opts);
-        model.prefill_tokens(&mut original, &[1], &mut None).unwrap();
+        model
+            .prefill_tokens(&mut original, &[1], &mut None)
+            .unwrap();
         original.tokens.push(3);
         original.cache.write(0, 1, &[0.0, 0.0], &[0.0, 0.0]);
         original.cache.advance();
