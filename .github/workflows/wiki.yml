@@ -2,7 +2,9 @@ name: Deploy Wiki
 
 on:
   push:
-    branches: [main]
+    # This repository's default branch is `master`; the workflow previously
+    # watched `main`, so it never fired on any real push.
+    branches: [master]
     paths:
       - 'wiki/**'
 
@@ -28,7 +30,7 @@ jobs:
 
       - name: Install mdBook
         run: |
-          curl -sSL https://github.com/rust-lang/mdBook/releases/download/v0.4.40/mdbook-v0.4.40-x86_64-unknown-linux-gnu.tar.gz \
+          curl -fsSL https://github.com/rust-lang/mdBook/releases/download/v0.4.40/mdbook-v0.4.40-x86_64-unknown-linux-gnu.tar.gz \
             | tar -xz --directory /usr/local/bin
 
       - name: Build wiki

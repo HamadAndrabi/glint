@@ -90,8 +90,11 @@ jobs:
       # and rayon is excluded because crossbeam-epoch's pointer tricks trip a
       # known Stacked Borrows false positive under Miri. Single-threaded runs
       # still cover every unsafe block in glint's own tensor/cache code.
+      # Quoted: an unquoted plain scalar cannot contain ": ", so the `tensor::`
+      # / `cache::` test filters would otherwise be parsed as YAML mapping
+      # syntax and the whole workflow file would fail to load.
       - name: Miri (tensor + cache modules)
-        run: cargo miri test --no-default-features --lib -- tensor:: cache::
+        run: "cargo miri test --no-default-features --lib -- tensor:: cache::"
 
   check-vulkan:
     runs-on: ubuntu-latest

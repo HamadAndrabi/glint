@@ -15,6 +15,10 @@ on:
 jobs:
   parity:
     runs-on: ubuntu-latest
+    # Bounded so an install/download regression fails fast instead of burning
+    # the runner budget (a previous unbounded llama.cpp source build was killed
+    # by the runner after several minutes, leaving the parity step skipped).
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -22,18 +26,68 @@ jobs:
       - name: Build glint (release)
         run: cargo build --release
 
+      # Prefer the prebuilt Linux x64 binaries. The release asset name embeds the
+      # build number (llama-b<NNNN>-bin-ubuntu-x64.zip), so there is no stable
+      # /latest/download/ URL to hard-code — resolve it from the release
+      # metadata. Every download uses `curl -f` so an HTTP error fails loudly
+      # instead of writing the error page to disk and looking like a success.
       - name: Install llama.cpp
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          curl -sL -o llama.tar.gz \
-            https://github.com/ggml-org/llama.cpp/releases/latest/download/llama-bin-ubuntu-x64.tar.gz \
-            && tar xzf llama.tar.gz || {
-            # Fall back to building from source if the release asset moved.
+          set -euo pipefail
+          mkdir -p build/bin
+
+          url=""
+          if curl -fsSL -o release.json \
+               -H "Authorization: Bearer $GH_TOKEN" \
+               -H "Accept: application/vnd.github+json" \
+               https://api.github.com/repos/ggml-org/llama.cpp/releases/latest; then
+            url=$(jq -r '[.assets[]
+                          | select(.name | test("bin-ubuntu-x64\\.zip$"))
+                          | .browser_download_url][0] // ""' release.json)
+          fi
+
+          if [ -n "$url" ] && curl -fsSL -o llama.zip "$url"; then
+            echo "Using prebuilt release asset: $url"
+            unzip -q -o llama.zip -d llama-prebuilt
+            # The archive layout has moved around between releases (build/bin/,
+            # bin/, flat) — locate the binaries rather than assuming a path.
+            found=$(find llama-prebuilt -type f \
+                      \( -name llama-completion -o -name llama-cli \) -print -quit)
+            [ -n "$found" ] || { echo "error: no llama binary in asset" >&2; exit 1; }
+            cp -a "$(dirname "$found")"/. build/bin/
+          else
+            echo "Prebuilt asset unavailable — building llama-cli from source." >&2
             git clone --depth 1 https://github.com/ggml-org/llama.cpp
-            cmake -S llama.cpp -B llama.cpp/build -DCMAKE_BUILD_TYPE=Release
-            cmake --build llama.cpp/build -j --target llama-cli
-            mkdir -p build/bin && cp llama.cpp/build/bin/llama-cli build/bin/
-          }
+            # Scoped down and with bounded parallelism: the default configuration
+            # also builds the server, tests, examples and the tools/ui npm asset
+            # bundle, which is what previously got this job killed.
+            cmake -S llama.cpp -B llama.cpp/build \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DLLAMA_BUILD_TESTS=OFF \
+              -DLLAMA_BUILD_EXAMPLES=OFF \
+              -DLLAMA_BUILD_SERVER=OFF \
+              -DLLAMA_CURL=OFF
+            cmake --build llama.cpp/build -j"$(nproc)" --target llama-cli
+            cp -a llama.cpp/build/bin/. build/bin/
+          fi
+
+          chmod +x build/bin/* 2>/dev/null || true
           echo "$GITHUB_WORKSPACE/build/bin" >> "$GITHUB_PATH"
+          # The prebuilt binaries link shared libs sitting beside them, so the
+          # loader needs that directory too — without this the parity step fails
+          # at exec time rather than on a real output divergence.
+          echo "LD_LIBRARY_PATH=$GITHUB_WORKSPACE/build/bin${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+            >> "$GITHUB_ENV"
+
+          # Smoke-check here so a broken install is attributed to this step.
+          # $GITHUB_PATH/$GITHUB_ENV only take effect in *later* steps.
+          export LD_LIBRARY_PATH="$GITHUB_WORKSPACE/build/bin${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          bin=build/bin/llama-completion
+          [ -x "$bin" ] || bin=build/bin/llama-cli
+          [ -x "$bin" ] || { echo "error: no llama binary installed" >&2; exit 1; }
+          "$bin" --version
 
       - name: Cache models
         uses: actions/cache@v4
