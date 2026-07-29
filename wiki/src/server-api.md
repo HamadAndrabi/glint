@@ -262,10 +262,41 @@ All errors return a JSON body:
 These behaviors are guaranteed and clients can rely on them:
 
 1. Non-streaming is the default (`stream: false` if omitted)
-2. The final SSE chunk before `[DONE]` always carries `"finish_reason": "stop"`
-3. Every SSE stream terminates with `data: [DONE]`
-4. Content chunks have `finish_reason: null`; only the final chunk has `"stop"`
+2. A stream that ran to completion ends with a final chunk carrying a
+   `finish_reason`, followed by `data: [DONE]`
+3. `finish_reason` is `"stop"` when the model emitted its EOS token, and
+   `"length"` when generation was cut short by `max_tokens` or by the model's
+   context window
+4. Content chunks have `finish_reason: null`; only the final chunk sets it
 5. Chat streams always start with a role-only delta chunk
+
+### Truncated streams
+
+There is one case where a stream does **not** end with `[DONE]`.
+
+The engine never blocks on delivery, so a client that falls far enough behind
+is evicted and its undelivered tokens are dropped (see
+[Backpressure](#backpressure-and-slow-clients) below). The content such a client
+received is a strict *prefix* of what was generated. Terminating that stream
+normally would make a partial response indistinguishable from a complete one —
+including for clients that only wait for `[DONE]` and never inspect
+`finish_reason` — so instead the stream ends with an SSE `error` event and no
+terminator:
+
+```text
+event: error
+data: {"error":{"message":"The response was truncated: ...","type":"server_error","code":"truncated"}}
+```
+
+Key off `error.code == "truncated"`. The absence of `[DONE]` is itself the
+signal: **treat a stream that ends without `[DONE]` as incomplete.**
+
+On the non-streaming endpoints the same condition returns **HTTP 500** rather
+than a short 200, for the same reason. On `/v1/responses`, which signals
+outcome through typed events instead of `[DONE]`, a truncated stream emits
+`response.failed` in place of both `response.output_text.done` and
+`response.completed`, and a non-streaming truncation is likewise a 500;
+a `"length"` outcome maps to `status: "incomplete"`.
 
 ---
 
@@ -315,9 +346,20 @@ stalled reader can no longer freeze decoding for everyone else:
   sequence is evicted. A finished sequence is also given a bounded `DRAIN_TIMEOUT`
   (10 s) to accept its remaining tokens before the undelivered tail is dropped.
 
+Eviction costs the client the tail of its response, so it must be observable.
+A closed token channel on its own cannot say *why* it closed, so every sequence
+carries an out-of-band outcome — `Stop`, `Length`, `Truncated`, or `Incomplete`
+— that the engine records **before** dropping the sender. The HTTP layer reads
+it once the token stream ends and terminates the response accordingly: normally
+for the first two, and as a [truncated stream](#truncated-streams) for the
+others. Any sequence that leaves the engine without recording an outcome (a
+rejected prompt, or a decode panic) reads `Incomplete` and is likewise reported
+as a failure rather than as a successful empty completion.
+
 ### Fault isolation
 
 The engine's decode loop runs under `catch_unwind`. If a decode step panics, the
 panic is logged as `FATAL`, every in-flight sequence is dropped (each client
 observes its stream ending), and the engine loop is respawned rather than silently
-zombieing the server.
+zombieing the server. Those dropped sequences never recorded an outcome, so their
+clients see a truncation error rather than a clean end-of-stream.

@@ -37,6 +37,13 @@
 //! [`DRAIN_TIMEOUT`]) — removal on finish alone would silently drop the tail
 //! of a completion whose reader is momentarily behind.
 //!
+//! Eviction is still possible, though, and a closed token channel looks the
+//! same whether the completion finished or the engine gave up on it. Every
+//! sequence therefore carries a [`FinishSignal`]: the engine records a
+//! [`Finish`] there *before* dropping the sender, so the HTTP layer can tell a
+//! finished completion ([`Finish::Stop`] / [`Finish::Length`]) from a truncated
+//! one ([`Finish::Truncated`]) and terminate the stream honestly.
+//!
 //! # Fault containment
 //!
 //! The engine thread runs its loop under `catch_unwind`. If a decode step
@@ -45,6 +52,7 @@
 //! state — the server keeps serving subsequent requests rather than turning
 //! into a zombie that accepts work it can never perform.
 
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -60,6 +68,81 @@ use crate::transformer::{forward_one_lora, forward_prefill_lora, TransformerWeig
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
+/// Why a sequence stopped producing tokens.
+///
+/// Token *data* flows over an mpsc channel, but that channel closing cannot
+/// distinguish "the completion finished" from "the engine gave up on this
+/// client and dropped the rest of it". Without that distinction the HTTP layer
+/// has no honest way to terminate a stream, so the outcome travels out of band
+/// alongside the tokens (see [`FinishSignal`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Finish {
+    /// No outcome was ever recorded — the decode loop panicked and the
+    /// sequence was dropped, or the prompt was rejected during prefill.
+    /// Treated exactly like [`Finish::Truncated`]: callers must not report
+    /// success for a sequence that never reported one.
+    Incomplete = 0,
+    /// The EOS token was sampled — the model chose to stop.
+    Stop = 1,
+    /// The request's token budget or the model's context window ran out.
+    /// Generation was cut short but every produced token was delivered.
+    Length = 2,
+    /// Evicted before its queued tail could be delivered (the client fell too
+    /// far behind, or disconnected). What the client received is a strict
+    /// prefix of what was generated.
+    Truncated = 3,
+}
+
+/// Shared, write-once-per-outcome cell carrying a sequence's [`Finish`].
+///
+/// The engine writes the outcome **before** dropping the token sender, so a
+/// reader that observes the channel closing is guaranteed to observe the
+/// outcome too (`Release` store paired with the `Acquire` load in [`get`]).
+///
+/// [`get`]: FinishSignal::get
+#[derive(Clone, Debug)]
+pub struct FinishSignal(Arc<AtomicU8>);
+
+impl FinishSignal {
+    fn new() -> Self {
+        Self(Arc::new(AtomicU8::new(Finish::Incomplete as u8)))
+    }
+
+    /// Record the outcome. Later calls overwrite earlier ones — a sequence
+    /// that finished cleanly and *then* got evicted mid-drain is truncated.
+    fn set(&self, finish: Finish) {
+        self.0.store(finish as u8, Ordering::Release);
+    }
+
+    /// Read the recorded outcome. Only meaningful once the token channel has
+    /// closed; before that the sequence is still running and reads
+    /// [`Finish::Incomplete`].
+    pub fn get(&self) -> Finish {
+        match self.0.load(Ordering::Acquire) {
+            1 => Finish::Stop,
+            2 => Finish::Length,
+            3 => Finish::Truncated,
+            _ => Finish::Incomplete,
+        }
+    }
+}
+
+impl Default for FinishSignal {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// What [`InferenceEngine::submit`] hands back: the token stream plus the
+/// out-of-band outcome for the sequence feeding it.
+pub struct Submitted {
+    /// Generated token IDs. Closes when the sequence leaves the engine.
+    pub rx: mpsc::Receiver<u32>,
+    /// Read this *after* `rx` closes to learn why the stream ended.
+    pub finish: FinishSignal,
+}
+
 /// A request submitted to the engine by a route handler.
 pub struct InferenceRequest {
     pub prompt_tokens: Vec<u32>,
@@ -73,6 +156,8 @@ pub struct InferenceRequest {
     pub lora_name: Option<String>,
     /// Tokens are delivered here; dropping the receiver signals client disconnect.
     pub tx: mpsc::Sender<u32>,
+    /// Where the engine records why this sequence ended, before dropping `tx`.
+    pub finish: FinishSignal,
 }
 
 /// Admission limits for the engine.
@@ -124,6 +209,10 @@ struct ActiveSequence {
     /// but stays alive until `pending` is empty, the client disconnects, or
     /// [`DRAIN_TIMEOUT`] elapses — whichever comes first.
     draining_since: Option<Instant>,
+    /// Outcome cell shared with the requesting route. Written when decoding
+    /// stops ([`Finish::Stop`] / [`Finish::Length`]) and overwritten with
+    /// [`Finish::Truncated`] if the sequence is later evicted mid-drain.
+    finish: FinishSignal,
 }
 
 /// Per-sequence outbound backlog past which we treat the client as unable to
@@ -236,6 +325,10 @@ impl InferenceEngine {
     /// they arrive. Fails fast with [`SubmitError::Busy`] when the request
     /// queue is full (shed load — e.g. HTTP 503) and [`SubmitError::Shutdown`]
     /// if the engine thread is gone.
+    ///
+    /// The returned [`Submitted::finish`] carries why the stream ended and must
+    /// be consulted once the receiver closes — a closed channel alone does not
+    /// distinguish a finished completion from an evicted one.
     pub fn submit(
         &self,
         prompt_tokens: Vec<u32>,
@@ -244,8 +337,9 @@ impl InferenceEngine {
         eos_token: u32,
         constraint: Option<ConstraintSpec>,
         lora_name: Option<String>,
-    ) -> Result<mpsc::Receiver<u32>, SubmitError> {
+    ) -> Result<Submitted, SubmitError> {
         let (token_tx, token_rx) = mpsc::channel(64);
+        let finish = FinishSignal::new();
         let req = InferenceRequest {
             prompt_tokens,
             max_new_tokens,
@@ -254,9 +348,13 @@ impl InferenceEngine {
             constraint,
             lora_name,
             tx: token_tx,
+            finish: finish.clone(),
         };
         match self.tx.try_send(req) {
-            Ok(()) => Ok(token_rx),
+            Ok(()) => Ok(Submitted {
+                rx: token_rx,
+                finish,
+            }),
             Err(mpsc::error::TrySendError::Full(_)) => Err(SubmitError::Busy),
             Err(mpsc::error::TrySendError::Closed(_)) => Err(SubmitError::Shutdown),
         }
@@ -327,6 +425,8 @@ fn engine_loop(
             if seq.draining_since.is_none() {
                 let s = &mut seq.session;
                 if s.max_remaining == 0 {
+                    // Budget exhausted before this step — nothing more to emit.
+                    seq.finish.set(Finish::Length);
                     seq.draining_since = Some(now);
                 } else {
                     s.max_remaining -= 1;
@@ -346,7 +446,13 @@ fn engine_loop(
 
                     // Stop producing at EOS or when the next decode step would
                     // overflow the KV cache (which asserts, killing the loop).
-                    if next == s.eos_token || s.tokens.len() >= context_length {
+                    // These are different outcomes to a client: EOS is the model
+                    // choosing to stop, a full context is generation cut short.
+                    if next == s.eos_token {
+                        seq.finish.set(Finish::Stop);
+                        seq.draining_since = Some(now);
+                    } else if s.tokens.len() >= context_length {
+                        seq.finish.set(Finish::Length);
                         seq.draining_since = Some(now);
                     }
                 }
@@ -356,10 +462,21 @@ fn engine_loop(
             // draining or not. A finished sequence leaves only once its queue
             // is empty (all tokens delivered) or its client gives up on us.
             match try_deliver(&seq.tx, &mut seq.pending) {
-                Delivery::Disconnected | Delivery::TooSlow => finished.push(i),
+                // Evicted with tokens still queued: whatever the client got is
+                // a strict prefix of the completion. Overwrites any Stop/Length
+                // already recorded — the outcome the client can observe is that
+                // its response is incomplete.
+                Delivery::Disconnected | Delivery::TooSlow => {
+                    seq.finish.set(Finish::Truncated);
+                    finished.push(i);
+                }
                 Delivery::Ok => match seq.draining_since {
+                    // Fully drained — keep the Stop/Length recorded at finish.
                     Some(_) if seq.pending.is_empty() => finished.push(i),
-                    Some(since) if now.duration_since(since) > DRAIN_TIMEOUT => finished.push(i),
+                    Some(since) if now.duration_since(since) > DRAIN_TIMEOUT => {
+                        seq.finish.set(Finish::Truncated);
+                        finished.push(i);
+                    }
                     _ => {}
                 },
             }
@@ -414,7 +531,9 @@ fn engine_loop(
 ///
 /// A prompt that does not fit the model's context window is rejected outright:
 /// prefilling it would overflow the KV cache (a hard assert). The request's
-/// token channel is dropped, which the client observes as an empty stream.
+/// token channel is dropped without an outcome ever being recorded, so its
+/// [`FinishSignal`] stays [`Finish::Incomplete`] and the client sees an error
+/// rather than a successful empty completion.
 /// (The HTTP layer clamps `max_tokens` against the context before submitting,
 /// so this guard only fires for non-HTTP callers or future clamping bugs.)
 #[allow(clippy::too_many_arguments)]
@@ -471,6 +590,7 @@ fn prefill_and_add(
         tx: req.tx,
         pending: std::collections::VecDeque::new(),
         draining_since: None,
+        finish: req.finish,
     });
 }
 
@@ -601,12 +721,21 @@ mod tests {
     /// its token budget (deterministic lengths for the assertions below).
     const NO_EOS: u32 = 9999;
 
-    fn drain_all(mut rx: mpsc::Receiver<u32>) -> Vec<u32> {
+    fn drain_all(sub: Submitted) -> Vec<u32> {
+        drain_with_finish(sub).0
+    }
+
+    /// Drain the stream and read the outcome the engine recorded for it.
+    ///
+    /// Reading `finish` only after the channel closes is the contract callers
+    /// must follow: the engine writes the outcome before dropping the sender.
+    fn drain_with_finish(sub: Submitted) -> (Vec<u32>, Finish) {
+        let Submitted { mut rx, finish } = sub;
         let mut out = Vec::new();
         while let Some(tok) = rx.blocking_recv() {
             out.push(tok);
         }
-        out
+        (out, finish.get())
     }
 
     // Regression test for the token-loss bug: a completion longer than the
@@ -656,12 +785,12 @@ mod tests {
     #[test]
     fn disconnect_does_not_wedge_engine() {
         let engine = start_tiny_engine(EngineLimits::default(), 256);
-        let mut rx_a = engine
+        let mut sub_a = engine
             .submit(vec![1, 2], 200, greedy_cfg(), NO_EOS, None, None)
             .expect("queue has room");
         // Read one token to be sure the sequence is live, then walk away.
-        assert!(rx_a.blocking_recv().is_some());
-        drop(rx_a);
+        assert!(sub_a.rx.blocking_recv().is_some());
+        drop(sub_a);
 
         let budget = 15;
         let rx_b = engine
@@ -682,20 +811,21 @@ mod tests {
 
         // Request A: long-running; wait for its first token so we know the
         // engine has admitted it (active=1 == max_active, admission paused).
-        let mut rx_a = engine
+        let mut sub_a = engine
             .submit(vec![1, 2], 200, greedy_cfg(), NO_EOS, None, None)
             .expect("first submit");
-        assert!(rx_a.blocking_recv().is_some());
+        assert!(sub_a.rx.blocking_recv().is_some());
 
         // Request B parks in the queue (capacity 1 → now full).
-        let _rx_b = engine
+        let _sub_b = engine
             .submit(vec![3, 4], 5, greedy_cfg(), NO_EOS, None, None)
             .expect("second submit fills the queue");
 
         // Request C: queue full → shed load.
-        let err = engine
-            .submit(vec![5, 6], 5, greedy_cfg(), NO_EOS, None, None)
-            .expect_err("third submit must be rejected");
+        let err = match engine.submit(vec![5, 6], 5, greedy_cfg(), NO_EOS, None, None) {
+            Ok(_) => panic!("third submit must be rejected"),
+            Err(err) => err,
+        };
         assert_eq!(err, SubmitError::Busy);
     }
 
@@ -720,5 +850,108 @@ mod tests {
             .submit(vec![1, 2], budget, greedy_cfg(), NO_EOS, None, None)
             .expect("engine still accepts work");
         assert_eq!(drain_all(rx).len(), budget);
+    }
+
+    // ── Finish-outcome tests ─────────────────────────────────────────────
+    //
+    // A closed token channel looks identical whether the completion finished
+    // or the engine abandoned it, so every sequence also records a `Finish`.
+    // These pin each outcome to the condition that produces it — the HTTP
+    // layer turns them directly into finish_reason / stream termination.
+
+    // Running out of token budget is "length", not "stop". Reporting this as
+    // "stop" tells a client the model chose to end there, when in fact the
+    // reply was cut off and could be continued.
+    #[test]
+    fn budget_exhaustion_reports_length() {
+        let engine = start_tiny_engine(EngineLimits::default(), 256);
+        let budget = 12;
+        let sub = engine
+            .submit(vec![1, 2], budget, greedy_cfg(), NO_EOS, None, None)
+            .expect("queue has room");
+        let (tokens, finish) = drain_with_finish(sub);
+        assert_eq!(tokens.len(), budget, "budget is spent in full");
+        assert_eq!(finish, Finish::Length);
+    }
+
+    // Filling the context window is also "length" — generation stopped short
+    // for a reason outside the model's control.
+    #[test]
+    fn context_limit_reports_length() {
+        let context = 24u32;
+        let engine = start_tiny_engine(EngineLimits::default(), context);
+        let prompt = vec![1, 2, 3];
+        // Budget far exceeds the remaining context, so the context bound is
+        // what actually stops generation.
+        let sub = engine
+            .submit(prompt.clone(), 500, greedy_cfg(), NO_EOS, None, None)
+            .expect("queue has room");
+        let (tokens, finish) = drain_with_finish(sub);
+        assert_eq!(finish, Finish::Length);
+        assert_eq!(
+            prompt.len() + tokens.len(),
+            context as usize,
+            "generation runs exactly up to the context window"
+        );
+    }
+
+    // Sampling EOS is the one genuine "stop". Greedy decoding is
+    // deterministic, so learn which token this model emits first, then re-run
+    // declaring that token to be EOS.
+    #[test]
+    fn eos_reports_stop() {
+        let engine = start_tiny_engine(EngineLimits::default(), 256);
+        let prompt = vec![1, 2];
+        let probe = engine
+            .submit(prompt.clone(), 1, greedy_cfg(), NO_EOS, None, None)
+            .expect("queue has room");
+        let first = drain_all(probe)[0];
+
+        let sub = engine
+            .submit(prompt, 50, greedy_cfg(), first, None, None)
+            .expect("queue has room");
+        let (tokens, finish) = drain_with_finish(sub);
+        assert_eq!(finish, Finish::Stop);
+        assert_eq!(
+            tokens,
+            vec![first],
+            "the EOS token is delivered, then generation stops"
+        );
+    }
+
+    // A client that walks away is evicted, and the tail it never read is gone
+    // — that is truncation, not completion. Holding the signal after dropping
+    // the receiver is exactly how a route observes this.
+    #[test]
+    fn abandoned_stream_reports_truncated() {
+        let engine = start_tiny_engine(EngineLimits::default(), 256);
+        let Submitted { mut rx, finish } = engine
+            .submit(vec![1, 2], 500, greedy_cfg(), NO_EOS, None, None)
+            .expect("queue has room");
+        assert!(rx.blocking_recv().is_some(), "sequence is live");
+        drop(rx);
+
+        // The engine notices on its next delivery attempt.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while finish.get() == Finish::Incomplete && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(finish.get(), Finish::Truncated);
+    }
+
+    // A prompt the engine refuses never reaches the decode loop, so no outcome
+    // is ever recorded. It must read Incomplete rather than defaulting to
+    // something success-shaped: routes turn this into an error, not into an
+    // empty-but-successful completion.
+    #[test]
+    fn rejected_prompt_reports_incomplete() {
+        let engine = start_tiny_engine(EngineLimits::default(), 32);
+        let huge_prompt: Vec<u32> = (0..40).map(|i| i % 8).collect(); // 40 > 32
+        let sub = engine
+            .submit(huge_prompt, 10, greedy_cfg(), NO_EOS, None, None)
+            .expect("submit itself succeeds");
+        let (tokens, finish) = drain_with_finish(sub);
+        assert!(tokens.is_empty());
+        assert_eq!(finish, Finish::Incomplete);
     }
 }

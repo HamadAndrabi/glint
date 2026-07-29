@@ -28,6 +28,7 @@ use crate::model::chat_template::Message;
 use crate::sampling::SamplerConfig;
 use crate::transformer::embed_batch;
 
+use super::engine::{Finish, FinishSignal};
 use super::state::AppState;
 use super::types::*;
 
@@ -111,6 +112,8 @@ struct PreparedGeneration {
 
 struct StartedGeneration {
     rx: tokio::sync::mpsc::Receiver<u32>,
+    /// Why the sequence ended — only meaningful once `rx` has closed.
+    finish: FinishSignal,
     prompt_len: usize,
     model_name: String,
 }
@@ -118,6 +121,39 @@ struct StartedGeneration {
 struct CompletedGeneration {
     text: String,
     completion_tokens: usize,
+    /// `Some(reason)` for a complete response, `None` if it was truncated.
+    finish_reason: Option<&'static str>,
+}
+
+/// Map an engine outcome to its OpenAI `finish_reason`.
+///
+/// `None` means there is no honest value: the client received a strict prefix
+/// of the completion, so the response must not be presented as finished. See
+/// [`Finish::Truncated`].
+fn finish_reason_for(finish: Finish) -> Option<&'static str> {
+    match finish {
+        Finish::Stop => Some("stop"),
+        Finish::Length => Some("length"),
+        Finish::Truncated | Finish::Incomplete => None,
+    }
+}
+
+/// Body of the SSE `error` event that replaces the normal terminator when a
+/// stream is cut short.
+const TRUNCATED_SSE_BODY: &str = concat!(
+    r#"{"error":{"message":"The response was truncated: the server dropped "#,
+    r#"undelivered tokens because this client could not keep up with the "#,
+    r#"stream. The content received is incomplete.","#,
+    r#""type":"server_error","code":"truncated"}}"#
+);
+
+/// Terminal SSE event for a stream that was cut short.
+///
+/// Deliberately *not* followed by `[DONE]`: a client that only waits for the
+/// terminator would otherwise treat a partial response as a complete one, which
+/// is the whole failure this signalling exists to prevent.
+fn truncated_sse_event() -> Event {
+    Event::default().event("error").data(TRUNCATED_SSE_BODY)
 }
 
 fn prepare_generation_from_prompt(
@@ -236,7 +272,7 @@ fn start_generation(
         constraint,
     } = prepared;
 
-    let rx = state
+    let submitted = state
         .engine
         .submit(
             prompt_tokens,
@@ -263,7 +299,8 @@ fn start_generation(
     state.metrics.on_submit();
 
     Ok(StartedGeneration {
-        rx,
+        rx: submitted.rx,
+        finish: submitted.finish,
         prompt_len,
         model_name,
     })
@@ -272,6 +309,7 @@ fn start_generation(
 async fn collect_generation(
     state: Arc<AppState>,
     rx: tokio::sync::mpsc::Receiver<u32>,
+    finish: FinishSignal,
 ) -> CompletedGeneration {
     let t0 = Instant::now();
     let mut stream = ReceiverStream::new(rx);
@@ -294,9 +332,12 @@ async fn collect_generation(
     state.metrics.record(completion_tokens as u64, elapsed_ms);
     state.metrics.on_complete();
 
+    // Safe to read now: the stream above ran to completion, so the engine has
+    // dropped the sender — and it records the outcome before doing so.
     CompletedGeneration {
         text,
         completion_tokens,
+        finish_reason: finish_reason_for(finish.get()),
     }
 }
 
@@ -432,7 +473,17 @@ async fn non_streaming_completion(state: Arc<AppState>, prepared: PreparedGenera
         Err(err) => return err,
     };
 
-    let completed = collect_generation(Arc::clone(&state), started.rx).await;
+    let completed = collect_generation(Arc::clone(&state), started.rx, started.finish).await;
+
+    // A truncated buffer would serialize as a short-but-valid completion, which
+    // the caller cannot tell from a real one. Fail the request instead.
+    let Some(finish_reason) = completed.finish_reason else {
+        state.metrics.record_failure();
+        return api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "The response was truncated before it could be fully collected",
+        );
+    };
 
     Json(CompletionResponse {
         id: gen_id(),
@@ -442,7 +493,7 @@ async fn non_streaming_completion(state: Arc<AppState>, prepared: PreparedGenera
         choices: vec![CompletionChoice {
             text: completed.text,
             index: 0,
-            finish_reason: "stop",
+            finish_reason,
         }],
         usage: UsageInfo {
             prompt_tokens: started.prompt_len,
@@ -499,29 +550,45 @@ async fn streaming_completion(state: Arc<AppState>, prepared: PreparedGeneration
         Ok::<Event, Infallible>(Event::default().data(data))
     });
 
-    // Final chunk with finish_reason: "stop", then [DONE]
+    // Terminator. A completed stream gets the usual final chunk carrying
+    // finish_reason ("stop" or "length") followed by [DONE]; a truncated one
+    // gets an error event and no [DONE]. Evaluated lazily — these closures run
+    // only after the token stream above has drained, which is exactly when the
+    // engine's outcome becomes readable.
     let tc = Arc::clone(&token_count);
-    let finish_stream = tokio_stream::iter(vec![0u8, 1u8]).map(move |i| {
+    let finish_signal = started.finish;
+    let finish_stream = tokio_stream::iter(vec![0u8, 1u8]).filter_map(move |i| {
+        let reason = finish_reason_for(finish_signal.get());
         if i == 0 {
-            let chunk = CompletionChunk {
-                id: finish_id.clone(),
-                object: "text_completion",
-                created,
-                model: finish_model.clone(),
-                choices: vec![ChunkChoice {
-                    text: String::new(),
-                    index: 0,
-                    finish_reason: Some("stop"),
-                }],
+            let event = match reason {
+                Some(reason) => {
+                    let chunk = CompletionChunk {
+                        id: finish_id.clone(),
+                        object: "text_completion",
+                        created,
+                        model: finish_model.clone(),
+                        choices: vec![ChunkChoice {
+                            text: String::new(),
+                            index: 0,
+                            finish_reason: Some(reason),
+                        }],
+                    };
+                    Event::default().data(serde_json::to_string(&chunk).unwrap_or_default())
+                }
+                None => truncated_sse_event(),
             };
-            let data = serde_json::to_string(&chunk).unwrap_or_default();
-            Ok::<Event, Infallible>(Event::default().data(data))
+            Some(Ok::<Event, Infallible>(event))
         } else {
+            // Record metrics either way — a truncated stream still consumed
+            // engine time, and skipping this would leak the in-flight gauge.
             state
                 .metrics
                 .record(tc.load(Ordering::Relaxed), t0.elapsed().as_millis() as u64);
             state.metrics.on_complete();
-            Ok::<Event, Infallible>(Event::default().data("[DONE]"))
+            if reason.is_none() {
+                state.metrics.record_failure();
+            }
+            reason.map(|_| Ok::<Event, Infallible>(Event::default().data("[DONE]")))
         }
     });
 
@@ -600,32 +667,44 @@ async fn streaming_chat_completion(state: Arc<AppState>, prepared: PreparedGener
         Ok::<Event, Infallible>(Event::default().data(data))
     });
 
-    // Final chunk with finish_reason: "stop", then [DONE]
+    // Terminator — see `streaming_completion` for the contract: final chunk +
+    // [DONE] when the completion finished, error event and no [DONE] when it
+    // was truncated.
     let tc = Arc::clone(&token_count);
-    let finish_stream = tokio_stream::iter(vec![0u8, 1u8]).map(move |i| {
+    let finish_signal = started.finish;
+    let finish_stream = tokio_stream::iter(vec![0u8, 1u8]).filter_map(move |i| {
+        let reason = finish_reason_for(finish_signal.get());
         if i == 0 {
-            let chunk = ChatChunk {
-                id: finish_id.clone(),
-                object: "chat.completion.chunk",
-                created,
-                model: finish_model.clone(),
-                choices: vec![ChatChunkChoice {
-                    index: 0,
-                    delta: ChatDelta {
-                        role: None,
-                        content: None,
-                    },
-                    finish_reason: Some("stop"),
-                }],
+            let event = match reason {
+                Some(reason) => {
+                    let chunk = ChatChunk {
+                        id: finish_id.clone(),
+                        object: "chat.completion.chunk",
+                        created,
+                        model: finish_model.clone(),
+                        choices: vec![ChatChunkChoice {
+                            index: 0,
+                            delta: ChatDelta {
+                                role: None,
+                                content: None,
+                            },
+                            finish_reason: Some(reason),
+                        }],
+                    };
+                    Event::default().data(serde_json::to_string(&chunk).unwrap_or_default())
+                }
+                None => truncated_sse_event(),
             };
-            let data = serde_json::to_string(&chunk).unwrap_or_default();
-            Ok::<Event, Infallible>(Event::default().data(data))
+            Some(Ok::<Event, Infallible>(event))
         } else {
             state
                 .metrics
                 .record(tc.load(Ordering::Relaxed), t0.elapsed().as_millis() as u64);
             state.metrics.on_complete();
-            Ok::<Event, Infallible>(Event::default().data("[DONE]"))
+            if reason.is_none() {
+                state.metrics.record_failure();
+            }
+            reason.map(|_| Ok::<Event, Infallible>(Event::default().data("[DONE]")))
         }
     });
 
@@ -674,7 +753,15 @@ pub async fn chat_completions(
             Err(err) => return err,
         };
 
-        let completed = collect_generation(Arc::clone(&state), started.rx).await;
+        let completed = collect_generation(Arc::clone(&state), started.rx, started.finish).await;
+
+        let Some(finish_reason) = completed.finish_reason else {
+            state.metrics.record_failure();
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "The response was truncated before it could be fully collected",
+            );
+        };
 
         Json(ChatCompletionResponse {
             id: gen_id(),
@@ -687,7 +774,7 @@ pub async fn chat_completions(
                     role: "assistant",
                     content: completed.text,
                 },
-                finish_reason: "stop",
+                finish_reason,
             }],
             usage: UsageInfo {
                 prompt_tokens: started.prompt_len,
@@ -724,7 +811,22 @@ pub async fn responses(
         let id = gen_id_with_prefix("resp");
         let message_id = gen_id_with_prefix("msg");
         let created_at = now_secs();
-        let completed = collect_generation(Arc::clone(&state), started.rx).await;
+        let completed = collect_generation(Arc::clone(&state), started.rx, started.finish).await;
+
+        // The Responses API carries outcome in `status` rather than
+        // `finish_reason`: a budget/context stop is "incomplete", not a failure.
+        // A truncated response is a genuine server error either way.
+        let status = match completed.finish_reason {
+            Some("length") => "incomplete",
+            Some(_) => "completed",
+            None => {
+                state.metrics.record_failure();
+                return api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "The response was truncated before it could be fully collected",
+                );
+            }
+        };
 
         Json(build_responses_response(
             id,
@@ -734,7 +836,7 @@ pub async fn responses(
             completed.text,
             started.prompt_len,
             completed.completion_tokens,
-            "completed",
+            status,
         ))
         .into_response()
     }
@@ -816,10 +918,19 @@ async fn streaming_response(state: Arc<AppState>, prepared: PreparedGeneration) 
     let text_buf = Arc::clone(&full_text);
     let done_response_id = response_id.clone();
     let completed_response_id = response_id.clone();
-    let finish_stream = tokio_stream::iter(vec![0u8, 1u8]).map(move |i| {
+    // This surface signals completion with typed events rather than [DONE], so
+    // a truncated stream emits `response.failed` in place of both terminal
+    // events — never an `output_text.done` carrying a partial body, and never a
+    // `response.completed`.
+    let finish_signal = started.finish;
+    let finish_stream = tokio_stream::iter(vec![0u8, 1u8]).filter_map(move |i| {
         let text = text_buf.lock().map(|buf| buf.clone()).unwrap_or_default();
+        let reason = finish_reason_for(finish_signal.get());
 
         if i == 0 {
+            // Truncated: suppress the "done" event entirely rather than
+            // announce a partial body as final.
+            reason?;
             let payload = serde_json::json!({
                 "type": "response.output_text.done",
                 "response_id": done_response_id,
@@ -827,17 +938,38 @@ async fn streaming_response(state: Arc<AppState>, prepared: PreparedGeneration) 
                 "content_index": 0,
                 "text": text,
             });
-            Ok::<Event, Infallible>(
+            Some(Ok::<Event, Infallible>(
                 Event::default()
                     .event("response.output_text.done")
                     .data(payload.to_string()),
-            )
+            ))
         } else {
             let output_tokens = tc.load(Ordering::Relaxed) as usize;
             state
                 .metrics
                 .record(output_tokens as u64, t0.elapsed().as_millis() as u64);
             state.metrics.on_complete();
+
+            let Some(reason) = reason else {
+                state.metrics.record_failure();
+                let payload = serde_json::json!({
+                    "type": "response.failed",
+                    "response_id": completed_response_id.clone(),
+                    "error": {
+                        "message": "The response was truncated: the server dropped \
+                                    undelivered tokens because this client could not \
+                                    keep up with the stream.",
+                        "type": "server_error",
+                        "code": "truncated",
+                    },
+                });
+                return Some(Ok::<Event, Infallible>(
+                    Event::default()
+                        .event("response.failed")
+                        .data(payload.to_string()),
+                ));
+            };
+
             let response = build_responses_response(
                 completed_response_id.clone(),
                 message_id.clone(),
@@ -846,17 +978,21 @@ async fn streaming_response(state: Arc<AppState>, prepared: PreparedGeneration) 
                 text,
                 prompt_len,
                 output_tokens,
-                "completed",
+                if reason == "length" {
+                    "incomplete"
+                } else {
+                    "completed"
+                },
             );
             let payload = serde_json::json!({
                 "type": "response.completed",
                 "response": response,
             });
-            Ok::<Event, Infallible>(
+            Some(Ok::<Event, Infallible>(
                 Event::default()
                     .event("response.completed")
                     .data(payload.to_string()),
-            )
+            ))
         }
     });
 
@@ -922,5 +1058,38 @@ pub async fn embeddings(
             })
             .into_response()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The mapping that decides how a stream terminates. `None` is the load-
+    // bearing case: it is what makes a truncated response fail loudly instead
+    // of arriving as a short, complete-looking one.
+    #[test]
+    fn finish_reason_mapping() {
+        assert_eq!(finish_reason_for(Finish::Stop), Some("stop"));
+        assert_eq!(finish_reason_for(Finish::Length), Some("length"));
+        assert_eq!(finish_reason_for(Finish::Truncated), None);
+        assert_eq!(finish_reason_for(Finish::Incomplete), None);
+    }
+
+    // The truncation payload is assembled from string literals, so a stray
+    // quote would ship malformed JSON to every truncated stream. Clients key
+    // off `error.code`, not the prose, so pin both.
+    #[test]
+    fn truncated_sse_body_is_valid_json() {
+        let parsed: serde_json::Value = serde_json::from_str(TRUNCATED_SSE_BODY)
+            .expect("truncation payload must be valid JSON");
+        assert_eq!(parsed["error"]["code"], "truncated");
+        assert_eq!(parsed["error"]["type"], "server_error");
+        assert!(
+            parsed["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("truncated")),
+            "message should say plainly that the response was truncated"
+        );
     }
 }

@@ -143,9 +143,17 @@ Prioritize these invariants during implementation and review:
 5. API compatibility
    Preserve the current server contract, especially SSE streaming behavior:
    - non-streaming remains the default unless `stream: true`
-   - final SSE chunk carries `finish_reason: "stop"`
-   - streams terminate with `data: [DONE]`
+   - a stream that completed ends with a final chunk carrying `finish_reason`
+     (`"stop"` for EOS, `"length"` for a token-budget or context cutoff),
+     followed by `data: [DONE]`
+   - a stream truncated by slow-client eviction ends with an SSE `error` event
+     and deliberately **no** `[DONE]`, so a partial response cannot be mistaken
+     for a complete one; non-streaming endpoints return 500 in that case
    - object names in `src/server/types.rs` stay aligned with route behavior
+
+   The engine reports why a sequence ended via `Finish`/`FinishSignal`
+   (`src/server/engine.rs`), written before the token sender is dropped. Routes
+   must consult it rather than assuming a closed channel means success.
 
 6. Feature-gated surfaces
    If a shared API changes, audit `python`, `wasm`, and `vulkan` paths as needed. Do not assume the default native CLI/server surface is the only consumer.
