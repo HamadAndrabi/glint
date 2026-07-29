@@ -345,7 +345,19 @@ mod tests {
         let x = Tensor::from_vec(vec![1.0, 2.0, 3.0, 4.0], &[4]);
         let scaled = rope(&x, 2, 4, 10000.0, 2.0, 4);
         let unscaled = rope(&x, 1, 4, 10000.0, 1.0, 4);
-        approx_eq(scaled.data(), unscaled.data(), 1e-6);
+
+        // Both calls reduce to a bit-identical angle (2.0/2.0 and 1.0/1.0 are
+        // both exactly 1.0), so on real hardware `sin`/`cos` are pure and the
+        // difference is exactly zero — keep the strict tolerance there.
+        //
+        // Miri deliberately returns non-deterministic results for transcendental
+        // functions, within an error margin, to catch code that relies on exact
+        // libm output. Under it the two calls can differ by a few ULP (~1.2e-6
+        // observed), which says nothing about whether `scaling_factor` is
+        // applied correctly: any real bug here changes the angle outright and
+        // shows up as an O(1) difference, not a rounding-scale one.
+        let tol = if cfg!(miri) { 1e-4 } else { 1e-6 };
+        approx_eq(scaled.data(), unscaled.data(), tol);
     }
 
     #[test]
