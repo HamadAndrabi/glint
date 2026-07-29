@@ -65,12 +65,27 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-fuzz
+      # cargo-fuzz defaults --target to the triple *it* was built for, and
+      # install-action ships a statically-linked musl build. Left implicit, it
+      # therefore tries to build the fuzz targets for x86_64-unknown-linux-musl,
+      # which is not installed — and ASan cannot link against a static libc
+      # anyway ("sanitizer is incompatible with statically linked libc").
+      # Pin every invocation to the host triple instead.
+      # NB: block scalars (`run: |`) below — these commands contain ": ", which
+      # a plain YAML scalar cannot hold. That is the exact defect that kept this
+      # whole workflow from parsing for three weeks; don't inline them.
+      - name: Resolve host target
+        run: |
+          echo "FUZZ_TARGET=$(rustc -vV | sed -n 's/^host: //p')" >> "$GITHUB_ENV"
       - name: Build fuzz targets
-        run: cargo fuzz build
+        run: |
+          cargo fuzz build --target "$FUZZ_TARGET"
       - name: Smoke-run gguf_parse
-        run: cargo fuzz run gguf_parse -- -runs=20000 -max_total_time=60
+        run: |
+          cargo fuzz run --target "$FUZZ_TARGET" gguf_parse -- -runs=20000 -max_total_time=60
       - name: Smoke-run snapshot_import
-        run: cargo fuzz run snapshot_import -- -runs=20000 -max_total_time=60
+        run: |
+          cargo fuzz run --target "$FUZZ_TARGET" snapshot_import -- -runs=20000 -max_total_time=60
 
   # Run the unsafe-heavy, pure-compute modules under Miri to catch undefined
   # behaviour (out-of-bounds reads, invalid transmutes) that tests running on
@@ -90,8 +105,11 @@ jobs:
       # and rayon is excluded because crossbeam-epoch's pointer tricks trip a
       # known Stacked Borrows false positive under Miri. Single-threaded runs
       # still cover every unsafe block in glint's own tensor/cache code.
+      # Quoted: an unquoted plain scalar cannot contain ": ", so the `tensor::`
+      # / `cache::` test filters would otherwise be parsed as YAML mapping
+      # syntax and the whole workflow file would fail to load.
       - name: Miri (tensor + cache modules)
-        run: cargo miri test --no-default-features --lib -- tensor:: cache::
+        run: "cargo miri test --no-default-features --lib -- tensor:: cache::"
 
   check-vulkan:
     runs-on: ubuntu-latest
