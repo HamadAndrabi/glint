@@ -1011,6 +1011,7 @@ mod tests {
         data.extend_from_slice(&2u32.to_le_bytes()); // version
         data.extend_from_slice(&4_194_432u64.to_le_bytes()); // tensor_count
         data.extend_from_slice(&0u64.to_le_bytes()); // metadata_kv_count
+
         // Two complete descriptors: empty name, 0 dims, type 0, offset 0.
         for _ in 0..2 {
             data.extend_from_slice(&0u64.to_le_bytes()); // name length
