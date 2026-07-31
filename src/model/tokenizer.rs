@@ -1,11 +1,19 @@
 //! BPE tokenizer — encodes text to token IDs and decodes back.
 //!
-//! Reads vocabulary and merge rules directly from GGUF metadata.
+//! Reads vocabulary and merge rules directly from GGUF metadata, or from a
+//! HuggingFace `tokenizer.json` (see [`Tokenizer::from_hf_json`]).
 
 use std::collections::HashMap;
 
 use crate::error::GlintError;
 use crate::model::gguf::GgufModel;
+
+/// Upper bound on the token id space accepted from a `tokenizer.json`.
+///
+/// The vocabulary is turned into a dense `Vec<String>` indexed by id, so a
+/// hostile file claiming an id of `u32::MAX` would otherwise ask for a
+/// multi-gigabyte allocation. No real vocabulary comes close to this.
+const MAX_VOCAB_SIZE: usize = 4_000_000;
 
 /// A byte-pair encoding tokenizer loaded from GGUF metadata.
 pub struct Tokenizer {
@@ -89,6 +97,182 @@ impl Tokenizer {
             merges,
             bos_token_id,
             eos_token_id,
+            add_bos,
+        })
+    }
+
+    /// Load a tokenizer from a HuggingFace `tokenizer.json`.
+    ///
+    /// Only byte-level BPE is supported — the LLaMA-3 / SmolLM / Qwen family,
+    /// and any other tokenizer whose pieces are GPT-2 byte characters. That is
+    /// the same assumption [`Tokenizer::encode`] already makes for GGUF
+    /// vocabularies, so a SentencePiece-derived tokenizer (Metaspace `▁`
+    /// pieces, no `ByteLevel` stage) is refused rather than silently
+    /// mis-encoding every prompt.
+    ///
+    /// * `tokenizer_json` — contents of `tokenizer.json` (required).
+    /// * `tokenizer_config_json` — contents of `tokenizer_config.json`, which
+    ///   carries `add_bos_token` and the BOS/EOS token *strings*.
+    /// * `bos_from_config` / `eos_from_config` — ids from `config.json`, which
+    ///   take precedence over the strings resolved from the tokenizer config.
+    pub fn from_hf_json(
+        tokenizer_json: &str,
+        tokenizer_config_json: Option<&str>,
+        bos_from_config: Option<u32>,
+        eos_from_config: Option<u32>,
+    ) -> Result<Self, GlintError> {
+        let invalid = |detail: String| GlintError::HfInvalidJson {
+            file: "tokenizer.json".to_string(),
+            detail,
+        };
+
+        let root: serde_json::Value =
+            serde_json::from_str(tokenizer_json).map_err(|e| invalid(e.to_string()))?;
+        let root = root
+            .as_object()
+            .ok_or_else(|| invalid("top level value is not a JSON object".to_string()))?;
+
+        let model = root
+            .get("model")
+            .and_then(|v| v.as_object())
+            .ok_or_else(|| invalid("missing 'model' object".to_string()))?;
+
+        match model.get("type").and_then(|v| v.as_str()) {
+            None | Some("BPE") => {}
+            Some(other) => {
+                return Err(GlintError::HfUnsupported(format!(
+                    "tokenizer model type '{other}' — Glint implements byte-level BPE"
+                )))
+            }
+        }
+        if !has_byte_level_stage(root) {
+            return Err(GlintError::HfUnsupported(
+                "tokenizer.json has no ByteLevel pre-tokenizer or decoder — only \
+                 byte-level BPE vocabularies (LLaMA-3, SmolLM, Qwen, GPT-2 style) \
+                 can be encoded correctly; convert the model to GGUF instead"
+                    .to_string(),
+            ));
+        }
+
+        // ── Vocabulary: `model.vocab` plus any `added_tokens` ────────────────
+        let vocab_json = model
+            .get("vocab")
+            .and_then(|v| v.as_object())
+            .ok_or_else(|| invalid("missing 'model.vocab' object".to_string()))?;
+
+        let mut pairs: Vec<(String, u32)> = Vec::with_capacity(vocab_json.len());
+        let mut push = |piece: &str, id: u64| -> Result<(), GlintError> {
+            let id = usize::try_from(id).ok().filter(|&i| i < MAX_VOCAB_SIZE);
+            let id = id.ok_or_else(|| {
+                invalid(format!(
+                    "token '{piece}' has an id beyond the {MAX_VOCAB_SIZE}-token limit"
+                ))
+            })?;
+            pairs.push((piece.to_string(), id as u32));
+            Ok(())
+        };
+
+        for (piece, id) in vocab_json {
+            let id = id
+                .as_u64()
+                .ok_or_else(|| invalid(format!("vocab entry '{piece}' is not an integer id")))?;
+            push(piece, id)?;
+        }
+        // Added tokens (specials such as <|endoftext|>) are listed separately
+        // and are usually — but not always — mirrored in `model.vocab`.
+        if let Some(added) = root.get("added_tokens").and_then(|v| v.as_array()) {
+            for entry in added {
+                let content = entry
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| invalid("added_tokens entry has no 'content'".to_string()))?;
+                let id = entry
+                    .get("id")
+                    .and_then(|v| v.as_u64())
+                    .ok_or_else(|| invalid("added_tokens entry has no 'id'".to_string()))?;
+                push(content, id)?;
+            }
+        }
+
+        if pairs.is_empty() {
+            return Err(GlintError::MissingVocabulary);
+        }
+
+        let size = pairs.iter().map(|(_, id)| *id as usize).max().unwrap() + 1;
+        let mut vocab = vec![String::new(); size];
+        let mut token_to_id = HashMap::with_capacity(pairs.len());
+        for (piece, id) in pairs {
+            vocab[id as usize] = piece.clone();
+            token_to_id.insert(piece, id);
+        }
+
+        // ── Merge rules ──────────────────────────────────────────────────────
+        // Written either as "a b" strings (tokenizers < 0.20) or as ["a", "b"]
+        // pairs (>= 0.20). Byte-level pieces never contain a space — a literal
+        // space byte is the piece "Ġ" — so splitting on the first space is
+        // unambiguous.
+        let mut merges = Vec::new();
+        if let Some(list) = model.get("merges").and_then(|v| v.as_array()) {
+            merges.reserve(list.len());
+            for entry in list {
+                if let Some(s) = entry.as_str() {
+                    let mut parts = s.splitn(2, ' ');
+                    match (parts.next(), parts.next()) {
+                        (Some(a), Some(b)) => merges.push((a.to_string(), b.to_string())),
+                        _ => return Err(invalid(format!("merge rule '{s}' is not a pair"))),
+                    }
+                } else if let Some(pair) = entry.as_array().filter(|p| p.len() == 2) {
+                    match (pair[0].as_str(), pair[1].as_str()) {
+                        (Some(a), Some(b)) => merges.push((a.to_string(), b.to_string())),
+                        _ => return Err(invalid("merge rule pair is not a string".to_string())),
+                    }
+                } else {
+                    return Err(invalid("merge rule is neither a string nor a pair".into()));
+                }
+            }
+        }
+
+        // ── Special tokens ───────────────────────────────────────────────────
+        let tok_config: Option<serde_json::Value> =
+            tokenizer_config_json.and_then(|text| serde_json::from_str(text).ok());
+        let special_id = |key: &str| -> Option<u32> {
+            let value = tok_config.as_ref()?.get(key)?;
+            let content = value
+                .as_str()
+                .or_else(|| value.get("content").and_then(|c| c.as_str()))?;
+            token_to_id.get(content).copied()
+        };
+
+        let eos = eos_from_config
+            .or_else(|| special_id("eos_token"))
+            .ok_or_else(|| {
+                GlintError::HfUnsupported(
+                    "no EOS token id in config.json or tokenizer_config.json — \
+                     generation would never stop"
+                        .to_string(),
+                )
+            })?;
+        let bos = bos_from_config.or_else(|| special_id("bos_token"));
+
+        let add_bos = tok_config
+            .as_ref()
+            .and_then(|c| c.get("add_bos_token"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(bos.is_some());
+        if add_bos && bos.is_none() {
+            return Err(GlintError::HfUnsupported(
+                "add_bos_token is set but no BOS token id could be resolved".to_string(),
+            ));
+        }
+
+        Ok(Self {
+            vocab,
+            token_to_id,
+            merges,
+            // Never prepended while `add_bos` is false, so falling back to EOS
+            // here is inert; it keeps the field non-optional for the GGUF path.
+            bos_token_id: bos.unwrap_or(eos),
+            eos_token_id: eos,
             add_bos,
         })
     }
@@ -245,6 +429,31 @@ impl Tokenizer {
     }
 }
 
+/// Does this `tokenizer.json` run a `ByteLevel` stage?
+///
+/// The pre-tokenizer and decoder may each be a single component or a
+/// `Sequence` of them, so both subtrees are scanned for a `"type":"ByteLevel"`
+/// node at any depth. Its presence is what makes the GPT-2 byte↔char mapping
+/// in [`gpt2_byte_to_char`] the right way to turn text into vocabulary pieces.
+fn has_byte_level_stage(root: &serde_json::Map<String, serde_json::Value>) -> bool {
+    fn scan(value: &serde_json::Value) -> bool {
+        match value {
+            serde_json::Value::Object(map) => {
+                if map.get("type").and_then(|t| t.as_str()) == Some("ByteLevel") {
+                    return true;
+                }
+                map.values().any(scan)
+            }
+            serde_json::Value::Array(items) => items.iter().any(scan),
+            _ => false,
+        }
+    }
+    ["pre_tokenizer", "decoder"]
+        .iter()
+        .filter_map(|key| root.get(*key))
+        .any(scan)
+}
+
 /// GPT-2 BPE byte-to-unicode mapping.
 ///
 /// Maps bytes to unicode codepoints, avoiding control characters.
@@ -309,5 +518,142 @@ mod tests {
             let ch = gpt2_byte_to_char(b);
             assert_eq!(ch, b as char);
         }
+    }
+
+    // ── HuggingFace tokenizer.json ───────────────────────────────────────────
+
+    /// A minimal byte-level BPE `tokenizer.json`: every byte of "hi there"
+    /// as a single-char piece, plus merges that build "hi" and "Ġthere".
+    fn hf_tokenizer_json() -> String {
+        // Byte-level pieces: printable ASCII maps to itself, space maps to 'Ġ'.
+        let letters = [
+            "h", "i", "Ġ", "t", "e", "r", "Ġt", "Ġth", "Ġthe", "Ġther", "Ġthere", "hi",
+        ];
+        let mut vocab = vec!["<unk>".to_string(), "<s>".to_string(), "</s>".to_string()];
+        vocab.extend(letters.iter().map(|s| s.to_string()));
+        let entries: Vec<String> = vocab
+            .iter()
+            .enumerate()
+            .map(|(i, piece)| format!("\"{piece}\":{i}"))
+            .collect();
+        format!(
+            r#"{{
+                "added_tokens": [
+                    {{"id": 0, "content": "<unk>", "special": true}},
+                    {{"id": 1, "content": "<s>", "special": true}},
+                    {{"id": 2, "content": "</s>", "special": true}}
+                ],
+                "pre_tokenizer": {{"type": "ByteLevel", "add_prefix_space": false}},
+                "decoder": {{"type": "ByteLevel"}},
+                "model": {{
+                    "type": "BPE",
+                    "vocab": {{{}}},
+                    "merges": ["h i", "Ġ t", "Ġt h", "Ġth e", "Ġthe r", "Ġther e"]
+                }}
+            }}"#,
+            entries.join(",")
+        )
+    }
+
+    fn hf_tokenizer_config_json() -> &'static str {
+        r#"{
+            "add_bos_token": true,
+            "bos_token": {"content": "<s>"},
+            "eos_token": "</s>",
+            "chat_template": "{% for m in messages %}{{ m.content }}{% endfor %}"
+        }"#
+    }
+
+    #[test]
+    fn test_from_hf_json_encode_decode_roundtrip() {
+        let tok = Tokenizer::from_hf_json(&hf_tokenizer_json(), None, Some(1), Some(2)).unwrap();
+        assert_eq!(tok.bos_token_id, 1);
+        assert_eq!(tok.eos_token_id, 2);
+
+        let ids = tok.encode("hi there");
+        // The merge chain collapses the string to exactly two pieces.
+        assert_eq!(ids.len(), 2, "got {ids:?}");
+        assert_eq!(tok.decode_token(ids[0]), "hi");
+        assert_eq!(tok.decode_token(ids[1]), "Ġthere");
+        assert_eq!(tok.decode(&ids), "hi there");
+    }
+
+    #[test]
+    fn test_from_hf_json_resolves_specials_from_tokenizer_config() {
+        let tok = Tokenizer::from_hf_json(
+            &hf_tokenizer_json(),
+            Some(hf_tokenizer_config_json()),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(tok.bos_token_id, 1);
+        assert_eq!(tok.eos_token_id, 2);
+        assert!(tok.add_bos);
+        assert_eq!(tok.encode_prompt("hi")[0], 1);
+    }
+
+    #[test]
+    fn test_from_hf_json_accepts_merge_pairs_array() {
+        let json = hf_tokenizer_json().replace(
+            r#"["h i", "Ġ t", "Ġt h", "Ġth e", "Ġthe r", "Ġther e"]"#,
+            r#"[["h","i"],["Ġ","t"],["Ġt","h"],["Ġth","e"],["Ġthe","r"],["Ġther","e"]]"#,
+        );
+        let tok = Tokenizer::from_hf_json(&json, None, Some(1), Some(2)).unwrap();
+        assert_eq!(tok.encode("hi there").len(), 2);
+    }
+
+    #[test]
+    fn test_from_hf_json_vocab_is_dense_and_indexed_by_id() {
+        let tok = Tokenizer::from_hf_json(&hf_tokenizer_json(), None, Some(1), Some(2)).unwrap();
+        assert_eq!(tok.vocab_size(), 15);
+        assert_eq!(tok.decode_token(0), "<unk>");
+        assert_eq!(tok.decode_token(2), "</s>");
+    }
+
+    #[test]
+    fn test_from_hf_json_rejects_non_byte_level_tokenizer() {
+        let json = hf_tokenizer_json()
+            .replace(
+                r#""pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false}"#,
+                r#""pre_tokenizer": {"type": "Metaspace"}"#,
+            )
+            .replace(
+                r#""decoder": {"type": "ByteLevel"}"#,
+                r#""decoder": {"type": "Metaspace"}"#,
+            );
+        let err = Tokenizer::from_hf_json(&json, None, Some(1), Some(2))
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("ByteLevel"), "got: {err}");
+    }
+
+    #[test]
+    fn test_from_hf_json_rejects_non_bpe_model() {
+        let json = hf_tokenizer_json().replace(r#""type": "BPE""#, r#""type": "Unigram""#);
+        let err = Tokenizer::from_hf_json(&json, None, Some(1), Some(2))
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("Unigram"), "got: {err}");
+    }
+
+    #[test]
+    fn test_from_hf_json_requires_an_eos_token() {
+        let err = Tokenizer::from_hf_json(&hf_tokenizer_json(), None, None, None)
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("EOS"), "got: {err}");
+    }
+
+    #[test]
+    fn test_from_hf_json_rejects_malformed_input() {
+        assert!(Tokenizer::from_hf_json("not json", None, Some(1), Some(2)).is_err());
+        assert!(Tokenizer::from_hf_json("{}", None, Some(1), Some(2)).is_err());
+        // A vocab id far beyond any real tokenizer must not be allocated for.
+        let huge = r#"{
+            "pre_tokenizer": {"type": "ByteLevel"},
+            "model": {"type": "BPE", "vocab": {"a": 4294967295}, "merges": []}
+        }"#;
+        assert!(Tokenizer::from_hf_json(huge, None, Some(1), Some(2)).is_err());
     }
 }
