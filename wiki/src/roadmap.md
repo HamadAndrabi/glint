@@ -71,14 +71,26 @@ pass cannot express — fused QKV projections, attention biases, per-head
 QK norms, non-linear RoPE scaling, SentencePiece tokenizers — is rejected with
 a specific error rather than loaded into a silently wrong run.
 
-### Continuous Batching Improvements
+### Continuous Batching — ✅ shipped
 
-The current `InferenceEngine` already serves multiple requests concurrently, but it does so by interleaving one decode step per active request. True continuous batching would go further:
-- Multiple active sequences share a single forward pass
-- Logit computation amortizes weight loading across batch
-- New requests join mid-generation when slots free up
+The `InferenceEngine` used to serve multiple requests by interleaving one decode
+step per active request, so every sequence paid the full cost of streaming the
+model's weights from memory. It now decodes all active sequences in a single
+forward pass per step:
 
-This is the key throughput multiplier for high-concurrency serving.
+- Multiple active sequences share one forward pass ✅
+- Each weight matrix is traversed once per step, not once per sequence, so the
+  cost of a step is roughly flat in batch size ✅
+- New requests join mid-generation as slots free up; finished sequences leave
+  without stalling the rest ✅
+
+Batching is bit-identical to decoding each sequence alone, so a response never
+depends on how busy the server was. See
+[Inference Engine → Continuous batching](./server-api.md#continuous-batching).
+
+Still open here: batching the *prefill* of newly admitted requests (today each
+admitted prompt is prefilled on its own), and chunked prefill so a long prompt
+cannot delay a step for the sequences already decoding.
 
 ### Quantization: More Formats
 
@@ -175,11 +187,10 @@ If you're looking for a well-scoped contribution:
 
 | Difficulty | Task |
 |-----------|------|
-| Beginner | Add Q4_1 / Q5_0 dequantization (follow Q4_0 pattern) |
 | Beginner | Add `--format json` output flag to `inspect` subcommand |
 | Intermediate | Implement prefix caching for the HTTP server |
 | Intermediate | Add Python streaming callback (generator-based) |
-| Advanced | Continuous batching (multiple sequences per forward pass) |
+| Advanced | Batched prefill (admit several queued prompts in one pass) |
 | Advanced | MoE routing in `forward.rs` |
 
 ---

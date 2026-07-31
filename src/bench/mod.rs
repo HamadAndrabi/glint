@@ -190,8 +190,11 @@ pub fn run_decode_bench(
 
 /// Measure decode throughput with multiple concurrent sessions.
 ///
-/// Sessions are run round-robin (same as the server engine): each loop
-/// iteration advances every session by one decode step.
+/// Sessions are advanced the way the server engine advances them: one batched
+/// forward pass per step covering every live session, so the model's weights
+/// are traversed once per step rather than once per session. Comparing
+/// `tokens_per_sec` here against the single-session `decode` benchmark is what
+/// shows how much continuous batching buys at a given concurrency.
 pub fn run_concurrency_bench(
     model: &Model,
     n_seqs: usize,
@@ -222,15 +225,11 @@ pub fn run_concurrency_bench(
                 s
             })
             .collect();
-        // Round-robin decode.
+        // Batched decode — all sessions share every step.
         let mut step = 0usize;
         let t0 = Instant::now();
         while step < decode_tokens {
-            for s in sessions.iter_mut() {
-                if !s.is_finished() {
-                    let _ = model.decode_one(s, gpu);
-                }
-            }
+            let _ = model.decode_batch(&mut sessions, gpu);
             step += 1;
         }
         t0.elapsed().as_secs_f64() * 1000.0

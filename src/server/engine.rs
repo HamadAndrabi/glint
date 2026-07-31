@@ -1,22 +1,38 @@
-//! Round-robin inference engine.
+//! Continuously-batched inference engine.
 //!
 //! `InferenceEngine` runs a single dedicated OS thread that owns the model
 //! weights and (optionally) the GPU backend. Incoming requests are queued and
 //! processed in a tight loop:
 //!
-//! 1. **Admission** — new requests are accepted from the queue only while the
+//! 1. **Admission** — new requests are accepted from the queue whenever the
 //!    number of active sequences is below [`EngineLimits::max_active`]; each
 //!    admitted request has its prompt prefilled into a fresh per-sequence cache
 //!    (full-context by default, or pages from a shared pool when
-//!    [`EngineLimits::kv_pool_pages`] is set).
-//! 2. **Round-robin decode** — advance every live sequence by one token
-//!    (each with its own `forward_one` call), sample, and push the token ID
-//!    down the per-request channel. This is fair interleaving, not true batched
-//!    inference — each sequence gets a separate forward pass.
-//! 3. **Draining & eviction** — a sequence that has produced its last token
+//!    [`EngineLimits::kv_pool_pages`] is set). Admission is re-checked every
+//!    iteration, so a request joins the running batch as soon as a slot frees
+//!    rather than waiting for the batch to empty.
+//! 2. **Batched decode** — every live sequence advances by one token in a
+//!    *single* forward pass ([`decode_batch_cpu`] → `forward_batch_lora`).
+//!    Decoding is memory-bound, so the win is that each weight matrix is
+//!    streamed from RAM once per step instead of once per sequence: the cost of
+//!    a step is roughly flat in the number of sequences sharing it, which is
+//!    what turns concurrency into throughput.
+//! 3. **Sampling & delivery** — each sequence samples from its own logits with
+//!    its own sampler and constraint, and the token is pushed down that
+//!    request's channel.
+//! 4. **Draining & eviction** — a sequence that has produced its last token
 //!    (EOS, token budget, or context limit) is kept in a *draining* state until
 //!    every queued token has been delivered to the client, then removed. A
-//!    disconnected client or one that stays too far behind is evicted.
+//!    disconnected client or one that stays too far behind is evicted. Either
+//!    way it drops out of the next batch without stalling the sequences that
+//!    are still decoding.
+//!
+//! Batching is invisible to a request: `forward_batch` is bit-identical to
+//! `forward_one` per sequence, and everything else — sampler state, KV cache,
+//! token budget, LoRA adapter, [`Finish`] outcome — stays strictly
+//! per-sequence. A completion must not depend on how busy the server was, so
+//! sharing a step with other requests cannot change the tokens it receives.
+//! A batch of one degrades to exactly the previous single-sequence behaviour.
 //!
 //! The engine blocks (parks the thread) only when there are no active
 //! sequences and no pending requests — i.e. when the server is completely idle.
@@ -61,13 +77,17 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 use crate::backend::GpuBackend;
-use crate::cache::PagePool;
+use crate::cache::{KvStore, PagePool};
 use crate::constrained::{build_constraint, ConstraintSpec, VocabIndex};
 use crate::model::config::ModelConfig;
+use crate::model::lora::LoraWeights;
 use crate::model::lora_registry::AdapterRegistry;
 use crate::sampling::SamplerConfig;
 use crate::session::{CacheFormat, Session, SessionOptions};
-use crate::transformer::{forward_one_lora, forward_prefill_lora, TransformerWeights};
+use crate::tensor::Tensor;
+use crate::transformer::{
+    forward_batch_lora, forward_one_lora, forward_prefill_lora, TransformerWeights,
+};
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -542,9 +562,9 @@ fn engine_loop(
 
         // ── Advance all live (non-draining) sequences by one decode step ──
         //
-        // GPU path: sequential (only one GPU context).
-        // CPU path: rayon par_iter_mut — N sequences in parallel, each calling
-        //           forward_one against its own independent KV cache.
+        // GPU path: sequential (a single device context — nothing to share).
+        // CPU path: one batched forward pass over every live sequence, so the
+        //           weights are traversed once for the whole step.
         if gpu.is_some() {
             for seq in active.iter_mut().filter(|s| s.draining_since.is_none()) {
                 let s = &mut seq.session;
@@ -644,39 +664,78 @@ fn prefill_and_add(
     });
 }
 
-/// Advance every live (non-draining) sequence by one decode step in parallel
-/// (CPU path).
+/// Advance every live (non-draining) sequence by one decode step — the batched
+/// step at the heart of continuous batching (CPU path).
 ///
-/// Each sequence has its own independent KV cache, so rayon can process all
-/// sequences concurrently — no shared mutable state between iterations.
+/// All live sequences go through a **single** [`forward_batch_lora`] call, so
+/// each weight matrix is streamed from memory once for the whole batch instead
+/// of once per sequence. Decoding is memory-bound, so this is where the
+/// throughput of concurrent serving comes from.
+///
+/// Which sequences take part is decided fresh every step, which is what makes
+/// the batching *continuous*: a sequence admitted one step ago joins the next
+/// one automatically, and a sequence that finished simply stops appearing —
+/// neither waits for the others.
+///
+/// Sequences are gathered in `active` order, and the logits come back in the
+/// same order; every sequence keeps its own cache, position, sampler and LoRA
+/// adapter, so sharing a step changes nothing it observes (see the parity
+/// tests on `forward_batch`).
 fn decode_batch_cpu(
     active: &mut [ActiveSequence],
     weights: &Arc<TransformerWeights>,
     config: &Arc<ModelConfig>,
 ) {
-    #[cfg(feature = "rayon")]
-    {
-        use rayon::prelude::*;
-        active
-            .par_iter_mut()
-            .filter(|s| s.draining_since.is_none())
-            .for_each(|seq| {
-                let s = &mut seq.session;
-                let tok = *s.tokens.last().unwrap();
-                let pos = s.tokens.len() - 1;
-                let lora = s.lora_adapter.as_deref();
-                s.last_logits =
-                    forward_one_lora(weights, config, tok, pos, s.cache.as_mut(), &mut None, lora);
-            });
+    let live = active.iter().filter(|s| s.draining_since.is_none()).count();
+    if live == 0 {
+        return;
     }
-    #[cfg(not(feature = "rayon"))]
-    for seq in active.iter_mut().filter(|s| s.draining_since.is_none()) {
+
+    // Single live sequence: call the single-sequence path directly rather than
+    // building batch vectors for a batch of one. Nothing is amortised at B=1,
+    // and a lone request should not pay an allocation per token for machinery
+    // it does not use.
+    if live == 1 {
+        let seq = active
+            .iter_mut()
+            .find(|s| s.draining_since.is_none())
+            .expect("live count says there is one");
         let s = &mut seq.session;
         let tok = *s.tokens.last().unwrap();
         let pos = s.tokens.len() - 1;
         let lora = s.lora_adapter.as_deref();
         s.last_logits =
             forward_one_lora(weights, config, tok, pos, s.cache.as_mut(), &mut None, lora);
+        return;
+    }
+
+    let mut tokens: Vec<u32> = Vec::with_capacity(live);
+    let mut positions: Vec<usize> = Vec::with_capacity(live);
+    let mut caches: Vec<&mut dyn KvStore> = Vec::with_capacity(live);
+    let mut loras: Vec<Option<&LoraWeights>> = Vec::with_capacity(live);
+    let mut logit_slots: Vec<&mut Tensor> = Vec::with_capacity(live);
+
+    for seq in active.iter_mut().filter(|s| s.draining_since.is_none()) {
+        let s = &mut seq.session;
+        tokens.push(*s.tokens.last().unwrap());
+        positions.push(s.tokens.len() - 1);
+        loras.push(s.lora_adapter.as_deref());
+        caches.push(s.cache.as_mut());
+        logit_slots.push(&mut s.last_logits);
+    }
+
+    let logits = forward_batch_lora(
+        weights,
+        config,
+        &tokens,
+        &positions,
+        &mut caches,
+        &mut None,
+        &loras,
+    );
+
+    for (slot, produced) in logit_slots.into_iter().zip(logits) {
+        *slot = produced;
     }
 }
 
@@ -1051,6 +1110,357 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert_eq!(finish.get(), Finish::Truncated);
+    }
+
+    // ── Continuous batching ──────────────────────────────────────────────
+    //
+    // Sequences now share one forward pass per step, and which sequences take
+    // part changes as requests are admitted and retired. The contract that
+    // makes that safe is that a request cannot tell: these tests pin the
+    // outputs of concurrent requests against the same requests run alone, and
+    // check that sequences joining and leaving a running batch disturb
+    // neither the others' tokens nor their own outcomes.
+
+    /// Build one live sequence: prompt prefilled, `next` staged as the token
+    /// this step will decode (what the engine's sampler would have pushed).
+    ///
+    /// The receiver is returned alongside so the caller can keep it alive —
+    /// dropping it would make the sequence look disconnected.
+    fn live_sequence(
+        weights: &Arc<TransformerWeights>,
+        config: &Arc<ModelConfig>,
+        prompt: &[u32],
+        next: u32,
+    ) -> (ActiveSequence, mpsc::Receiver<u32>) {
+        let mut session = Session::new(SessionOptions {
+            max_new_tokens: 16,
+            sampler_cfg: greedy_cfg(),
+            eos_token: NO_EOS,
+            cache_format: CacheFormat::F32,
+            context_length: config.context_length as usize,
+            n_layers: config.block_count as usize,
+            n_kv_heads: config.head_count_kv as usize,
+            head_dim: config.head_dim() as usize,
+            lora_adapter: None,
+            page_pool: None,
+        });
+        session.tokens = prompt.to_vec();
+        session.prefill_len = prompt.len();
+        session.last_logits = forward_prefill_lora(
+            weights,
+            config,
+            prompt,
+            session.cache.as_mut(),
+            0,
+            &mut None,
+            None,
+        );
+        session.pos = prompt.len().saturating_sub(1);
+        session.tokens.push(next);
+        let (tx, rx) = mpsc::channel(64);
+        (
+            ActiveSequence {
+                session,
+                tx,
+                pending: VecDeque::new(),
+                draining_since: None,
+                finish: FinishSignal::new(),
+            },
+            rx,
+        )
+    }
+
+    // Timing-independent check of the step the scheduler runs: three sequences
+    // with different prompts, positions and histories advanced in one batched
+    // pass must land on exactly the logits they would have got stepping alone.
+    // (The end-to-end tests below can only observe tokens, and cannot force
+    // the requests to overlap; this one pins the batched step directly.)
+    #[test]
+    fn batched_step_matches_single_sequence_steps() {
+        let (weights, mut config) = make_tiny_weights();
+        config.context_length = 64;
+        let weights = Arc::new(weights);
+        let config = Arc::new(config);
+        let prompts: [&[u32]; 3] = [&[1, 2, 3], &[4], &[5, 0, 6]];
+        let next: [u32; 3] = [6, 2, 7];
+
+        // Reference: each sequence advanced by itself.
+        let expected: Vec<Tensor> = (0..3)
+            .map(|s| {
+                let (mut seq, _rx) = live_sequence(&weights, &config, prompts[s], next[s]);
+                let session = &mut seq.session;
+                let pos = session.tokens.len() - 1;
+                forward_one_lora(
+                    &weights,
+                    &config,
+                    next[s],
+                    pos,
+                    session.cache.as_mut(),
+                    &mut None,
+                    None,
+                )
+            })
+            .collect();
+
+        // Same sequences, advanced together in one batched step.
+        let mut keepalive = Vec::new();
+        let mut active: Vec<ActiveSequence> = (0..3)
+            .map(|s| {
+                let (seq, rx) = live_sequence(&weights, &config, prompts[s], next[s]);
+                keepalive.push(rx);
+                seq
+            })
+            .collect();
+        decode_batch_cpu(&mut active, &weights, &config);
+
+        for (s, seq) in active.iter().enumerate() {
+            let got = seq.session.last_logits.data();
+            assert_eq!(got.len(), expected[s].data().len(), "seq {s} logits len");
+            for (i, (&a, &b)) in expected[s].data().iter().zip(got).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "seq {s} logit {i}: alone={a}, batched={b}"
+                );
+            }
+        }
+    }
+
+    // A batch of one must behave exactly like the previous single-sequence
+    // engine — same result, and no batch machinery involved.
+    #[test]
+    fn batch_of_one_matches_the_single_sequence_path() {
+        let (weights, mut config) = make_tiny_weights();
+        config.context_length = 64;
+        let weights = Arc::new(weights);
+        let config = Arc::new(config);
+
+        let (mut solo, _rx_a) = live_sequence(&weights, &config, &[1, 2, 3], 5);
+        let pos = solo.session.tokens.len() - 1;
+        let expected = forward_one_lora(
+            &weights,
+            &config,
+            5,
+            pos,
+            solo.session.cache.as_mut(),
+            &mut None,
+            None,
+        );
+
+        let (seq, _rx_b) = live_sequence(&weights, &config, &[1, 2, 3], 5);
+        let mut active = vec![seq];
+        decode_batch_cpu(&mut active, &weights, &config);
+
+        for (i, (&a, &b)) in expected
+            .data()
+            .iter()
+            .zip(active[0].session.last_logits.data())
+            .enumerate()
+        {
+            assert_eq!(a.to_bits(), b.to_bits(), "logit {i}");
+        }
+    }
+
+    // Draining sequences (finished, still delivering their tail) must be left
+    // out of the batch entirely — decoding them again would run past their
+    // last token and corrupt their cache.
+    #[test]
+    fn draining_sequences_are_excluded_from_the_batch() {
+        let (weights, mut config) = make_tiny_weights();
+        config.context_length = 64;
+        let weights = Arc::new(weights);
+        let config = Arc::new(config);
+
+        let mut keepalive = Vec::new();
+        let mut active: Vec<ActiveSequence> = [(&[1u32, 2, 3][..], 6u32), (&[4u32][..], 2)]
+            .iter()
+            .map(|(prompt, next)| {
+                let (seq, rx) = live_sequence(&weights, &config, prompt, *next);
+                keepalive.push(rx);
+                seq
+            })
+            .collect();
+        active[0].draining_since = Some(Instant::now());
+        let frozen_logits = active[0].session.last_logits.data().to_vec();
+        let frozen_len = active[0].session.cache.len();
+
+        decode_batch_cpu(&mut active, &weights, &config);
+
+        assert_eq!(
+            active[0].session.last_logits.data(),
+            frozen_logits.as_slice(),
+            "a draining sequence must not be decoded"
+        );
+        assert_eq!(active[0].session.cache.len(), frozen_len);
+    }
+
+    // The load-bearing test. A completion must not depend on how busy the
+    // server was when it arrived, so requests decoded together must produce
+    // exactly what they produce one at a time.
+    #[test]
+    fn batched_decode_matches_serial_decode() {
+        let engine = start_tiny_engine(EngineLimits::default(), 256);
+        let budget = 24;
+        let prompts: Vec<Vec<u32>> = vec![vec![1, 2, 3], vec![4, 5], vec![6, 0, 7, 1]];
+
+        // Serial: each request has the engine to itself (a batch of one).
+        let serial: Vec<Vec<u32>> = prompts
+            .iter()
+            .map(|p| {
+                drain_all(
+                    engine
+                        .submit(p.clone(), budget, greedy_cfg(), NO_EOS, None, None)
+                        .expect("queue has room"),
+                )
+            })
+            .collect();
+        for stream in &serial {
+            assert_eq!(stream.len(), budget, "serial run should spend its budget");
+        }
+
+        // Concurrent: all three in flight at once, sharing decode steps.
+        let submitted: Vec<Submitted> = prompts
+            .iter()
+            .map(|p| {
+                engine
+                    .submit(p.clone(), budget, greedy_cfg(), NO_EOS, None, None)
+                    .expect("queue has room")
+            })
+            .collect();
+        let concurrent: Vec<Vec<u32>> = submitted.into_iter().map(drain_all).collect();
+
+        assert_eq!(
+            concurrent, serial,
+            "sharing a batch changed the tokens a request received"
+        );
+    }
+
+    // Sequences enter and leave a running batch, so the engine must keep each
+    // one's logits, cache and sampler matched to the right request as the
+    // batch's membership shifts under it.
+    #[test]
+    fn sequences_leaving_the_batch_do_not_disturb_the_rest() {
+        let engine = start_tiny_engine(EngineLimits::default(), 256);
+        let budget = 40;
+        let prompt = vec![1, 2, 3];
+
+        let alone = drain_all(
+            engine
+                .submit(prompt.clone(), budget, greedy_cfg(), NO_EOS, None, None)
+                .expect("queue has room"),
+        );
+
+        // Same request, but now short-lived requests keep joining and retiring
+        // around it mid-generation.
+        let long = engine
+            .submit(prompt, budget, greedy_cfg(), NO_EOS, None, None)
+            .expect("queue has room");
+        let shorts: Vec<Submitted> = (0..3u32)
+            .map(|i| {
+                engine
+                    .submit(vec![4 + i, 5], 5, greedy_cfg(), NO_EOS, None, None)
+                    .expect("queue has room")
+            })
+            .collect();
+        for short in shorts {
+            assert_eq!(drain_all(short).len(), 5);
+        }
+        assert_eq!(
+            drain_all(long),
+            alone,
+            "a neighbour retiring changed this sequence's tokens"
+        );
+    }
+
+    // A request that arrives while another is mid-generation joins the batch
+    // straight away — it must not wait for the running sequence to finish, and
+    // both must complete in full.
+    #[test]
+    fn request_admitted_mid_generation_completes() {
+        let engine = start_tiny_engine(EngineLimits::default(), 256);
+        let long_budget = 60;
+        let mut first = engine
+            .submit(vec![1, 2], long_budget, greedy_cfg(), NO_EOS, None, None)
+            .expect("queue has room");
+
+        // Let the first request get well into its generation before the
+        // second one shows up.
+        let mut seen = 0;
+        for _ in 0..5 {
+            assert!(first.rx.blocking_recv().is_some(), "first is live");
+            seen += 1;
+        }
+
+        let late_budget = 12;
+        let second = engine
+            .submit(vec![3, 4], late_budget, greedy_cfg(), NO_EOS, None, None)
+            .expect("queue has room");
+        assert_eq!(
+            drain_all(second).len(),
+            late_budget,
+            "a request admitted mid-batch must complete"
+        );
+
+        while first.rx.blocking_recv().is_some() {
+            seen += 1;
+        }
+        assert_eq!(seen, long_budget, "the running request also completes");
+        assert_eq!(first.finish.get(), Finish::Length);
+    }
+
+    // With every slot busy, queued requests must be admitted as sequences
+    // retire — not held until the whole batch drains.
+    #[test]
+    fn finished_sequences_free_slots_for_queued_requests() {
+        let limits = EngineLimits {
+            max_active: 2,
+            queue_capacity: 16,
+            kv_pool_pages: None,
+        };
+        let engine = start_tiny_engine(limits, 256);
+        let budget = 8;
+        let submitted: Vec<Submitted> = (0..6u32)
+            .map(|i| {
+                engine
+                    .submit(vec![1 + i % 4, 2], budget, greedy_cfg(), NO_EOS, None, None)
+                    .expect("queue has room")
+            })
+            .collect();
+        for sub in submitted {
+            let (tokens, finish) = drain_with_finish(sub);
+            assert_eq!(tokens.len(), budget, "every queued request completes");
+            assert_eq!(finish, Finish::Length);
+        }
+    }
+
+    // Outcomes are per-sequence, not per-batch: one sequence hitting EOS in a
+    // shared step must not end the others, and each client must learn why its
+    // own stream stopped.
+    #[test]
+    fn finish_outcomes_stay_per_sequence_within_a_batch() {
+        let engine = start_tiny_engine(EngineLimits::default(), 256);
+        let prompt = vec![1, 2];
+        let probe = engine
+            .submit(prompt.clone(), 1, greedy_cfg(), NO_EOS, None, None)
+            .expect("queue has room");
+        let first = drain_all(probe)[0];
+
+        // Declaring the model's first token as EOS makes this sequence stop
+        // after one token, while its batch-mate keeps decoding.
+        let stopper = engine
+            .submit(prompt, 50, greedy_cfg(), first, None, None)
+            .expect("queue has room");
+        let budget = 20;
+        let runner = engine
+            .submit(vec![3, 4, 5], budget, greedy_cfg(), NO_EOS, None, None)
+            .expect("queue has room");
+
+        let (stop_tokens, stop_finish) = drain_with_finish(stopper);
+        let (run_tokens, run_finish) = drain_with_finish(runner);
+        assert_eq!(stop_finish, Finish::Stop);
+        assert_eq!(stop_tokens, vec![first]);
+        assert_eq!(run_finish, Finish::Length);
+        assert_eq!(run_tokens.len(), budget);
     }
 
     // A prompt the engine refuses never reaches the decode loop, so no outcome
