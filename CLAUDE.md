@@ -86,14 +86,17 @@ Keep a scalar fallback alongside every optimized path.
 
 GGUF loading is zero-copy via `memmap2` on native builds. GGUF stores tensors in column-major order; internally Glint uses row-major tensors, and the shape reversal happens in `src/transformer/weights.rs`.
 
+SafeTensors (HuggingFace) loading is the second, optional entry point — a directory holding `config.json` + `tokenizer.json` + `*.safetensors`, or a `.safetensors` file inside one. GGUF stays the default; the loader is picked by path in `Model::load` and in the CLI's `load_model`. HF stores linear weights row-major as `[out_features, in_features]`, which is already Glint's convention, so **no transpose is applied** — but Q/K projections *are* row-permuted, because HF's RoPE pairs dimension `j` with `j + head_dim/2` while Glint's `ops::rope` rotates adjacent pairs (see `permute_qk_rows`).
+
 ## Module Map
 
 | Path | Responsibility |
 |------|---------------|
 | `src/error.rs` | `GlintError` enum |
 | `src/model/gguf.rs` | GGUF parser and tensor metadata |
-| `src/model/config.rs` | Hyperparameters from GGUF metadata |
-| `src/model/tokenizer.rs` | BPE tokenizer |
+| `src/model/safetensors.rs` | SafeTensors parser and HuggingFace model-directory loader |
+| `src/model/config.rs` | Hyperparameters from GGUF metadata or HF `config.json` |
+| `src/model/tokenizer.rs` | BPE tokenizer (GGUF metadata or HF `tokenizer.json`) |
 | `src/model/chat_template.rs` | Chat template detection and rendering |
 | `src/model/lora.rs` | LoRA adapter loading and application (`ΔW = scale × B @ A`) |
 | `src/model/pull.rs` | Hugging Face model search and download |

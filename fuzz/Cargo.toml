@@ -25,6 +25,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "safetensors_parse"
+path = "fuzz_targets/safetensors_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "snapshot_import"
 path = "fuzz_targets/snapshot_import.rs"
 test = false

@@ -47,9 +47,22 @@ The core innovation from [vLLM (Kwon et al.)](https://arxiv.org/abs/2309.05657).
 
 **Why it matters:** Current `KvCache` pre-allocates `max_seq_len` slots per request. With 100 concurrent requests and 4096 context, that's 100 × full KV-cache allocations even if most requests are short. PagedAttention reduces peak memory usage significantly.
 
-### SafeTensors Format Support
+### SafeTensors Format Support — shipped
 
-Add loading of the [SafeTensors](https://github.com/huggingface/safetensors) format used by most HuggingFace models. Currently Glint requires GGUF; with SafeTensors, models can be loaded directly without conversion.
+Loading of the [SafeTensors](https://github.com/huggingface/safetensors) format
+used by most HuggingFace models. Point any command at a model directory
+(`config.json` + `tokenizer.json` + `*.safetensors`, sharded or not) and it
+loads without a GGUF conversion step:
+
+```bash
+glint run --file ./SmolLM2-135M-Instruct --prompt "Hello"
+```
+
+Scope: LLaMA-family architectures (`llama`, `mistral`, and relatives), F32 /
+F16 / BF16 weights, and byte-level BPE tokenizers. Anything Glint's forward
+pass cannot express — fused QKV projections, attention biases, per-head
+QK norms, non-linear RoPE scaling, SentencePiece tokenizers — is rejected with
+a specific error rather than loaded into a silently wrong run.
 
 ### Continuous Batching Improvements
 
@@ -157,7 +170,6 @@ If you're looking for a well-scoped contribution:
 |-----------|------|
 | Beginner | Add Q4_1 / Q5_0 dequantization (follow Q4_0 pattern) |
 | Beginner | Add `--format json` output flag to `inspect` subcommand |
-| Intermediate | Add SafeTensors loading |
 | Intermediate | Implement prefix caching for the HTTP server |
 | Intermediate | Add Python streaming callback (generator-based) |
 | Advanced | PagedAttention KV cache manager |
