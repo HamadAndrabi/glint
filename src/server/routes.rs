@@ -389,6 +389,10 @@ pub async fn health() -> impl IntoResponse {
 // ── GET /v1/metrics ──────────────────────────────────────────────────────────
 
 /// Runtime metrics — requests, token throughput, latency, and concurrency.
+///
+/// KV-memory reporting is **additive and optional**: `kv_pool` appears only
+/// when the engine runs a paged pool, `prefix_cache` only when prefix reuse is
+/// enabled. Every other field is present unconditionally, as before.
 pub async fn server_metrics(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let m = &state.metrics;
     let requests = m.requests_total.load(Ordering::Relaxed);
@@ -398,7 +402,7 @@ pub async fn server_metrics(State(state): State<Arc<AppState>>) -> impl IntoResp
     let queued = m.queue_depth.load(Ordering::Relaxed);
     let uptime_secs = m.started_at.elapsed().as_secs();
 
-    Json(serde_json::json!({
+    let mut body = serde_json::json!({
         // Throughput
         "requests_total":          requests,
         "requests_failed":         failed,
@@ -412,7 +416,30 @@ pub async fn server_metrics(State(state): State<Arc<AppState>>) -> impl IntoResp
         "queue_depth":             queued,
         // Uptime
         "uptime_secs":             uptime_secs,
-    }))
+    });
+
+    // Sampled by the engine when sequences are admitted or retired, so these
+    // are exact as of the last such boundary rather than continuously live.
+    let kv = state.engine.kv_stats();
+    if let Some(pool) = kv.pool {
+        body["kv_pool"] = serde_json::json!({
+            "capacity":   pool.capacity,
+            "live":       pool.live,
+            "peak_live":  pool.peak_live,
+            "pooled":     pool.pooled,
+        });
+    }
+    if let Some(prefix) = kv.prefix {
+        body["prefix_cache"] = serde_json::json!({
+            "hits":           prefix.hits,
+            "misses":         prefix.misses,
+            "evictions":      prefix.evictions,
+            "tokens_reused":  prefix.tokens_reused,
+            "entries":        prefix.entries,
+            "pages":          prefix.pages,
+        });
+    }
+    Json(body)
 }
 
 // ── GET /v1/models ────────────────────────────────────────────────────────────

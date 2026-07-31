@@ -10,7 +10,7 @@ use std::time::Instant;
 use glint::api::Model as GlintModel;
 use glint::bench;
 #[cfg(feature = "server")]
-use glint::cache::{PagePool, PAGE_SIZE};
+use glint::cache::{PagePool, PrefixCacheConfig, PAGE_SIZE};
 #[cfg(feature = "server")]
 use glint::constrained::VocabIndex;
 use glint::model::chat_template::{ChatTemplate, Message};
@@ -190,6 +190,12 @@ enum Commands {
         /// shared by all requests — memory follows real usage).
         #[arg(long, default_value = "f32")]
         kv_cache: String,
+
+        /// Reuse the KV pages of a shared prompt prefix (e.g. a long system
+        /// prompt) instead of re-prefilling it for every request. Requires
+        /// `--kv-cache paged`. Off by default.
+        #[arg(long, default_value_t = false)]
+        prefix_cache: bool,
     },
 
     /// Download a GGUF model from HuggingFace Hub.
@@ -327,9 +333,10 @@ async fn main() {
             host,
             gpu,
             kv_cache,
+            prefix_cache,
         } => {
             let file = maybe_download(&file).await;
-            serve_model(&file, &host, port, gpu, &kv_cache).await;
+            serve_model(&file, &host, port, gpu, &kv_cache, prefix_cache).await;
         }
         #[cfg(feature = "server")]
         Commands::Pull { repo, file, dir } => {
@@ -1137,7 +1144,14 @@ fn chat_model(
 }
 
 #[cfg(feature = "server")]
-async fn serve_model(path: &PathBuf, host: &str, port: u16, use_gpu: bool, kv_cache: &str) {
+async fn serve_model(
+    path: &PathBuf,
+    host: &str,
+    port: u16,
+    use_gpu: bool,
+    kv_cache: &str,
+    prefix_cache: bool,
+) {
     let (config, tokenizer, weights) = load_model(path).into_parts();
     eprintln!("Weights loaded.");
 
@@ -1190,6 +1204,29 @@ async fn serve_model(path: &PathBuf, host: &str, port: u16, use_gpu: bool, kv_ca
             (CacheFormat::F32, None) => "F32 (full precision)".to_string(),
         }
     );
+
+    // Prefix reuse is page sharing, so it needs the paged pool. Retained
+    // prefixes are capped at a quarter of the pool: enough to hold a handful of
+    // long system prompts, while leaving the bulk of KV memory to live
+    // sequences (which can also evict prefixes when they run short).
+    if prefix_cache {
+        match limits.kv_pool_pages {
+            Some(pool_pages) => {
+                let config = PrefixCacheConfig {
+                    max_pages: (pool_pages / 4).max(1),
+                    ..PrefixCacheConfig::default()
+                };
+                eprintln!(
+                    "Prefix cache:    on (up to {} entries, {} pages)",
+                    config.max_entries, config.max_pages
+                );
+                limits.prefix_cache = Some(config);
+            }
+            None => eprintln!(
+                "WARNING: --prefix-cache needs --kv-cache paged; continuing without prefix reuse."
+            ),
+        }
+    }
 
     // Start the concurrent round-robin inference engine on a dedicated OS
     // thread. The engine owns the GPU backend (if any) and all active KV

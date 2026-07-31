@@ -71,14 +71,17 @@
 //! into a zombie that accepts work it can never perform.
 
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 
 use crate::backend::GpuBackend;
-use crate::cache::{KvStore, PagePool};
+use crate::cache::{
+    KvStore, PagePool, PoolStats, PrefixCache, PrefixCacheConfig, PrefixCacheStats,
+};
 use crate::constrained::{build_constraint, ConstraintSpec, VocabIndex};
+use crate::error::GlintError;
 use crate::model::config::ModelConfig;
 use crate::model::lora::LoraWeights;
 use crate::model::lora_registry::AdapterRegistry;
@@ -209,6 +212,15 @@ pub struct EngineLimits {
     /// [`KvCache`]: crate::cache::KvCache
     /// [`PagedKvCache`]: crate::cache::PagedKvCache
     pub kv_pool_pages: Option<usize>,
+    /// Bounds for a [`PrefixCache`] over the paged pool, or `None` (the
+    /// default) to prefill every prompt from scratch.
+    ///
+    /// When set — and only when `kv_pool_pages` is also set, since prefix reuse
+    /// is page sharing — the engine keeps the KV pages of completed prefills
+    /// and admits a request that shares a prompt prefix by forking them,
+    /// prefilling only the suffix. Reuse is exact: a request served from a fork
+    /// produces the same tokens, bit for bit, as one prefilled cold.
+    pub prefix_cache: Option<PrefixCacheConfig>,
 }
 
 impl Default for EngineLimits {
@@ -217,8 +229,23 @@ impl Default for EngineLimits {
             max_active: 8,
             queue_capacity: 32,
             kv_pool_pages: None,
+            prefix_cache: None,
         }
     }
+}
+
+/// KV-memory bookkeeping, sampled by the engine for `/v1/metrics`.
+///
+/// Both halves are `None` unless the corresponding feature is configured. The
+/// snapshot is refreshed at admission and retirement boundaries — not per
+/// token — so `pool.live` is exact as of the last sequence that joined or left
+/// rather than continuously.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EngineKvStats {
+    /// Occupancy of the shared page pool ([`EngineLimits::kv_pool_pages`]).
+    pub pool: Option<PoolStats>,
+    /// Prefix-cache counters ([`EngineLimits::prefix_cache`]).
+    pub prefix: Option<PrefixCacheStats>,
 }
 
 /// Why a submit was rejected.
@@ -305,6 +332,9 @@ fn try_deliver(tx: &mpsc::Sender<u32>, pending: &mut std::collections::VecDeque<
 /// Clone-able; all clones share the same underlying channel.
 pub struct InferenceEngine {
     tx: mpsc::Sender<InferenceRequest>,
+    /// Latest KV-memory snapshot published by the loop thread. Written at
+    /// admission and retirement boundaries, read by `/v1/metrics`.
+    kv_stats: Arc<Mutex<EngineKvStats>>,
 }
 
 impl InferenceEngine {
@@ -319,6 +349,8 @@ impl InferenceEngine {
         limits: EngineLimits,
     ) -> Self {
         let (tx, mut rx) = mpsc::channel(limits.queue_capacity.max(1));
+        let kv_stats = Arc::new(Mutex::new(EngineKvStats::default()));
+        let loop_stats = Arc::clone(&kv_stats);
         std::thread::Builder::new()
             .name("glint-inference".into())
             .spawn(move || {
@@ -338,6 +370,7 @@ impl InferenceEngine {
                             &vocab_index,
                             &registry,
                             limits,
+                            &loop_stats,
                         )
                     }));
                     match result {
@@ -353,7 +386,19 @@ impl InferenceEngine {
                 }
             })
             .expect("failed to spawn inference thread");
-        Self { tx }
+        Self { tx, kv_stats }
+    }
+
+    /// Latest KV-memory snapshot: page-pool occupancy and prefix-cache
+    /// counters, each present only when that feature is configured.
+    ///
+    /// Sampled by the engine thread when sequences are admitted or retired, so
+    /// reading it costs one uncontended lock and never interferes with decoding.
+    pub fn kv_stats(&self) -> EngineKvStats {
+        *self
+            .kv_stats
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Enqueue a generation request.
@@ -410,6 +455,7 @@ fn engine_loop(
     vocab_index: &Arc<VocabIndex>,
     registry: &Arc<AdapterRegistry>,
     limits: EngineLimits,
+    kv_stats: &Mutex<EngineKvStats>,
 ) {
     let mut active: Vec<ActiveSequence> = Vec::new();
     // Decoding one token at position `pos` requires `pos < context_length`
@@ -425,28 +471,49 @@ fn engine_loop(
             config.head_dim() as usize,
         )
     });
+    // Prefix reuse is page sharing, so it exists only where sessions actually
+    // get paged caches: an f32 session drawing from a pool. (`Session::new`
+    // gives a `Q8` session the contiguous quantised cache and ignores the pool,
+    // so a registry there could never be filled — or safely read from.) Owned
+    // here — the loop is the only thread that touches it, and it is touched
+    // only when a sequence is admitted or retired, never per token.
+    let mut prefix_cache = match cache_format {
+        CacheFormat::F32 => page_pool
+            .as_ref()
+            .and(limits.prefix_cache)
+            .map(PrefixCache::new),
+        CacheFormat::Q8 => None,
+    };
 
     loop {
         // ── Admit pending requests while below the concurrency cap ────────
+        let mut admitted = false;
         while active.len() < limits.max_active {
             match rx.try_recv() {
-                Ok(req) => prefill_and_add(
-                    &mut active,
-                    req,
-                    weights,
-                    config,
-                    gpu,
-                    cache_format,
-                    page_pool.as_ref(),
-                    vocab_index,
-                    registry,
-                ),
+                Ok(req) => {
+                    prefill_and_add(
+                        &mut active,
+                        req,
+                        weights,
+                        config,
+                        gpu,
+                        cache_format,
+                        page_pool.as_ref(),
+                        prefix_cache.as_mut(),
+                        vocab_index,
+                        registry,
+                    );
+                    admitted = true;
+                }
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => return,
             }
         }
 
         if active.is_empty() {
+            if admitted {
+                publish_kv_stats(kv_stats, page_pool.as_ref(), prefix_cache.as_ref());
+            }
             // Nothing to decode — block until a request arrives.
             match rx.blocking_recv() {
                 Some(req) => prefill_and_add(
@@ -457,14 +524,19 @@ fn engine_loop(
                     gpu,
                     cache_format,
                     page_pool.as_ref(),
+                    prefix_cache.as_mut(),
                     vocab_index,
                     registry,
                 ),
                 None => return, // all senders dropped; shut down
             }
+            publish_kv_stats(kv_stats, page_pool.as_ref(), prefix_cache.as_ref());
             // Loop back to admit any additional requests that arrived while
             // we were blocked (so we prefill them before the first decode step).
             continue;
+        }
+        if admitted {
+            publish_kv_stats(kv_stats, page_pool.as_ref(), prefix_cache.as_ref());
         }
 
         // ── Sample from last_logits, deliver, and collect finished ────────
@@ -532,8 +604,13 @@ fn engine_loop(
         }
 
         // Remove finished sequences (reverse order so indices stay valid).
+        let retired = !finished.is_empty();
         for i in finished.into_iter().rev() {
             active.swap_remove(i);
+        }
+        if retired {
+            // Their pages have just gone back to the pool — resample.
+            publish_kv_stats(kv_stats, page_pool.as_ref(), prefix_cache.as_ref());
         }
 
         if active.is_empty() {
@@ -553,8 +630,13 @@ fn engine_loop(
         // left ends that one sequence (every token it produced is still
         // delivered — that is `Length`, not a truncation) instead of panicking
         // inside the decode and taking every other sequence down with it.
+        //
+        // Retained prefixes are given up first: a cached prefix is an
+        // optimisation for future requests and must never cost a running one
+        // its next token.
         for seq in active.iter_mut().filter(|s| s.draining_since.is_none()) {
-            if seq.session.cache.reserve(seq.session.tokens.len()).is_err() {
+            let need = seq.session.tokens.len();
+            if reserve_or_evict(seq.session.cache.as_mut(), need, prefix_cache.as_mut()).is_err() {
                 seq.finish.set(Finish::Length);
                 seq.draining_since = Some(now);
             }
@@ -588,6 +670,53 @@ fn engine_loop(
     }
 }
 
+/// Reserve `total_positions` in `cache`, giving up retained prefixes first.
+///
+/// A cached prefix holds pages a live request could be using, so a reservation
+/// that fails against a full pool evicts prefix entries — least-recently-used
+/// first — and retries until either the reservation succeeds or there is
+/// nothing left to give back. Without a prefix cache this is exactly
+/// `cache.reserve`.
+fn reserve_or_evict(
+    cache: &mut dyn KvStore,
+    total_positions: usize,
+    prefix_cache: Option<&mut PrefixCache>,
+) -> Result<(), GlintError> {
+    let mut last = match cache.reserve(total_positions) {
+        Ok(()) => return Ok(()),
+        Err(err) => err,
+    };
+    let Some(prefix_cache) = prefix_cache else {
+        return Err(last);
+    };
+    while prefix_cache.evict_lru() {
+        match cache.reserve(total_positions) {
+            Ok(()) => return Ok(()),
+            Err(err) => last = err,
+        }
+    }
+    Err(last)
+}
+
+/// Publish a KV-memory snapshot for `/v1/metrics` to read.
+///
+/// Returns immediately when neither the pool nor the prefix cache is
+/// configured, so the default engine never takes the lock at all.
+fn publish_kv_stats(
+    slot: &Mutex<EngineKvStats>,
+    pool: Option<&PagePool>,
+    prefix: Option<&PrefixCache>,
+) {
+    if pool.is_none() && prefix.is_none() {
+        return;
+    }
+    let snapshot = EngineKvStats {
+        pool: pool.map(PagePool::stats),
+        prefix: prefix.map(PrefixCache::stats),
+    };
+    *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = snapshot;
+}
+
 /// Run one prefill pass for `req` and add it to `active`.
 ///
 /// A prompt that does not fit the model's context window is rejected outright:
@@ -597,6 +726,16 @@ fn engine_loop(
 /// rather than a successful empty completion.
 /// (The HTTP layer clamps `max_tokens` against the context before submitting,
 /// so this guard only fires for non-HTTP callers or future clamping bugs.)
+///
+/// # Prefix reuse
+///
+/// With a `prefix_cache`, the prompt's longest cached page-aligned prefix is
+/// forked into the new session's cache and only the remaining suffix is
+/// prefilled, at a position offset of the prefix length. RoPE positions are
+/// absolute and attention reads the whole cache, so the suffix sees exactly the
+/// K/V a cold prefill would have written for those positions — the completion
+/// is bit-identical either way. Afterwards the prompt's complete pages are
+/// handed to the registry for the next request that shares them.
 #[allow(clippy::too_many_arguments)]
 fn prefill_and_add(
     active: &mut Vec<ActiveSequence>,
@@ -606,6 +745,7 @@ fn prefill_and_add(
     gpu: &mut Option<GpuBackend>,
     cache_format: CacheFormat,
     page_pool: Option<&PagePool>,
+    mut prefix_cache: Option<&mut PrefixCache>,
     vocab_index: &Arc<VocabIndex>,
     registry: &Arc<AdapterRegistry>,
 ) {
@@ -629,11 +769,32 @@ fn prefill_and_add(
         page_pool: page_pool.cloned(),
     };
     let mut session = Session::new(opts);
+
+    // Warm start: adopt a fork of the longest cached prefix of this prompt.
+    // The session's own cache is empty and holds no pages at this point, so
+    // replacing it costs nothing. The registry is keyed by adapter *name*
+    // because the engine's adapter registry is fixed at startup, so the same
+    // name always resolves to the same weights.
+    let lora_key = req.lora_name.as_deref();
+    let mut start = 0usize;
+    if let Some(prefix_cache) = prefix_cache.as_deref_mut() {
+        if let Some(fork) = prefix_cache.lookup(&req.prompt_tokens, lora_key) {
+            start = fork.len();
+            session.cache = Box::new(fork);
+        }
+    }
+
     // A paged cache takes its pages here rather than during the prefill, so a
     // pool with no room left rejects the request (the client sees its stream
     // end, `Finish::Incomplete`) instead of panicking mid-forward-pass.
     // Pre-allocated caches implement `reserve` as a no-op.
-    if session.cache.reserve(req.prompt_tokens.len()).is_err() {
+    if reserve_or_evict(
+        session.cache.as_mut(),
+        req.prompt_tokens.len(),
+        prefix_cache.as_deref_mut(),
+    )
+    .is_err()
+    {
         return;
     }
     // Attach constraint if requested.
@@ -648,13 +809,22 @@ fn prefill_and_add(
     session.last_logits = forward_prefill_lora(
         weights,
         config,
-        &req.prompt_tokens,
+        &req.prompt_tokens[start..],
         session.cache.as_mut(),
-        0,
+        start,
         &mut gpu_ref,
         lora_ref,
     );
     session.pos = req.prompt_tokens.len().saturating_sub(1);
+
+    // Retain this prompt's complete pages for the next request that shares
+    // them. Only the prompt is offered — a generated continuation belongs to
+    // this request alone — and only whole pages, so the sequence's own decoding
+    // never writes a page the registry holds.
+    if let (Some(prefix_cache), Some(paged)) = (prefix_cache, session.cache.as_paged()) {
+        prefix_cache.insert(&req.prompt_tokens, paged, lora_key);
+    }
+
     active.push(ActiveSequence {
         session,
         tx: req.tx,
@@ -1415,7 +1585,7 @@ mod tests {
         let limits = EngineLimits {
             max_active: 2,
             queue_capacity: 16,
-            kv_pool_pages: None,
+            ..Default::default()
         };
         let engine = start_tiny_engine(limits, 256);
         let budget = 8;
@@ -1477,5 +1647,581 @@ mod tests {
         let (tokens, finish) = drain_with_finish(sub);
         assert!(tokens.is_empty());
         assert_eq!(finish, Finish::Incomplete);
+    }
+
+    // ── Prefix caching ───────────────────────────────────────────────────
+    //
+    // A request whose prompt opens with a prefix another request already
+    // prefilled starts from that prefix's KV pages instead of recomputing
+    // them. The bar is that this is invisible: skipping work must not change a
+    // single token, or the server's answers would depend on what it happened
+    // to have served before.
+
+    /// Paged pool, no prefix reuse — the reference configuration.
+    fn paged_limits(pool_pages: usize) -> EngineLimits {
+        EngineLimits {
+            kv_pool_pages: Some(pool_pages),
+            ..Default::default()
+        }
+    }
+
+    /// Paged pool with prefix reuse enabled.
+    fn prefix_limits(pool_pages: usize) -> EngineLimits {
+        EngineLimits {
+            kv_pool_pages: Some(pool_pages),
+            prefix_cache: Some(PrefixCacheConfig::default()),
+            ..Default::default()
+        }
+    }
+
+    /// A 40-token shared opening (two full pages plus a partial one) followed
+    /// by a per-request tail — the shape of a chat request behind a long
+    /// system prompt.
+    fn shared_prompt(tail: &[u32]) -> Vec<u32> {
+        let mut prompt: Vec<u32> = (0..40u32).map(|i| i % 7).collect();
+        prompt.extend_from_slice(tail);
+        prompt
+    }
+
+    fn prefix_stats(engine: &InferenceEngine) -> PrefixCacheStats {
+        engine
+            .kv_stats()
+            .prefix
+            .expect("prefix cache is enabled for this engine")
+    }
+
+    /// Poll `ready` until it holds or five seconds pass.
+    ///
+    /// The KV snapshot is published by the engine thread just *after* a
+    /// sequence is removed, which is the same moment its client's channel
+    /// closes — so a test that drains a stream and reads the counters
+    /// immediately can beat the publish. Waiting removes the race without
+    /// weakening the assertion.
+    fn wait_for(engine: &InferenceEngine, ready: impl Fn(PrefixCacheStats) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !ready(prefix_stats(engine)) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Admit `prompt` through the real admission path, returning the sequence
+    /// and its receiver (dropping the receiver would look like a disconnect).
+    ///
+    /// Calling [`prefill_and_add`] directly is what lets the tests below
+    /// compare *logits and K/V rows* rather than sampled tokens: the tiny test
+    /// model's argmax is the same for almost any input, so a token stream is a
+    /// coarse probe for "did the cache change".
+    fn admit(
+        weights: &Arc<TransformerWeights>,
+        config: &Arc<ModelConfig>,
+        pool: &PagePool,
+        prefix_cache: Option<&mut PrefixCache>,
+        prompt: Vec<u32>,
+    ) -> (ActiveSequence, mpsc::Receiver<u32>) {
+        let (tx, rx) = mpsc::channel(64);
+        let req = InferenceRequest {
+            prompt_tokens: prompt,
+            max_new_tokens: 8,
+            sampler_cfg: greedy_cfg(),
+            eos_token: NO_EOS,
+            constraint: None,
+            lora_name: None,
+            tx,
+            finish: FinishSignal::new(),
+        };
+        let vocab: Vec<String> = (0..config.vocab_size).map(|i| format!("t{i}")).collect();
+        let mut active = Vec::new();
+        prefill_and_add(
+            &mut active,
+            req,
+            weights,
+            config,
+            &mut None,
+            CacheFormat::F32,
+            Some(pool),
+            prefix_cache,
+            &VocabIndex::from_vocab(&vocab),
+            &Arc::new(AdapterRegistry::new()),
+        );
+        (active.pop().expect("the prompt was admitted"), rx)
+    }
+
+    /// Admit `prompts` twice — once with no registry, once with one — and
+    /// assert the two runs are indistinguishable: same logits, and the same
+    /// K/V in every cache row of every layer.
+    ///
+    /// This is the correctness bar for the whole feature. Skipping the prefill
+    /// of a shared prefix is only sound if what the borrower ends up holding is
+    /// bit-for-bit what it would have computed itself.
+    fn assert_reuse_is_bit_identical(prompts: &[Vec<u32>], expect_reused: u64) {
+        let (raw_weights, mut config) = make_tiny_weights();
+        config.context_length = 256;
+        let weights = Arc::new(raw_weights);
+        let config = Arc::new(config);
+        let n_kv_heads = config.head_count_kv as usize;
+        let head_dim = config.head_dim() as usize;
+        let n_layers = config.block_count as usize;
+
+        let cold_pool = PagePool::new(256, n_kv_heads, head_dim);
+        let cold: Vec<_> = prompts
+            .iter()
+            .map(|p| admit(&weights, &config, &cold_pool, None, p.clone()))
+            .collect();
+
+        let warm_pool = PagePool::new(256, n_kv_heads, head_dim);
+        let mut registry = PrefixCache::new(PrefixCacheConfig::default());
+        let warm: Vec<_> = prompts
+            .iter()
+            .map(|p| {
+                admit(
+                    &weights,
+                    &config,
+                    &warm_pool,
+                    Some(&mut registry),
+                    p.clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            registry.stats().tokens_reused,
+            expect_reused,
+            "unexpected amount of prefix reuse"
+        );
+
+        for (seq, ((cold_seq, _), (warm_seq, _))) in cold.iter().zip(&warm).enumerate() {
+            let cold_logits = cold_seq.session.last_logits.data();
+            let warm_logits = warm_seq.session.last_logits.data();
+            assert_eq!(cold_logits.len(), warm_logits.len(), "seq {seq} logits len");
+            for (i, (&a, &b)) in cold_logits.iter().zip(warm_logits).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "seq {seq} logit {i}: cold={a}, reused={b}"
+                );
+            }
+
+            let cold_cache = cold_seq.session.cache.as_paged().expect("paged");
+            let warm_cache = warm_seq.session.cache.as_paged().expect("paged");
+            assert_eq!(cold_cache.len(), warm_cache.len(), "seq {seq} cache len");
+            for layer in 0..n_layers {
+                for pos in 0..cold_cache.len() {
+                    assert_eq!(
+                        cold_cache.k_at(layer, pos),
+                        warm_cache.k_at(layer, pos),
+                        "seq {seq} layer {layer} K row {pos}"
+                    );
+                    assert_eq!(
+                        cold_cache.v_at(layer, pos),
+                        warm_cache.v_at(layer, pos),
+                        "seq {seq} layer {layer} V row {pos}"
+                    );
+                }
+            }
+        }
+    }
+
+    // Two prompts sharing a 40-token opening: the second is admitted on the
+    // first's pages and prefills only its suffix, at a non-zero position
+    // offset. Every cache row and every logit must match the cold run.
+    #[test]
+    fn a_forked_admission_is_bit_identical_to_a_cold_one() {
+        assert_reuse_is_bit_identical(&[shared_prompt(&[1, 2, 3]), shared_prompt(&[4, 5, 6])], 32);
+    }
+
+    // Same, where the shared opening is 20 tokens — one whole page plus a
+    // partial one. Exactly the complete page is reused; the four positions of
+    // the partial page are recomputed per request, so the page in which the
+    // prompts diverge is never shared.
+    #[test]
+    fn a_partial_page_prefix_is_bit_identical_to_a_cold_one() {
+        let base: Vec<u32> = (0..20u32).map(|i| i % 5).collect();
+        let mut a = base.clone();
+        let mut b = base;
+        a.extend([1, 1]);
+        b.extend([6, 6]);
+        assert_reuse_is_bit_identical(&[a, b], 16);
+    }
+
+    // A chain of three requests, each extending the last: reuse must stay
+    // exact as the registry's entries are superseded by longer prefixes.
+    #[test]
+    fn a_growing_chain_of_prompts_stays_bit_identical() {
+        let long = shared_prompt(&[1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4]);
+        let prompts = vec![long[..24].to_vec(), long[..40].to_vec(), long.clone()];
+        // 24 → miss; 40 → one page of the 16-token entry; 52 → two pages of
+        // the 32-token entry.
+        assert_reuse_is_bit_identical(&prompts, 16 + 32);
+    }
+
+    // Prompts that share nothing reuse nothing, and a registry sitting in the
+    // path leaves their caches exactly as a cold admission would.
+    #[test]
+    fn unrelated_prompts_reuse_nothing_and_stay_bit_identical() {
+        let a: Vec<u32> = (0..40u32).map(|i| i % 7).collect();
+        let b: Vec<u32> = (0..40u32).map(|i| (i * 3 + 1) % 7).collect();
+        assert_reuse_is_bit_identical(&[a, b], 0);
+    }
+
+    // THE load-bearing test. A completion served from a forked prefix must be
+    // bit-identical to the same completion prefilled from scratch — the reuse
+    // is a memory optimisation, never a numerical one.
+    #[test]
+    fn prefix_hit_produces_the_same_tokens_as_a_cold_prefill() {
+        let budget = 24;
+        let prompt_a = shared_prompt(&[1, 2, 3]);
+        let prompt_b = shared_prompt(&[4, 5, 6]);
+
+        // Reference: both prompts prefilled cold (pool, but no prefix reuse).
+        let cold = start_tiny_engine(paged_limits(256), 256);
+        let expect_a = drain_all(
+            cold.submit(prompt_a.clone(), budget, greedy_cfg(), NO_EOS, None, None)
+                .expect("queue has room"),
+        );
+        let expect_b = drain_all(
+            cold.submit(prompt_b.clone(), budget, greedy_cfg(), NO_EOS, None, None)
+                .expect("queue has room"),
+        );
+        assert_eq!(expect_a.len(), budget);
+
+        // Warm: A fills the registry, B is admitted on top of A's pages.
+        let warm = start_tiny_engine(prefix_limits(256), 256);
+        let got_a = drain_all(
+            warm.submit(prompt_a, budget, greedy_cfg(), NO_EOS, None, None)
+                .expect("queue has room"),
+        );
+        let got_b = drain_all(
+            warm.submit(prompt_b, budget, greedy_cfg(), NO_EOS, None, None)
+                .expect("queue has room"),
+        );
+
+        assert_eq!(got_a, expect_a, "the cold-path request changed");
+        assert_eq!(
+            got_b, expect_b,
+            "reuse changed the tokens a client received"
+        );
+
+        let stats = prefix_stats(&warm);
+        assert_eq!(stats.hits, 1, "B should have been served from A's pages");
+        assert_eq!(stats.misses, 1, "A found an empty registry");
+        assert_eq!(
+            stats.tokens_reused, 32,
+            "43 prompt positions share two whole pages"
+        );
+    }
+
+    // The prefix's producer does not have to be finished: a request can fork
+    // the pages of a sequence that is still decoding. Copy-on-write is what
+    // keeps the two apart, and both must still match their cold outputs.
+    #[test]
+    fn prefix_is_reusable_while_the_first_request_is_still_decoding() {
+        let prompt_a = shared_prompt(&[1, 2, 3]);
+        let prompt_b = shared_prompt(&[4, 5, 6]);
+        let budget_b = 20;
+
+        let cold = start_tiny_engine(paged_limits(256), 256);
+        let expect_b = drain_all(
+            cold.submit(prompt_b.clone(), budget_b, greedy_cfg(), NO_EOS, None, None)
+                .expect("queue has room"),
+        );
+
+        let warm = start_tiny_engine(prefix_limits(256), 256);
+        // A is long-running; wait for a token so we know it has been admitted
+        // (and therefore that its prompt is in the registry).
+        let mut sub_a = warm
+            .submit(prompt_a, 200, greedy_cfg(), NO_EOS, None, None)
+            .expect("queue has room");
+        assert!(sub_a.rx.blocking_recv().is_some(), "A is live");
+
+        let got_b = drain_all(
+            warm.submit(prompt_b, budget_b, greedy_cfg(), NO_EOS, None, None)
+                .expect("queue has room"),
+        );
+        assert_eq!(got_b, expect_b, "forking a live sequence's pages changed B");
+        assert_eq!(prefix_stats(&warm).hits, 1);
+
+        // A keeps decoding correctly with B alongside it.
+        let mut seen = 1;
+        while sub_a.rx.blocking_recv().is_some() {
+            seen += 1;
+        }
+        assert_eq!(seen, 200, "A completed its own budget");
+    }
+
+    // Sharing is whole pages only. Prompts with 20 tokens in common share the
+    // one complete page; the four tokens of the partial page are prefilled per
+    // request, so divergence inside that page cannot corrupt either sequence.
+    // (The bitwise version of this is
+    // `a_partial_page_prefix_is_bit_identical_to_a_cold_one`; this one pins the
+    // page accounting end to end.)
+    #[test]
+    fn a_partial_page_prefix_shares_exactly_one_page() {
+        let budget = 16;
+        let base: Vec<u32> = (0..20u32).map(|i| i % 5).collect();
+        let mut prompt_a = base.clone();
+        let mut prompt_b = base;
+        prompt_a.extend([1, 1]); // diverges at position 20 — inside page 1
+        prompt_b.extend([6, 6]);
+
+        let cold = start_tiny_engine(paged_limits(256), 256);
+        let expect_a = drain_all(
+            cold.submit(prompt_a.clone(), budget, greedy_cfg(), NO_EOS, None, None)
+                .expect("queue has room"),
+        );
+        let expect_b = drain_all(
+            cold.submit(prompt_b.clone(), budget, greedy_cfg(), NO_EOS, None, None)
+                .expect("queue has room"),
+        );
+
+        let warm = start_tiny_engine(prefix_limits(256), 256);
+        let got_a = drain_all(
+            warm.submit(prompt_a, budget, greedy_cfg(), NO_EOS, None, None)
+                .expect("queue has room"),
+        );
+        let got_b = drain_all(
+            warm.submit(prompt_b, budget, greedy_cfg(), NO_EOS, None, None)
+                .expect("queue has room"),
+        );
+
+        assert_eq!(got_a, expect_a);
+        assert_eq!(
+            got_b, expect_b,
+            "the diverging tail page leaked between them"
+        );
+        let stats = prefix_stats(&warm);
+        assert_eq!(stats.hits, 1);
+        assert_eq!(
+            stats.tokens_reused, 16,
+            "only the one complete page is shared"
+        );
+    }
+
+    // A prompt with nothing in common with anything cached is prefilled cold
+    // and produces exactly what it would have without a registry.
+    #[test]
+    fn an_unrelated_prompt_misses_and_is_unaffected() {
+        let budget = 12;
+        let cold = start_tiny_engine(paged_limits(256), 256);
+        let expect = drain_all(
+            cold.submit(vec![7, 0, 7], budget, greedy_cfg(), NO_EOS, None, None)
+                .expect("queue has room"),
+        );
+
+        let warm = start_tiny_engine(prefix_limits(256), 256);
+        let _ = drain_all(
+            warm.submit(shared_prompt(&[1]), 4, greedy_cfg(), NO_EOS, None, None)
+                .expect("queue has room"),
+        );
+        let got = drain_all(
+            warm.submit(vec![7, 0, 7], budget, greedy_cfg(), NO_EOS, None, None)
+                .expect("queue has room"),
+        );
+        assert_eq!(got, expect);
+        let stats = prefix_stats(&warm);
+        assert_eq!(stats.hits, 0);
+        assert_eq!(stats.tokens_reused, 0);
+    }
+
+    // Retained prefixes must never starve a live request. A sequence that runs
+    // out of pages gives up cached prefixes and keeps decoding — it must reach
+    // exactly as far as it would have with the whole pool to itself.
+    #[test]
+    fn a_running_sequence_evicts_cached_prefixes_rather_than_stopping_short() {
+        let pool_pages = 6; // single-layer test model: 6 × 16 = 96 positions
+        let prompt = vec![1, 2, 3];
+
+        // Reference: the pool holds nothing back.
+        let cold = start_tiny_engine(paged_limits(pool_pages), 512);
+        let (expect, cold_finish) = drain_with_finish(
+            cold.submit(prompt.clone(), 500, greedy_cfg(), NO_EOS, None, None)
+                .expect("queue has room"),
+        );
+        assert_eq!(cold_finish, Finish::Length, "the pool is the limit here");
+        assert!(!expect.is_empty());
+
+        // Warm: a cached prefix is holding pages when the long request starts.
+        let warm = start_tiny_engine(prefix_limits(pool_pages), 512);
+        let _ = drain_all(
+            warm.submit(shared_prompt(&[]), 4, greedy_cfg(), NO_EOS, None, None)
+                .expect("queue has room"),
+        );
+        assert!(prefix_stats(&warm).entries > 0, "registry is holding pages");
+
+        let (got, warm_finish) = drain_with_finish(
+            warm.submit(prompt, 500, greedy_cfg(), NO_EOS, None, None)
+                .expect("queue has room"),
+        );
+        assert_eq!(warm_finish, Finish::Length);
+        assert_eq!(
+            got.len(),
+            expect.len(),
+            "a cached prefix cost a live request its tokens"
+        );
+        assert_eq!(got, expect);
+        wait_for(&warm, |s| s.evictions >= 1);
+        assert!(
+            prefix_stats(&warm).evictions >= 1,
+            "the prefix should have been given back to the pool"
+        );
+    }
+
+    // A prompt too large to admit even after every prefix is evicted still
+    // fails cleanly, and the engine keeps serving.
+    #[test]
+    fn admission_that_cannot_fit_even_after_eviction_fails_cleanly() {
+        let warm = start_tiny_engine(prefix_limits(4), 512); // 4 × 16 = 64 positions
+        let _ = drain_all(
+            warm.submit(shared_prompt(&[]), 2, greedy_cfg(), NO_EOS, None, None)
+                .expect("queue has room"),
+        );
+        let huge: Vec<u32> = (0..100u32).map(|i| i % 8).collect(); // needs 7 pages
+        let (tokens, finish) = drain_with_finish(
+            warm.submit(huge, 4, greedy_cfg(), NO_EOS, None, None)
+                .expect("submit itself succeeds"),
+        );
+        assert!(tokens.is_empty());
+        assert_eq!(finish, Finish::Incomplete);
+
+        // Still alive, and the pool is usable again.
+        let budget = 5;
+        let (again, _) = drain_with_finish(
+            warm.submit(vec![1, 2], budget, greedy_cfg(), NO_EOS, None, None)
+                .expect("engine still accepts work"),
+        );
+        assert_eq!(again.len(), budget);
+    }
+
+    // Prefix reuse is opt-in. The default engine — and a paged engine without
+    // it — must behave exactly as before and report no registry at all.
+    #[test]
+    fn prefix_cache_is_off_by_default() {
+        let budget = 20;
+        let prompt_a = shared_prompt(&[1, 2, 3]);
+        let prompt_b = shared_prompt(&[4, 5, 6]);
+
+        let default_engine = start_tiny_engine(EngineLimits::default(), 256);
+        assert_eq!(
+            default_engine.kv_stats(),
+            EngineKvStats::default(),
+            "the default engine reports neither a pool nor a registry"
+        );
+        let expect_a = drain_all(
+            default_engine
+                .submit(prompt_a.clone(), budget, greedy_cfg(), NO_EOS, None, None)
+                .expect("queue has room"),
+        );
+        let expect_b = drain_all(
+            default_engine
+                .submit(prompt_b.clone(), budget, greedy_cfg(), NO_EOS, None, None)
+                .expect("queue has room"),
+        );
+
+        // A paged engine reports its pool but no registry, and its tokens are
+        // unchanged — enabling paging alone must not start reusing prefixes.
+        let paged = start_tiny_engine(paged_limits(256), 256);
+        let got_a = drain_all(
+            paged
+                .submit(prompt_a, budget, greedy_cfg(), NO_EOS, None, None)
+                .expect("queue has room"),
+        );
+        let got_b = drain_all(
+            paged
+                .submit(prompt_b, budget, greedy_cfg(), NO_EOS, None, None)
+                .expect("queue has room"),
+        );
+        let stats = paged.kv_stats();
+        assert!(stats.pool.is_some(), "the pool is reported");
+        assert!(stats.prefix.is_none(), "no registry without opting in");
+        assert_eq!(got_a, expect_a);
+        assert_eq!(got_b, expect_b);
+    }
+
+    // The Q8 cache format has no pages to share, so a registry must not be
+    // built for it even when one is configured — a `Q8` session keeps the
+    // contiguous quantised cache, and its tokens are unaffected.
+    #[test]
+    fn q8_sessions_get_no_prefix_cache() {
+        let (weights, mut config) = make_tiny_weights();
+        config.context_length = 256;
+        let vocab: Vec<String> = (0..config.vocab_size).map(|i| format!("t{i}")).collect();
+        let engine = InferenceEngine::start(
+            Arc::new(weights),
+            Arc::new(config),
+            None,
+            CacheFormat::Q8,
+            VocabIndex::from_vocab(&vocab),
+            Arc::new(AdapterRegistry::new()),
+            prefix_limits(256),
+        );
+        let budget = 12;
+        let tokens = drain_all(
+            engine
+                .submit(
+                    shared_prompt(&[1]),
+                    budget,
+                    greedy_cfg(),
+                    NO_EOS,
+                    None,
+                    None,
+                )
+                .expect("queue has room"),
+        );
+        assert_eq!(tokens.len(), budget);
+        assert!(
+            engine.kv_stats().prefix.is_none(),
+            "Q8 sessions never draw from the pool, so nothing could be cached"
+        );
+    }
+
+    // ── reserve_or_evict ─────────────────────────────────────────────────
+
+    // Without a registry, the helper is exactly `KvStore::reserve`.
+    #[test]
+    fn reserve_or_evict_without_a_registry_is_a_plain_reserve() {
+        use crate::cache::{PagedKvCache, PAGE_SIZE};
+        let pool = PagePool::new(1, 1, 4);
+        let mut cache = PagedKvCache::new(&pool, 1);
+        assert!(reserve_or_evict(&mut cache, PAGE_SIZE, None).is_ok());
+        assert!(reserve_or_evict(&mut cache, PAGE_SIZE + 1, None).is_err());
+    }
+
+    // With one, an exhausted pool costs the least-recently-used prefix rather
+    // than the reservation.
+    #[test]
+    fn reserve_or_evict_frees_prefixes_until_the_reservation_fits() {
+        use crate::cache::{PagedKvCache, PrefixCache, PAGE_SIZE};
+        let pool = PagePool::new(3, 1, 4);
+        let mut registry = PrefixCache::new(PrefixCacheConfig::default());
+
+        // Two cached prefixes hold one page each.
+        for tag in 0..2u32 {
+            let mut producer = PagedKvCache::new(&pool, 1);
+            let tokens: Vec<u32> = (0..PAGE_SIZE as u32).map(|i| i * 3 + tag).collect();
+            producer.reserve(tokens.len()).expect("pool has room");
+            for pos in 0..tokens.len() {
+                producer.write(0, pos, &[1.0; 4], &[2.0; 4]);
+                producer.advance();
+            }
+            registry.insert(&tokens, &producer, None);
+        }
+        assert_eq!(registry.len(), 2);
+        assert_eq!(pool.available_pages(), 1);
+
+        // A sequence wanting all three pages gets them back.
+        let mut live = PagedKvCache::new(&pool, 1);
+        reserve_or_evict(&mut live, 3 * PAGE_SIZE, Some(&mut registry)).expect("prefixes freed");
+        assert!(registry.is_empty(), "both prefixes were given back");
+        assert_eq!(registry.stats().evictions, 2);
+    }
+
+    // Nothing left to evict is still an error — the caller must handle it.
+    #[test]
+    fn reserve_or_evict_reports_failure_when_the_registry_is_empty() {
+        use crate::cache::{PagedKvCache, PrefixCache, PAGE_SIZE};
+        let pool = PagePool::new(1, 1, 4);
+        let mut registry = PrefixCache::new(PrefixCacheConfig::default());
+        let mut cache = PagedKvCache::new(&pool, 1);
+        let err = reserve_or_evict(&mut cache, 4 * PAGE_SIZE, Some(&mut registry))
+            .expect_err("nothing can free these pages");
+        assert!(matches!(err, GlintError::KvPagePoolExhausted { .. }));
     }
 }
