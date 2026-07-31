@@ -125,13 +125,31 @@ pub(super) fn get_scale_min_q4k(j: usize, scales: &[u8]) -> (u8, u8) {
     }
 }
 
+/// Unpack one Q4_0 block (18 bytes) into 32 f32 values.
+///
+/// Mirrors `dequantize_row_q4_0` in ggml-quants.c exactly: the nibbles are
+/// stored in *split planes* — the low nibbles of bytes 0..16 are elements
+/// 0..16 and the high nibbles are elements 16..32 (NOT interleaved per byte
+/// like a naive reading would suggest), the same convention as
+/// Q5_0/Q5_1/IQ4_NL. Values are unsigned [0..15], centered by subtracting 8
+/// to get the signed range [-8..7], then scaled by `d`.
+///
+/// Anchored externally by `ggml_reference_tests::q4_0_matches_ggml_reference`.
+pub(crate) fn unpack_q4_0_block(b: &[u8], out: &mut [f32; 32]) {
+    let d = f16::from_le_bytes([b[0], b[1]]).to_f32();
+    let qs = &b[2..18];
+    for j in 0..16 {
+        out[j] = ((qs[j] & 0x0F) as i32 - 8) as f32 * d;
+        out[j + 16] = ((qs[j] >> 4) as i32 - 8) as f32 * d;
+    }
+}
+
 /// Q4_0 dequantization.
 ///
 /// Block layout (18 bytes per block of 32 elements):
 ///   [f16 scale] [16 × packed bytes, each containing two 4-bit values]
 ///
-/// The 4-bit values are unsigned [0..15], centered by subtracting 8
-/// to get signed range [-8..7]. Then multiplied by scale.
+/// See [`unpack_q4_0_block`] for the element layout.
 fn dequantize_q4_0(data: &[u8], n_elements: usize) -> Vec<f32> {
     const BLOCK_SIZE: usize = 32;
     const BLOCK_BYTES: usize = 18; // 2 (scale) + 16 (packed nibbles)
@@ -139,26 +157,13 @@ fn dequantize_q4_0(data: &[u8], n_elements: usize) -> Vec<f32> {
     let n_blocks = n_elements.div_ceil(BLOCK_SIZE);
     assert!(data.len() >= n_blocks * BLOCK_BYTES);
 
-    let mut out = Vec::with_capacity(n_elements);
-
+    let mut out = Vec::with_capacity(n_blocks * BLOCK_SIZE);
+    let mut buf = [0.0f32; BLOCK_SIZE];
     for block in 0..n_blocks {
-        let block_data = &data[block * BLOCK_BYTES..];
-        let scale = f16::from_le_bytes([block_data[0], block_data[1]]).to_f32();
-        let quants = &block_data[2..2 + 16];
-        let remaining = (n_elements - block * BLOCK_SIZE).min(BLOCK_SIZE);
-
-        for i in 0..remaining {
-            let byte = quants[i / 2];
-            // Low nibble for even indices, high nibble for odd
-            let nibble = if i % 2 == 0 {
-                (byte & 0x0F) as i32
-            } else {
-                ((byte >> 4) & 0x0F) as i32
-            };
-            // Center: subtract 8 to get signed range [-8, 7]
-            out.push((nibble - 8) as f32 * scale);
-        }
+        unpack_q4_0_block(&data[block * BLOCK_BYTES..], &mut buf);
+        out.extend_from_slice(&buf);
     }
+    out.truncate(n_elements);
     out
 }
 
@@ -1262,6 +1267,85 @@ mod ggml_reference_tests {
         (63, 4.25),
     ];
     const Q4_1_SUM: f64 = 249.0;
+    // block_q4_0: d(f16) qs[16] — 32-element blocks, split-plane nibbles
+    #[test]
+    fn q4_0_matches_ggml_reference() {
+        let mut data = Vec::new();
+        for k in 0..2 {
+            data.extend_from_slice(&f16_bytes(D));
+            data.extend_from_slice(&patterned(16, k * 16, 37, 11));
+        }
+        let vals = dequantize(&data, GgmlType::Q4_0, 64);
+        check(&vals, Q4_0_EXPECTED, Q4_0_SUM, "q4_0");
+    }
+
+    const Q4_0_EXPECTED: &[(usize, f32)] = &[
+        (0, 1.5),
+        (1, -4.0),
+        (2, -1.5),
+        (3, 1.0),
+        (4, 3.5),
+        (5, -2.0),
+        (6, 0.5),
+        (7, 3.0),
+        (8, -2.5),
+        (9, 0.0),
+        (10, 2.5),
+        (11, -3.0),
+        (12, -0.5),
+        (13, 2.0),
+        (14, -3.5),
+        (15, -1.0),
+        (16, -4.0),
+        (17, -2.5),
+        (18, -1.5),
+        (19, -0.5),
+        (20, 0.5),
+        (21, 2.0),
+        (22, 3.0),
+        (23, -4.0),
+        (24, -2.5),
+        (25, -1.5),
+        (26, -0.5),
+        (27, 1.0),
+        (28, 2.0),
+        (29, 3.0),
+        (30, -3.5),
+        (31, -2.5),
+        (32, 1.5),
+        (33, -4.0),
+        (34, -1.5),
+        (35, 1.0),
+        (36, 3.5),
+        (37, -2.0),
+        (38, 0.5),
+        (39, 3.0),
+        (40, -2.5),
+        (41, 0.0),
+        (42, 2.5),
+        (43, -3.0),
+        (44, -0.5),
+        (45, 2.0),
+        (46, -3.5),
+        (47, -1.0),
+        (48, -1.5),
+        (49, 0.0),
+        (50, 1.0),
+        (51, 2.0),
+        (52, 3.0),
+        (53, -3.5),
+        (54, -2.5),
+        (55, -1.5),
+        (56, 0.0),
+        (57, 1.0),
+        (58, 2.0),
+        (59, 3.5),
+        (60, -3.5),
+        (61, -2.5),
+        (62, -1.0),
+        (63, 0.0),
+    ];
+    const Q4_0_SUM: f64 = -23.0;
 
     // block_q5_0: d(f16) qh[4] qs[16] — 32-element blocks, 5th bit in qh
     #[test]

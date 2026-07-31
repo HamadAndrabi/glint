@@ -4,6 +4,8 @@
 //   [f16 scale (2 bytes)] [16 bytes of packed nibbles, 2 per byte]
 //
 // Nibble values are unsigned 0–15, centered by subtracting 8 → [-8, +7].
+// The nibbles are split-plane (matching ggml's dequantize_row_q4_0): the low
+// nibble of byte j is element j and its high nibble is element j + 16.
 // Each workgroup computes one output row.
 
 struct Params {
@@ -67,15 +69,15 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
             let word = weights[wi];
             let packed_byte = (word >> (lane * 8u)) & 0xFFu;
 
-            // Low nibble → element 2*j
+            // Low nibble → element j
             let lo = packed_byte & 0xFu;
             let lo_val = f32(i32(lo) - 8);
-            block_sum += lo_val * input_vec[vec_offset + j * 2u];
+            block_sum += lo_val * input_vec[vec_offset + j];
 
-            // High nibble → element 2*j+1
+            // High nibble → element j + 16
             let hi = (packed_byte >> 4u) & 0xFu;
             let hi_val = f32(i32(hi) - 8);
-            block_sum += hi_val * input_vec[vec_offset + j * 2u + 1u];
+            block_sum += hi_val * input_vec[vec_offset + j + 16u];
         }
         partial_sum += block_sum * scale;
     }
