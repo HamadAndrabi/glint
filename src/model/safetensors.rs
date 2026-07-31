@@ -1062,7 +1062,7 @@ mod tests {
 
     #[test]
     fn test_absurd_rank_is_rejected() {
-        let dims = vec!["1"; MAX_TENSOR_DIMS + 1].join(",");
+        let dims = ["1"; MAX_TENSOR_DIMS + 1].join(",");
         let header = format!(r#"{{"a":{{"dtype":"F32","shape":[{dims}],"data_offsets":[0,4]}}}}"#);
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
