@@ -141,9 +141,15 @@ tokio async threads          OS thread (blocking)
 ─────────────────          ─────────────────────
 route handler              InferenceEngine::run_loop()
   │                            │
-  │ engine.submit(tokens) ──▶  │ forward_one() per token
-  │                            │
+  │ engine.submit(tokens) ──▶  │ forward_batch() — one pass per step,
+  │                            │   covering every active sequence
   │ ◀── mpsc::Receiver ──────  │ sender.send(token_id)
   │
   └─▶ SSE stream to client
 ```
+
+Active sequences are decoded together rather than one at a time: each step runs
+a single batched forward pass, so the model's weights are streamed from memory
+once per step instead of once per sequence. Sequences join and leave the batch
+as requests are admitted and complete — see
+[Continuous batching](./server-api.md#continuous-batching).
