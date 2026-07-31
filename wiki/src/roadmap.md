@@ -119,7 +119,8 @@ cannot delay a step for the sequences already decoding.
 
 ### Quantization: More Formats
 
-- **Q4_1 / Q5_0 / Q5_1** — simple quant variants not yet implemented
+- **Q4_1 / Q5_0 / Q5_1** — ✅ shipped (scalar + AVX2 kernels, ggml-anchored
+  golden vectors)
 - **GPTQ** — post-training quantization scheme common in HuggingFace ecosystem
 - **fp8** — 8-bit float (E4M3/E5M2), increasingly common in new models
 - **AWQ** — activation-aware weight quantization, better quality at low bits

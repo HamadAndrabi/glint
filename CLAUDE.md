@@ -65,10 +65,12 @@ Key types:
 - `KvStore`: trait abstracting over cache formats (used by flash attention and forward pass)
 - `GlintError`: project-wide error enum via `thiserror`
 
-Quantization formats supported: `Q8_0`, `Q4_0`, `Q4_K`, `Q5_K`, `Q6_K`, `Q2_K`, `Q3_K`, `IQ4_NL`
+Quantization formats supported: `Q8_0`, `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, `Q4_K`, `Q5_K`, `Q6_K`, `Q2_K`, `Q3_K`, `IQ4_NL`
 
-- `Q8_0` and `Q4_0` use 32-element blocks
+- `Q8_0`, `Q4_0`, `Q4_1`, `Q5_0`, and `Q5_1` use 32-element blocks
 - K-quants use 256-element super-blocks
+- 4-bit and 5-bit simple quants pack nibbles split-plane like ggml (byte `j`
+  holds element `j` in its low nibble and element `j+16` in its high nibble)
 
 SIMD dispatch pattern:
 
