@@ -216,8 +216,9 @@ impl QuantizedTensor {
 
     /// Matrix-vector multiply: `[rows, cols] × [cols] → [rows]`.
     ///
-    /// Dispatches to the quantized kernel for Q8_0/Q4_0,
-    /// or falls back to on-the-fly dequantization for other types.
+    /// Dispatches to the direct kernel for every supported quantized format,
+    /// or falls back to on-the-fly dequantization (F32/F16/BF16 and anything
+    /// without a kernel yet).
     pub fn matvec(&self, vec: &[f32]) -> Tensor {
         assert_eq!(
             vec.len(),
@@ -235,6 +236,7 @@ impl QuantizedTensor {
             GgmlType::Q2K => dispatch_q2_k(self.data.as_slice(), self.rows, self.cols, vec),
             GgmlType::Q3K => dispatch_q3_k(self.data.as_slice(), self.rows, self.cols, vec),
             GgmlType::IQ4NL => dispatch_iq4_nl(self.data.as_slice(), self.rows, self.cols, vec),
+            GgmlType::Q4_1 => matvec_q4_1_scalar(self.data.as_slice(), self.rows, self.cols, vec),
             GgmlType::Q5_0 => matvec_q5_0_scalar(self.data.as_slice(), self.rows, self.cols, vec),
             GgmlType::Q5_1 => matvec_q5_1_scalar(self.data.as_slice(), self.rows, self.cols, vec),
             _ => matvec_fallback(
@@ -719,6 +721,37 @@ fn matvec_iq4_nl_scalar(data: &[u8], rows: usize, cols: usize, vec: &[f32]) -> V
             let mut buf = [0.0f32; BLOCK_SIZE];
             for bi in 0..n_blocks {
                 super::dequantize::unpack_iq4_nl_block(&row[bi * BLOCK_BYTES..], &mut buf);
+                let x = &vec[bi * BLOCK_SIZE..bi * BLOCK_SIZE + BLOCK_SIZE];
+                for (w, xv) in buf.iter().zip(x) {
+                    acc += w * xv;
+                }
+            }
+            acc
+        })
+        .collect()
+}
+
+/// Q4_1 matrix-vector multiply (scalar, rayon-parallel over rows).
+///
+/// Block layout (20 bytes per 32 elements): [f16 d] [f16 m] [qs u8×16].
+/// Unpacks each block through the shared, ggml-anchored
+/// [`super::dequantize::unpack_q4_1_block`] — the nibbles are split-plane
+/// (low nibbles are elements 0..16, high nibbles 16..32) and the values are
+/// affine (`q*d + m`), not centered like Q4_0.
+fn matvec_q4_1_scalar(data: &[u8], rows: usize, cols: usize, vec: &[f32]) -> Vec<f32> {
+    const BLOCK_SIZE: usize = 32;
+    const BLOCK_BYTES: usize = 20;
+
+    let n_blocks = cols / BLOCK_SIZE;
+    let bytes_per_row = n_blocks * BLOCK_BYTES;
+
+    par_rows(rows)
+        .map(|r| {
+            let mut acc = 0.0f32;
+            let row = &data[r * bytes_per_row..];
+            let mut buf = [0.0f32; BLOCK_SIZE];
+            for bi in 0..n_blocks {
+                super::dequantize::unpack_q4_1_block(&row[bi * BLOCK_BYTES..], &mut buf);
                 let x = &vec[bi * BLOCK_SIZE..bi * BLOCK_SIZE + BLOCK_SIZE];
                 for (w, xv) in buf.iter().zip(x) {
                     acc += w * xv;
@@ -1368,6 +1401,138 @@ mod tests {
         assert!(
             (result[0] - 32.0).abs() < 0.1,
             "IQ4_NL expected 32.0, got {}",
+            result[0]
+        );
+    }
+
+    /// One 32-element block: `[f16 header…] [16 × qs_byte]`.
+    fn block_with_nibbles(header: &[[u8; 2]], qs_byte: u8) -> Vec<u8> {
+        let mut data: Vec<u8> = header.iter().flatten().copied().collect();
+        data.extend(std::iter::repeat_n(qs_byte, 16));
+        data
+    }
+
+    /// Input that differs between the two nibble planes, so a kernel that read
+    /// the nibbles interleaved instead of split-plane would score differently.
+    fn split_plane_probe() -> Vec<f32> {
+        (0..32).map(|i| if i < 16 { 1.0 } else { 2.0 }).collect()
+    }
+
+    /// Q4_1: verify scalar kernel matches dequantize-then-dot.
+    ///
+    /// d=1, m=0.5, every qs byte 0xA3 → elements 0..16 are 3*1+0.5 = 3.5 and
+    /// elements 16..32 are 10*1+0.5 = 10.5.
+    /// Expected = 16 × 3.5 × 1 + 16 × 10.5 × 2 = 56 + 336 = 392.
+    #[test]
+    fn test_q4_1_matvec_matches_dequantize() {
+        use crate::model::gguf::GgmlType;
+        use crate::tensor::dequantize::dequantize;
+
+        let block = block_with_nibbles(
+            &[
+                half::f16::from_f32(1.0).to_le_bytes(),
+                half::f16::from_f32(0.5).to_le_bytes(),
+            ],
+            0xA3,
+        );
+        let input = split_plane_probe();
+
+        let deq = dequantize(&block, GgmlType::Q4_1, 32);
+        let expected: f32 = deq.iter().zip(&input).map(|(a, b)| a * b).sum();
+
+        let result = matvec_q4_1_scalar(&block, 1, 32, &input);
+        assert!(
+            (result[0] - expected).abs() < 1e-3,
+            "Q4_1 matvec: got {}, expected {}",
+            result[0],
+            expected
+        );
+        assert!(
+            (result[0] - 392.0).abs() < 1e-3,
+            "Q4_1 expected 392.0, got {}",
+            result[0]
+        );
+    }
+
+    /// Q5_0: verify scalar kernel matches dequantize-then-dot.
+    ///
+    /// d=1, qs bytes 0xA3, qh=0x0001_0000 → only bit 16 is set, which is the
+    /// 5th bit of element 16 (the first of the high-nibble plane):
+    ///   elements 0..16:  3 − 16       = −13, × 1 → −208
+    ///   element 16:      (10|16) − 16 =  10, × 2 →   20
+    ///   elements 17..32: 10 − 16      =  −6, × 2 → −180
+    /// Expected = −368.
+    #[test]
+    fn test_q5_0_matvec_matches_dequantize() {
+        use crate::model::gguf::GgmlType;
+        use crate::tensor::dequantize::dequantize;
+
+        let qh = 0x0001_0000u32.to_le_bytes();
+        let block = block_with_nibbles(
+            &[
+                half::f16::from_f32(1.0).to_le_bytes(),
+                [qh[0], qh[1]],
+                [qh[2], qh[3]],
+            ],
+            0xA3,
+        );
+        let input = split_plane_probe();
+
+        let deq = dequantize(&block, GgmlType::Q5_0, 32);
+        let expected: f32 = deq.iter().zip(&input).map(|(a, b)| a * b).sum();
+
+        let result = matvec_q5_0_scalar(&block, 1, 32, &input);
+        assert!(
+            (result[0] - expected).abs() < 1e-3,
+            "Q5_0 matvec: got {}, expected {}",
+            result[0],
+            expected
+        );
+        assert!(
+            (result[0] - (-368.0_f32)).abs() < 1e-3,
+            "Q5_0 expected -368.0, got {}",
+            result[0]
+        );
+    }
+
+    /// Q5_1: verify scalar kernel matches dequantize-then-dot.
+    ///
+    /// Same quants as `test_q5_0_matvec_matches_dequantize` but affine with
+    /// d=1, m=0.5 and no centering:
+    ///   elements 0..16:   3 + 0.5 =  3.5, × 1 →  56
+    ///   element 16:      26 + 0.5 = 26.5, × 2 →  53
+    ///   elements 17..32: 10 + 0.5 = 10.5, × 2 → 315
+    /// Expected = 424.
+    #[test]
+    fn test_q5_1_matvec_matches_dequantize() {
+        use crate::model::gguf::GgmlType;
+        use crate::tensor::dequantize::dequantize;
+
+        let qh = 0x0001_0000u32.to_le_bytes();
+        let block = block_with_nibbles(
+            &[
+                half::f16::from_f32(1.0).to_le_bytes(),
+                half::f16::from_f32(0.5).to_le_bytes(),
+                [qh[0], qh[1]],
+                [qh[2], qh[3]],
+            ],
+            0xA3,
+        );
+        let input = split_plane_probe();
+
+        let deq = dequantize(&block, GgmlType::Q5_1, 32);
+        let expected: f32 = deq.iter().zip(&input).map(|(a, b)| a * b).sum();
+
+        let result = matvec_q5_1_scalar(&block, 1, 32, &input);
+        assert!(
+            (result[0] - expected).abs() < 1e-3,
+            "Q5_1 matvec: got {}, expected {}",
+            result[0],
+            expected
+        );
+        assert!(
+            (result[0] - 424.0).abs() < 1e-3,
+            "Q5_1 expected 424.0, got {}",
             result[0]
         );
     }
