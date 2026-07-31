@@ -34,7 +34,7 @@ Glint is a focused inference engine for GGUF-based LLaMA-family models. It is de
 | Generation | Greedy, sampling (temperature/top-k/top-p/min-p/repetition-penalty/seed), streaming, speculative decoding, JSON object mode |
 | Quantization | Q8_0, Q4_0, Q4_K, Q5_K, Q6_K, Q2_K, Q3_K, IQ4_NL — weights stay compressed in memory |
 | Performance | AVX2+FMA kernels, scalar fallback, Rayon row-parallel matvec, optional GPU backend (wgpu/Vulkan/Metal/DX12) |
-| KV Cache | f32, Q8_0-quantized, and PagedAttention-style paged variants (`--kv-cache paged`, refcounted page sharing); `KvStore` trait abstraction |
+| KV Cache | f32, Q8_0-quantized, and PagedAttention-style paged variants (`--kv-cache paged`, refcounted page sharing); prefix caching across requests (`--prefix-cache`); `KvStore` trait abstraction |
 | Sessions | First-class `Session` API, deterministic RNG state, snapshot export/import, cache-format-aware resume |
 | LoRA | Load and apply LoRA adapters at inference time via `--lora` |
 | Server | OpenAI-compatible `/v1/completions`, `/v1/chat/completions`, `/v1/embeddings`, `GET /v1/metrics`, SSE streaming, queued concurrent serving |

@@ -76,6 +76,28 @@ curl http://localhost:8080/v1/metrics
 }
 ```
 
+Two further objects appear **only when the corresponding feature is enabled**;
+everything above is always present.
+
+- `kv_pool` — with `--kv-cache paged`: `capacity`, `live`, `peak_live`, `pooled`
+  page counts for the shared [page pool](./kv-cache.md#pagedkvcache-paged-f32).
+- `prefix_cache` — with `--prefix-cache`: `hits`, `misses`, `evictions`,
+  `tokens_reused`, `entries`, `pages` for the
+  [prefix registry](./kv-cache.md#prefix-caching).
+
+```json
+{
+  "requests_total": 42,
+  "kv_pool":      { "capacity": 512, "live": 96, "peak_live": 140, "pooled": 44 },
+  "prefix_cache": { "hits": 812, "misses": 19, "evictions": 3,
+                    "tokens_reused": 1662976, "entries": 6, "pages": 124 }
+}
+```
+
+Both are sampled when sequences are admitted or retired, so they are exact as of
+the last such boundary rather than continuously live — neither costs anything on
+the per-token path.
+
 ---
 
 ### `POST /v1/completions`

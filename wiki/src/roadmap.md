@@ -51,8 +51,33 @@ Opt in with `glint serve --kv-cache paged`, or `EngineLimits::kv_pool_pages` /
 `SessionOptions::page_pool` in library code. The default is still the
 pre-allocated `KvCache`. See [KV Cache](./kv-cache.md) for the design.
 
-**Still open:** using page sharing for [prefix caching](#prefix-caching), and
-paged storage for the Q8 cache format.
+**Still open:** paged storage for the Q8 cache format.
+
+### Prefix Caching — ✅ shipped
+
+Requests that share a prompt prefix — a thousand chats behind the same
+2 000-token system prompt — used to re-run that prefill every time and compute
+bit-identical K/V every time. `PrefixCache` (`src/cache/prefix.rs`) retains the
+pages instead:
+
+- The registry keeps a page-sharing `fork_from` of each completed prefill and
+  finds the longest cached prefix of a new prompt ✅
+- Sharing is whole-page only, keyed by a chained per-page hash and then
+  verified against the tokens, so a hash collision costs a missed reuse and
+  never a wrong answer ✅
+- Admission forks the prefix and prefills only the suffix, at a non-zero
+  position offset — output is bit-identical to a cold prefill ✅
+- Bounded by entries and pages, LRU-evicted; a request that runs out of pages
+  reclaims prefixes and retries, so a cached prefix never starves live work ✅
+- Hit/miss/eviction counters and pool occupancy on `/v1/metrics` ✅
+
+Opt in with `glint serve --kv-cache paged --prefix-cache`, or
+`EngineLimits::prefix_cache` in library code. Off by default. See
+[KV Cache → Prefix Caching](./kv-cache.md#prefix-caching).
+
+Still open here: sharing prefixes across *restarts* (the registry is in-memory
+and per-process), and a page-level trie so lookup is a descent rather than a
+scan over entries — worth it only at a much larger entry budget.
 
 ### SafeTensors Format Support — shipped
 
@@ -112,12 +137,6 @@ Currently one model per server process. Multi-model support would allow:
 
 Architecture question: shared memory-mapped weight files, or separate process-per-model with a multiplexing proxy?
 
-### Prefix Caching
-
-Reuse KV-cache across requests that share a common prefix (e.g., a long system prompt). If 1000 users all send a 2048-token system prompt, the KV-cache for those tokens could be computed once and shared.
-
-The PagedAttention infrastructure this needs has shipped: `PagedKvCache::fork_from(upto_position)` hands a new sequence the pages of a prefix another sequence already computed, and copy-on-write keeps the two from corrupting each other. What is missing is the bookkeeping above it — matching an incoming prompt against cached prefixes, and deciding what to keep.
-
 ### Quantized Training / QLoRA
 
 Fine-tune directly on quantized models. QLoRA (Dettmers et al.) uses:
@@ -176,7 +195,8 @@ AVX-512 doubles the SIMD register width (512 bits = 16 f32 or 64 int8). Most mod
 A built-in web UI at `/dashboard` that shows:
 - Per-layer latency breakdown
 - Memory usage over time
-- KV-cache hit rate (for prefix caching)
+- KV-cache and prefix-cache hit rate over time (the counters exist on
+  `/v1/metrics`; what is missing is history and a UI)
 - Token throughput per request
 
 ---
@@ -188,8 +208,8 @@ If you're looking for a well-scoped contribution:
 | Difficulty | Task |
 |-----------|------|
 | Beginner | Add `--format json` output flag to `inspect` subcommand |
-| Intermediate | Implement prefix caching for the HTTP server |
 | Intermediate | Add Python streaming callback (generator-based) |
+| Intermediate | Paged storage for the Q8 KV-cache format |
 | Advanced | Batched prefill (admit several queued prompts in one pass) |
 | Advanced | MoE routing in `forward.rs` |
 

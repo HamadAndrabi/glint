@@ -188,6 +188,75 @@ Paged storage is f32-only today — a `CacheFormat::Q8` session still gets the c
 
 ---
 
+## Prefix Caching
+
+Source: `src/cache/prefix.rs`
+
+A serving workload repeats itself. A thousand chat requests behind the same 2 000-token system prompt each re-run the same 2 000 prefill positions and compute bit-identical K/V from every one of them. `PrefixCache` recognises the repetition and hands the second request the first one's pages.
+
+```rust
+pub struct PrefixCache {
+    entries: Vec<PrefixEntry>,   // tokens + page hashes + a fork holding the pages
+    config: PrefixCacheConfig,   // max_entries, max_pages
+    clock: u64,                  // LRU stamps
+    stats: PrefixCacheStats,
+}
+```
+
+### Keying: chained per-page hashes, verified against the tokens
+
+Sharing is at **whole-page granularity** — an entry always ends on a `PAGE_SIZE` boundary. That is what makes the reuse free: a fork that stopped mid-page would inherit a partially-filled page, and the borrower's first append would copy it. Whole pages are written by nobody, so they stay shared for their lifetime.
+
+Each entry stores one hash per full page, chained:
+
+```
+h[0] = fnv1a(0,      tokens[0..16])
+h[1] = fnv1a(h[0],   tokens[16..32])
+h[p] = fnv1a(h[p-1], tokens[16p..16p+16])
+```
+
+Because `h[p]` folds in every token before it, two prompts whose hashes agree at page `p` agreed on the whole prefix, and a lookup is a prefix-compare of two short `u64` vectors rather than a token-by-token walk. The hash is only an index: before a fork is handed out the candidate entry's tokens are compared with the prompt for real, so a collision costs a missed reuse and never a wrong answer.
+
+### Bounds and eviction
+
+Pages a prefix retains are pages the pool cannot give a live request, so the registry is bounded by both entry count and pages held, and evicts least-recently-used when either bound is crossed. Dropping an entry releases its pages (any a live sequence still shares survive until that sequence finishes).
+
+On top of that, the engine evicts on demand: a reservation that fails with `KvPagePoolExhausted` — at admission or before a decode step — gives back prefixes and retries before the request is failed or cut short. **A cached prefix is an optimisation and never starves work that is actually running.**
+
+### What the engine does with it
+
+At admission, with prefix caching enabled:
+
+1. Look the prompt up; on a hit, `fork_from` the cached prefix into the new session's cache.
+2. Prefill only `prompt[start..]`, with `pos_offset = start`. RoPE positions are absolute and attention reads the whole cache, so the suffix sees exactly the K/V a cold prefill would have written.
+3. After the prefill, hand the prompt's *complete pages* to the registry — never generated tokens, and never a partial page.
+
+A request served from a fork produces **bit-identical** output to the same request prefilled cold; the engine tests compare logits and every K/V row of every layer, not just the sampled tokens.
+
+Entries are keyed by LoRA adapter name as well as tokens, since an adapter changes every K/V it touches.
+
+### Using it
+
+```bash
+glint serve model.gguf --kv-cache paged --prefix-cache
+```
+
+or `EngineLimits::prefix_cache: Option<PrefixCacheConfig>` in library code. It is **off by default**, and it needs the paged pool — prefix reuse *is* page sharing, so `--prefix-cache` without `--kv-cache paged` warns and continues without it.
+
+`GET /v1/metrics` reports the registry when it is enabled (additive — no existing field changes):
+
+```json
+{
+  "kv_pool":      { "capacity": 512, "live": 96, "peak_live": 140, "pooled": 44 },
+  "prefix_cache": { "hits": 812, "misses": 19, "evictions": 3,
+                    "tokens_reused": 1662976, "entries": 6, "pages": 124 }
+}
+```
+
+Both objects are sampled when sequences are admitted or retired, so they are exact as of the last such boundary rather than continuously live — the registry does no work at all on the per-token path.
+
+---
+
 ## Speculative Decoding and Cache Rollback
 
 The `truncate(new_len)` method enables speculative decoding to roll back the cache when draft tokens are rejected:
