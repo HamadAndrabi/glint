@@ -236,9 +236,9 @@ impl QuantizedTensor {
             GgmlType::Q2K => dispatch_q2_k(self.data.as_slice(), self.rows, self.cols, vec),
             GgmlType::Q3K => dispatch_q3_k(self.data.as_slice(), self.rows, self.cols, vec),
             GgmlType::IQ4NL => dispatch_iq4_nl(self.data.as_slice(), self.rows, self.cols, vec),
-            GgmlType::Q4_1 => matvec_q4_1_scalar(self.data.as_slice(), self.rows, self.cols, vec),
-            GgmlType::Q5_0 => matvec_q5_0_scalar(self.data.as_slice(), self.rows, self.cols, vec),
-            GgmlType::Q5_1 => matvec_q5_1_scalar(self.data.as_slice(), self.rows, self.cols, vec),
+            GgmlType::Q4_1 => dispatch_q4_1(self.data.as_slice(), self.rows, self.cols, vec),
+            GgmlType::Q5_0 => dispatch_q5_0(self.data.as_slice(), self.rows, self.cols, vec),
+            GgmlType::Q5_1 => dispatch_q5_1(self.data.as_slice(), self.rows, self.cols, vec),
             _ => matvec_fallback(
                 self.data.as_slice(),
                 self.ggml_type,
@@ -388,6 +388,42 @@ fn dispatch_q4_0(data: &[u8], rows: usize, cols: usize, vec: &[f32]) -> Vec<f32>
         }
     }
     matvec_q4_0_scalar(data, rows, cols, vec)
+}
+
+fn dispatch_q4_1(data: &[u8], rows: usize, cols: usize, vec: &[f32]) -> Vec<f32> {
+    #[cfg(all(target_arch = "x86_64", feature = "rayon"))]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            // SAFETY: AVX2+FMA verified above; kernel length contract upheld by
+            // the validated descriptor (see `dispatch_q8_0` for the full note).
+            return unsafe { crate::tensor::simd::matvec_q4_1_avx2(data, rows, cols, vec) };
+        }
+    }
+    matvec_q4_1_scalar(data, rows, cols, vec)
+}
+
+fn dispatch_q5_0(data: &[u8], rows: usize, cols: usize, vec: &[f32]) -> Vec<f32> {
+    #[cfg(all(target_arch = "x86_64", feature = "rayon"))]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            // SAFETY: AVX2+FMA verified above; kernel length contract upheld by
+            // the validated descriptor (see `dispatch_q8_0` for the full note).
+            return unsafe { crate::tensor::simd::matvec_q5_0_avx2(data, rows, cols, vec) };
+        }
+    }
+    matvec_q5_0_scalar(data, rows, cols, vec)
+}
+
+fn dispatch_q5_1(data: &[u8], rows: usize, cols: usize, vec: &[f32]) -> Vec<f32> {
+    #[cfg(all(target_arch = "x86_64", feature = "rayon"))]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            // SAFETY: AVX2+FMA verified above; kernel length contract upheld by
+            // the validated descriptor (see `dispatch_q8_0` for the full note).
+            return unsafe { crate::tensor::simd::matvec_q5_1_avx2(data, rows, cols, vec) };
+        }
+    }
+    matvec_q5_1_scalar(data, rows, cols, vec)
 }
 
 // ── Scalar Kernels ───────────────────────────────────────────────────────────
@@ -1573,6 +1609,112 @@ mod tests {
                         simd[i]
                     );
                 }
+            }
+        }
+    }
+
+    /// Assert two kernels agree row-by-row.
+    #[cfg(all(target_arch = "x86_64", feature = "rayon"))]
+    fn assert_rows_close(fmt: &str, scalar: &[f32], simd: &[f32]) {
+        for (i, (&s, &v)) in scalar.iter().zip(simd).enumerate() {
+            assert!((s - v).abs() < 1e-3, "{fmt} row {i}: scalar={s}, simd={v}");
+        }
+    }
+
+    /// Deterministic nibble bytes for one block.
+    fn nibble_bytes(seed: usize) -> Vec<u8> {
+        (0..16).map(|j| (seed + j * 7 + 5) as u8).collect()
+    }
+
+    /// Input spanning both signs so sign errors in the kernels show up.
+    fn simd_probe_input(cols: usize) -> Vec<f32> {
+        (0..cols).map(|i| (i as f32) * 0.05 - 1.6).collect()
+    }
+
+    /// Verify SIMD and scalar Q4_1 kernels produce the same output.
+    /// Two blocks per row exercises cross-block accumulation.
+    #[test]
+    fn test_q4_1_simd_matches_scalar() {
+        let rows = 3;
+        let cols = 64;
+        let mut data = Vec::new();
+        for r in 0..rows {
+            for b in 0..2usize {
+                data.extend_from_slice(&half::f16::from_f32(0.25 * (r + 1) as f32).to_le_bytes());
+                data.extend_from_slice(&half::f16::from_f32(-0.5 + 0.125 * b as f32).to_le_bytes());
+                data.extend(nibble_bytes(r * 37 + b * 13));
+            }
+        }
+
+        let input = simd_probe_input(cols);
+        let scalar = matvec_q4_1_scalar(&data, rows, cols, &input);
+
+        #[cfg(all(target_arch = "x86_64", feature = "rayon"))]
+        {
+            if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                let simd =
+                    unsafe { crate::tensor::simd::matvec_q4_1_avx2(&data, rows, cols, &input) };
+                assert_rows_close("Q4_1", &scalar, &simd);
+            }
+        }
+    }
+
+    /// Verify SIMD and scalar Q5_0 kernels produce the same output.
+    /// The `qh` words vary per block so both 5th-bit planes are exercised.
+    #[test]
+    fn test_q5_0_simd_matches_scalar() {
+        let rows = 3;
+        let cols = 64;
+        let mut data = Vec::new();
+        for r in 0..rows {
+            for b in 0..2usize {
+                data.extend_from_slice(&half::f16::from_f32(0.25 * (r + 1) as f32).to_le_bytes());
+                data.extend_from_slice(
+                    &(0x9E3F_1C05u32 ^ ((r * 2 + b) as u32 * 0x0101_1011)).to_le_bytes(),
+                );
+                data.extend(nibble_bytes(r * 37 + b * 13));
+            }
+        }
+
+        let input = simd_probe_input(cols);
+        let scalar = matvec_q5_0_scalar(&data, rows, cols, &input);
+
+        #[cfg(all(target_arch = "x86_64", feature = "rayon"))]
+        {
+            if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                let simd =
+                    unsafe { crate::tensor::simd::matvec_q5_0_avx2(&data, rows, cols, &input) };
+                assert_rows_close("Q5_0", &scalar, &simd);
+            }
+        }
+    }
+
+    /// Verify SIMD and scalar Q5_1 kernels produce the same output.
+    #[test]
+    fn test_q5_1_simd_matches_scalar() {
+        let rows = 3;
+        let cols = 64;
+        let mut data = Vec::new();
+        for r in 0..rows {
+            for b in 0..2usize {
+                data.extend_from_slice(&half::f16::from_f32(0.25 * (r + 1) as f32).to_le_bytes());
+                data.extend_from_slice(&half::f16::from_f32(-0.5 + 0.125 * b as f32).to_le_bytes());
+                data.extend_from_slice(
+                    &(0x9E3F_1C05u32 ^ ((r * 2 + b) as u32 * 0x0101_1011)).to_le_bytes(),
+                );
+                data.extend(nibble_bytes(r * 37 + b * 13));
+            }
+        }
+
+        let input = simd_probe_input(cols);
+        let scalar = matvec_q5_1_scalar(&data, rows, cols, &input);
+
+        #[cfg(all(target_arch = "x86_64", feature = "rayon"))]
+        {
+            if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                let simd =
+                    unsafe { crate::tensor::simd::matvec_q5_1_avx2(&data, rows, cols, &input) };
+                assert_rows_close("Q5_1", &scalar, &simd);
             }
         }
     }

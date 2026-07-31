@@ -661,3 +661,214 @@ pub(crate) unsafe fn matvec_q4_0_avx2(
         .map(|i| unsafe { dot_row_q4_0(data, i * bytes_per_row, n_blocks, vec) })
         .collect()
 }
+
+// ── Q4_1 / Q5_0 / Q5_1 kernels ───────────────────────────────────────────────
+//
+// These three share ggml's *split-plane* nibble layout: the low nibbles of the
+// 16 `qs` bytes are elements 0..16 and the high nibbles are elements 16..32.
+// That is exactly the byte order `_mm256_inserti128_si256` produces from the
+// two nibble halves, so no interleaving shuffle is needed (unlike Q4_0, whose
+// packing in this codebase is interleaved).
+
+/// Expand the 16 packed `qs` bytes at `qs` into 32 nibble values (0..15),
+/// laid out in split-plane element order: low nibbles in bytes 0..16,
+/// high nibbles in bytes 16..32.
+///
+/// # Safety
+/// `qs` must be readable for 16 bytes.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn split_plane_nibbles(qs: *const u8) -> __m256i {
+    let low_mask = _mm_set1_epi8(0x0F);
+    let packed = _mm_loadu_si128(qs as *const __m128i);
+    let lo = _mm_and_si128(packed, low_mask);
+    // srli_epi16 + mask extracts each byte's high nibble in place — see the
+    // note in `dot_row_q4_k`.
+    let hi = _mm_and_si128(_mm_srli_epi16(packed, 4), low_mask);
+    _mm256_inserti128_si256::<1>(_mm256_castsi128_si256(lo), hi)
+}
+
+/// Expand the Q5_0/Q5_1 high-bit word into 32 bytes, each `16` where the
+/// corresponding element's 5th bit is set and `0` otherwise.
+///
+/// Byte `k` of the result must test bit `k` of `qh`. Broadcasting `qh` puts
+/// its four bytes in every 32-bit lane; `shuffle_epi8` (which indexes within
+/// each 128-bit lane) then spreads byte `k / 8` across bytes `8*(k/8)..+8`,
+/// leaving a per-byte AND against `1 << (k % 8)` to select the bit.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn qh_fifth_bits(qh: u32) -> __m256i {
+    #[rustfmt::skip]
+    let spread = _mm256_shuffle_epi8(
+        _mm256_set1_epi32(qh as i32),
+        _mm256_setr_epi8(
+            0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1,
+            2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3,
+        ),
+    );
+    #[rustfmt::skip]
+    let bit = _mm256_setr_epi8(
+        1, 2, 4, 8, 16, 32, 64, -128, 1, 2, 4, 8, 16, 32, 64, -128,
+        1, 2, 4, 8, 16, 32, 64, -128, 1, 2, 4, 8, 16, 32, 64, -128,
+    );
+    // Comparing the masked value against the mask itself yields 0xFF exactly
+    // where the bit was set (no mask byte is zero, so 0 never matches).
+    _mm256_and_si256(
+        _mm256_cmpeq_epi8(_mm256_and_si256(spread, bit), bit),
+        _mm256_set1_epi8(16),
+    )
+}
+
+/// Compute the dot product of one Q4_1 row against the input vector.
+///
+/// Block layout (20 bytes / 32 elements): `[f16 d] [f16 m] [qs u8×16]`.
+/// Affine and uncentered, so the block contributes
+/// `d × dot(nibbles, input) + m × sum(input)` — the same shape as a Q4_K
+/// sub-block but with `+m` instead of `−m`, which is why `dot_and_sum_q4k`
+/// can be reused verbatim.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dot_row_q4_1(data: &[u8], row_start: usize, n_blocks: usize, vec: &[f32]) -> f32 {
+    const BLOCK_ELEMS: usize = 32;
+    const BLOCK_BYTES: usize = 20;
+
+    let mut total = 0.0f32;
+    for b in 0..n_blocks {
+        let block = &data[row_start + b * BLOCK_BYTES..];
+        let d = f16::from_le_bytes([block[0], block[1]]).to_f32();
+        let m = f16::from_le_bytes([block[2], block[3]]).to_f32();
+
+        let nibbles = split_plane_nibbles(block[4..].as_ptr());
+        let (dot, sum) = dot_and_sum_q4k(nibbles, vec.as_ptr().add(b * BLOCK_ELEMS));
+        total += d * dot + m * sum;
+    }
+    total
+}
+
+/// Compute the dot product of one Q5_0 row against the input vector.
+///
+/// Block layout (22 bytes / 32 elements): `[f16 d] [qh u32] [qs u8×16]`.
+/// The 5-bit values (0..31) are centered by −16 into [−16, 15], which fits
+/// `i8`, so the centered bytes go straight through the shared Q8_0
+/// accumulator.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dot_row_q5_0(data: &[u8], row_start: usize, n_blocks: usize, vec: &[f32]) -> f32 {
+    const BLOCK_ELEMS: usize = 32;
+    const BLOCK_BYTES: usize = 22;
+
+    let sixteen = _mm256_set1_epi8(16);
+    let mut acc = _mm256_setzero_ps();
+    for b in 0..n_blocks {
+        let block = &data[row_start + b * BLOCK_BYTES..];
+        let d = f16::from_le_bytes([block[0], block[1]]).to_f32();
+        let qh = u32::from_le_bytes([block[2], block[3], block[4], block[5]]);
+
+        // 5th bit and low nibble never overlap, so OR == ADD.
+        let values = _mm256_or_si256(split_plane_nibbles(block[6..].as_ptr()), qh_fifth_bits(qh));
+        let centered = _mm256_sub_epi8(values, sixteen);
+        acc = accum_block_q8(centered, vec.as_ptr().add(b * BLOCK_ELEMS), d, acc);
+    }
+    hsum_avx2(acc)
+}
+
+/// Compute the dot product of one Q5_1 row against the input vector.
+///
+/// Block layout (24 bytes / 32 elements): `[f16 d] [f16 m] [qh u32] [qs u8×16]`.
+/// Same 5-bit assembly as Q5_0, but affine like Q4_1 — the values stay
+/// uncentered in [0, 31], where sign-extension in `dot_and_sum_q4k` is a
+/// no-op.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dot_row_q5_1(data: &[u8], row_start: usize, n_blocks: usize, vec: &[f32]) -> f32 {
+    const BLOCK_ELEMS: usize = 32;
+    const BLOCK_BYTES: usize = 24;
+
+    let mut total = 0.0f32;
+    for b in 0..n_blocks {
+        let block = &data[row_start + b * BLOCK_BYTES..];
+        let d = f16::from_le_bytes([block[0], block[1]]).to_f32();
+        let m = f16::from_le_bytes([block[2], block[3]]).to_f32();
+        let qh = u32::from_le_bytes([block[4], block[5], block[6], block[7]]);
+
+        let values = _mm256_or_si256(split_plane_nibbles(block[8..].as_ptr()), qh_fifth_bits(qh));
+        let (dot, sum) = dot_and_sum_q4k(values, vec.as_ptr().add(b * BLOCK_ELEMS));
+        total += d * dot + m * sum;
+    }
+    total
+}
+
+/// Q4_1 matrix-vector multiply using AVX2 + FMA + rayon.
+///
+/// # Safety
+/// Caller must verify AVX2 and FMA are available via `is_x86_feature_detected!`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+pub(crate) unsafe fn matvec_q4_1_avx2(
+    data: &[u8],
+    rows: usize,
+    cols: usize,
+    vec: &[f32],
+) -> Vec<f32> {
+    const BLOCK_ELEMS: usize = 32;
+    const BLOCK_BYTES: usize = 20;
+    check_dims(data.len(), rows, cols, vec.len(), BLOCK_ELEMS, BLOCK_BYTES);
+
+    let n_blocks = cols / BLOCK_ELEMS;
+    let bytes_per_row = n_blocks * BLOCK_BYTES;
+
+    (0..rows)
+        .into_par_iter()
+        .map(|i| unsafe { dot_row_q4_1(data, i * bytes_per_row, n_blocks, vec) })
+        .collect()
+}
+
+/// Q5_0 matrix-vector multiply using AVX2 + FMA + rayon.
+///
+/// # Safety
+/// Caller must verify AVX2 and FMA are available via `is_x86_feature_detected!`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+pub(crate) unsafe fn matvec_q5_0_avx2(
+    data: &[u8],
+    rows: usize,
+    cols: usize,
+    vec: &[f32],
+) -> Vec<f32> {
+    const BLOCK_ELEMS: usize = 32;
+    const BLOCK_BYTES: usize = 22;
+    check_dims(data.len(), rows, cols, vec.len(), BLOCK_ELEMS, BLOCK_BYTES);
+
+    let n_blocks = cols / BLOCK_ELEMS;
+    let bytes_per_row = n_blocks * BLOCK_BYTES;
+
+    (0..rows)
+        .into_par_iter()
+        .map(|i| unsafe { dot_row_q5_0(data, i * bytes_per_row, n_blocks, vec) })
+        .collect()
+}
+
+/// Q5_1 matrix-vector multiply using AVX2 + FMA + rayon.
+///
+/// # Safety
+/// Caller must verify AVX2 and FMA are available via `is_x86_feature_detected!`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+pub(crate) unsafe fn matvec_q5_1_avx2(
+    data: &[u8],
+    rows: usize,
+    cols: usize,
+    vec: &[f32],
+) -> Vec<f32> {
+    const BLOCK_ELEMS: usize = 32;
+    const BLOCK_BYTES: usize = 24;
+    check_dims(data.len(), rows, cols, vec.len(), BLOCK_ELEMS, BLOCK_BYTES);
+
+    let n_blocks = cols / BLOCK_ELEMS;
+    let bytes_per_row = n_blocks * BLOCK_BYTES;
+
+    (0..rows)
+        .into_par_iter()
+        .map(|i| unsafe { dot_row_q5_1(data, i * bytes_per_row, n_blocks, vec) })
+        .collect()
+}
