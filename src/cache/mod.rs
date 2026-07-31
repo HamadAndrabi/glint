@@ -5,10 +5,12 @@
 //! position and reuse them, reducing per-token work from O(N) matvecs to O(1).
 
 mod paged;
+mod prefix;
 
 use half::f16;
 
 pub use paged::{PagePool, PagedKvCache, PoolStats, PAGE_SIZE};
+pub use prefix::{PrefixCache, PrefixCacheConfig, PrefixCacheStats, MIN_SHARED_PAGES};
 
 use crate::error::GlintError;
 
@@ -91,6 +93,17 @@ pub trait KvStore: Send + Sync {
     /// CPU to GPU on every decode step — the resident path uploads only the new
     /// token's K/V vectors (`O(head_dim)`) instead.
     fn gpu_buffer(&self) -> Option<&crate::backend::GpuKvBuffer> {
+        None
+    }
+
+    /// Return this cache as a [`PagedKvCache`], if that is what it is.
+    ///
+    /// Returns `None` for the contiguous caches (`KvCache`, `KvCacheQ8`), which
+    /// have no pages to share. Page sharing — `fork_from`, and the prefix cache
+    /// built on it — is only expressible on the concrete paged type, so a
+    /// caller holding a `dyn KvStore` (the engine's `Session`) asks for the
+    /// paged view here rather than downcasting.
+    fn as_paged(&self) -> Option<&PagedKvCache> {
         None
     }
 }

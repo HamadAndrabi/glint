@@ -493,6 +493,10 @@ impl KvStore for PagedKvCache {
         self.ensure_capacity(total_positions)
     }
 
+    fn as_paged(&self) -> Option<&PagedKvCache> {
+        Some(self)
+    }
+
     fn advance(&mut self) {
         self.len += 1;
     }
