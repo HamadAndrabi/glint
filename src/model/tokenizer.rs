@@ -198,7 +198,19 @@ impl Tokenizer {
             return Err(GlintError::MissingVocabulary);
         }
 
+        // The vocabulary becomes a dense `Vec` indexed by id, so the highest id
+        // decides the allocation. Real tokenizers number their tokens densely;
+        // requiring that keeps a short hostile file from reserving millions of
+        // empty slots (the `MAX_VOCAB_SIZE` ceiling alone would still allow
+        // ~100 MB from a 100-byte input).
         let size = pairs.iter().map(|(_, id)| *id as usize).max().unwrap() + 1;
+        if size > pairs.len().saturating_mul(2).saturating_add(1024) {
+            return Err(invalid(format!(
+                "vocabulary is too sparse: highest token id is {} for {} tokens",
+                size - 1,
+                pairs.len()
+            )));
+        }
         let mut vocab = vec![String::new(); size];
         let mut token_to_id = HashMap::with_capacity(pairs.len());
         for (piece, id) in pairs {
@@ -655,5 +667,15 @@ mod tests {
             "model": {"type": "BPE", "vocab": {"a": 4294967295}, "merges": []}
         }"#;
         assert!(Tokenizer::from_hf_json(huge, None, Some(1), Some(2)).is_err());
+        // Sparse ids under the hard ceiling are rejected too: a two-token file
+        // must not reserve a million slots.
+        let sparse = r#"{
+            "pre_tokenizer": {"type": "ByteLevel"},
+            "model": {"type": "BPE", "vocab": {"a": 0, "b": 1000000}, "merges": []}
+        }"#;
+        let err = Tokenizer::from_hf_json(sparse, None, Some(1), Some(2))
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("sparse"), "got: {err}");
     }
 }

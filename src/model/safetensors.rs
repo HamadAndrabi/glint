@@ -837,21 +837,32 @@ pub(crate) mod test_support {
         }
     }
 
-    /// Hand-write a `.safetensors` image: length prefix, JSON header, data.
+    /// Hand-write an F32 `.safetensors` image: length prefix, JSON header, data.
     ///
     /// Deliberately does not share code with the parser — the tests should
     /// fail if either side drifts.
     pub fn build_f32(specs: &[TensorSpec]) -> Vec<u8> {
+        build(specs, "F32", |v| v.to_le_bytes().to_vec())
+    }
+
+    /// The same image with every tensor rounded to F16.
+    pub fn build_f16(specs: &[TensorSpec]) -> Vec<u8> {
+        build(specs, "F16", |v| {
+            half::f16::from_f32(v).to_le_bytes().to_vec()
+        })
+    }
+
+    fn build(specs: &[TensorSpec], dtype: &str, encode: fn(f32) -> Vec<u8>) -> Vec<u8> {
         let mut entries: Vec<String> = Vec::new();
         let mut data: Vec<u8> = Vec::new();
         for s in specs {
             let begin = data.len();
-            for v in &s.data {
-                data.extend_from_slice(&v.to_le_bytes());
+            for &v in &s.data {
+                data.extend_from_slice(&encode(v));
             }
             let shape: Vec<String> = s.shape.iter().map(|d| d.to_string()).collect();
             entries.push(format!(
-                "\"{}\":{{\"dtype\":\"F32\",\"shape\":[{}],\"data_offsets\":[{},{}]}}",
+                "\"{}\":{{\"dtype\":\"{dtype}\",\"shape\":[{}],\"data_offsets\":[{},{}]}}",
                 s.name,
                 shape.join(","),
                 begin,

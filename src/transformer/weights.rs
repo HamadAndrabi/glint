@@ -470,7 +470,9 @@ fn reject_unsupported_layouts(st: &SafeTensorsModel, n_layers: usize) -> Result<
 mod tests {
     use super::*;
     use crate::model::gguf::GgmlType;
-    use crate::model::safetensors::test_support::{build_f32, pseudo_random, spec, TensorSpec};
+    use crate::model::safetensors::test_support::{
+        build_f16, build_f32, pseudo_random, spec, TensorSpec,
+    };
     use crate::model::safetensors::{HfModelDir, SafeTensorsFile};
 
     // ── RoPE row permutation ─────────────────────────────────────────────────
@@ -880,6 +882,49 @@ mod tests {
                 );
                 assert_eq!(a.raw_data(), b.raw_data(), "layer {i} {name} data");
             }
+        }
+    }
+
+    /// F16 weights keep their stored width (no widening to f32 at load) and
+    /// still run: the permutation operates on 2-byte rows and the fallback
+    /// matvec dequantizes per row, so the logits track the F32 model closely.
+    #[test]
+    fn test_f16_weights_load_natively_and_track_f32() {
+        let specs: Vec<TensorSpec> = micro_weights()
+            .into_iter()
+            .map(|(hf, _, rows, cols, data)| {
+                let shape: Vec<usize> = if cols == 1 {
+                    vec![rows]
+                } else {
+                    vec![rows, cols]
+                };
+                spec(&hf, &shape, data)
+            })
+            .collect();
+        let st = SafeTensorsModel::from_files(vec![
+            SafeTensorsFile::from_bytes(build_f16(&specs)).unwrap()
+        ])
+        .unwrap();
+        let config = micro_config();
+        let weights = TransformerWeights::from_safetensors(&st, &config, false).unwrap();
+
+        assert_eq!(weights.layers[0].attn_q.ggml_type(), GgmlType::F16);
+        assert_eq!(
+            weights.layers[0].attn_q.raw_data().len(),
+            HEADS * HEAD_DIM * EMBED * 2,
+            "F16 weights must not be widened to f32"
+        );
+
+        let f16_logits = crate::transformer::forward(&weights, &config, &[1, 5, 3]);
+        let f32_logits =
+            crate::transformer::forward(&load_micro_safetensors(), &config, &[1, 5, 3]);
+        for (a, b) in f16_logits.data().iter().zip(f32_logits.data()) {
+            assert!(
+                (a - b).abs() < 1e-2,
+                "f16 {:?} vs f32 {:?}",
+                f16_logits.data(),
+                f32_logits.data()
+            );
         }
     }
 
