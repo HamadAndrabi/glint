@@ -720,7 +720,13 @@ pub(crate) unsafe fn matvec_q4_0_avx2(
 // Rows stay the unit of rayon parallelism (outer); sequences are the inner
 // loop, exactly as in the single-vector kernels.
 
-use super::quantized::MAX_BATCH_LANES;
+/// Maximum sequences a batched kernel accumulates in one weight traversal.
+///
+/// Bounds the register/stack space a kernel needs for its per-sequence
+/// accumulators. A larger batch is split into chunks of this size, each chunk
+/// re-walking the row — still `ceil(B / MAX_BATCH_LANES)` traversals instead of
+/// `B`, and far above the batch sizes CPU serving actually runs at.
+const MAX_BATCH_LANES: usize = 16;
 
 /// Debug-only precondition check for a batched kernel: every input vector must
 /// satisfy the single-vector contract, and `out` must hold `rows × B` results.

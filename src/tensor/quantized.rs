@@ -84,13 +84,6 @@ fn par_rows(rows: usize) -> std::ops::Range<usize> {
     0..rows
 }
 
-/// Maximum sequences a batched kernel accumulates in one weight traversal.
-///
-/// Bounds the stack space a kernel needs for its per-sequence accumulators.
-/// A larger batch is split into chunks of this size, each chunk re-walking the
-/// weights — still `ceil(B / MAX_BATCH_LANES)` traversals instead of `B`.
-pub(crate) const MAX_BATCH_LANES: usize = 16;
-
 /// Parallel iterator over the per-row slices of a `[rows, batch]` output
 /// buffer (rayon when available, sequential otherwise).
 ///
@@ -2126,8 +2119,8 @@ mod tests {
     }
 
     /// Assert `matvec_batch` is bit-identical to `matvec` per input, for each
-    /// requested batch size. 17 exceeds `MAX_BATCH_LANES`, so it also covers
-    /// the lane-chunking path.
+    /// requested batch size. 17 exceeds the SIMD kernels' lane cap, so it also
+    /// covers the lane-chunking path.
     fn assert_batch_matches_single(qt: &QuantizedTensor, label: &str) {
         for &batch in &[1usize, 2, 3, 4, 17] {
             let inputs = batch_inputs(batch, qt.cols());
