@@ -6,7 +6,9 @@
 //!
 //! 1. **Admission** — new requests are accepted from the queue only while the
 //!    number of active sequences is below [`EngineLimits::max_active`]; each
-//!    admitted request has its prompt prefilled into a fresh per-sequence cache.
+//!    admitted request has its prompt prefilled into a fresh per-sequence cache
+//!    (full-context by default, or pages from a shared pool when
+//!    [`EngineLimits::kv_pool_pages`] is set).
 //! 2. **Round-robin decode** — advance every live sequence by one token
 //!    (each with its own `forward_one` call), sample, and push the token ID
 //!    down the per-request channel. This is fair interleaving, not true batched
@@ -59,6 +61,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 use crate::backend::GpuBackend;
+use crate::cache::PagePool;
 use crate::constrained::{build_constraint, ConstraintSpec, VocabIndex};
 use crate::model::config::ModelConfig;
 use crate::model::lora_registry::AdapterRegistry;
@@ -173,6 +176,19 @@ pub struct EngineLimits {
     pub max_active: usize,
     /// Request-queue capacity; submits beyond this are rejected with `Busy`.
     pub queue_capacity: usize,
+    /// Size, in [`PAGE_SIZE`]-token pages, of a shared paged KV pool.
+    ///
+    /// `None` (the default) keeps the per-sequence full-context [`KvCache`].
+    /// `Some(n)` gives every admitted f32 sequence a [`PagedKvCache`] drawing
+    /// from one pool of `n` pages, so KV memory follows the tokens actually
+    /// generated instead of `max_active` worst-case contexts. A sequence that
+    /// cannot get a page ends with [`Finish::Length`] rather than taking the
+    /// engine down.
+    ///
+    /// [`PAGE_SIZE`]: crate::cache::PAGE_SIZE
+    /// [`KvCache`]: crate::cache::KvCache
+    /// [`PagedKvCache`]: crate::cache::PagedKvCache
+    pub kv_pool_pages: Option<usize>,
 }
 
 impl Default for EngineLimits {
@@ -180,6 +196,7 @@ impl Default for EngineLimits {
         Self {
             max_active: 8,
             queue_capacity: 32,
+            kv_pool_pages: None,
         }
     }
 }
@@ -378,6 +395,16 @@ fn engine_loop(
     // Decoding one token at position `pos` requires `pos < context_length`
     // in the KV cache, i.e. `tokens.len() <= context_length` before the step.
     let context_length = config.context_length as usize;
+    // One pool shared by every sequence this loop admits (see
+    // `EngineLimits::kv_pool_pages`). Rebuilt if the loop is respawned after a
+    // panic — the sequences holding its pages are gone by then anyway.
+    let page_pool = limits.kv_pool_pages.map(|pages| {
+        PagePool::new(
+            pages,
+            config.head_count_kv as usize,
+            config.head_dim() as usize,
+        )
+    });
 
     loop {
         // ── Admit pending requests while below the concurrency cap ────────
@@ -390,6 +417,7 @@ fn engine_loop(
                     config,
                     gpu,
                     cache_format,
+                    page_pool.as_ref(),
                     vocab_index,
                     registry,
                 ),
@@ -408,6 +436,7 @@ fn engine_loop(
                     config,
                     gpu,
                     cache_format,
+                    page_pool.as_ref(),
                     vocab_index,
                     registry,
                 ),
@@ -499,6 +528,18 @@ fn engine_loop(
             continue;
         }
 
+        // A paged cache may need a new page for the position about to be
+        // written. Claim it here, before the forward pass: a pool with nothing
+        // left ends that one sequence (every token it produced is still
+        // delivered — that is `Length`, not a truncation) instead of panicking
+        // inside the decode and taking every other sequence down with it.
+        for seq in active.iter_mut().filter(|s| s.draining_since.is_none()) {
+            if seq.session.cache.reserve(seq.session.tokens.len()).is_err() {
+                seq.finish.set(Finish::Length);
+                seq.draining_since = Some(now);
+            }
+        }
+
         // ── Advance all live (non-draining) sequences by one decode step ──
         //
         // GPU path: sequential (only one GPU context).
@@ -544,6 +585,7 @@ fn prefill_and_add(
     config: &Arc<ModelConfig>,
     gpu: &mut Option<GpuBackend>,
     cache_format: CacheFormat,
+    page_pool: Option<&PagePool>,
     vocab_index: &Arc<VocabIndex>,
     registry: &Arc<AdapterRegistry>,
 ) {
@@ -564,8 +606,16 @@ fn prefill_and_add(
         n_kv_heads: config.head_count_kv as usize,
         head_dim: config.head_dim() as usize,
         lora_adapter: lora_adapter.clone(),
+        page_pool: page_pool.cloned(),
     };
     let mut session = Session::new(opts);
+    // A paged cache takes its pages here rather than during the prefill, so a
+    // pool with no room left rejects the request (the client sees its stream
+    // end, `Finish::Incomplete`) instead of panicking mid-forward-pass.
+    // Pre-allocated caches implement `reserve` as a no-op.
+    if session.cache.reserve(req.prompt_tokens.len()).is_err() {
+        return;
+    }
     // Attach constraint if requested.
     if let Some(spec) = req.constraint {
         session.constraint = Some(build_constraint(&spec, Arc::clone(vocab_index)));
@@ -799,6 +849,69 @@ mod tests {
         assert_eq!(drain_all(rx_b).len(), budget);
     }
 
+    // ── Paged KV pool ─────────────────────────────────────────────────────
+
+    // Switching the engine to a shared paged pool is a memory-layout change,
+    // not a numerical one: the same prompt must yield the same tokens.
+    #[test]
+    fn paged_pool_produces_the_same_tokens_as_the_default_cache() {
+        let plain = start_tiny_engine(EngineLimits::default(), 256);
+        let paged = start_tiny_engine(
+            EngineLimits {
+                kv_pool_pages: Some(64),
+                ..Default::default()
+            },
+            256,
+        );
+        let budget = 40; // spans several 16-token pages
+        let from_plain = drain_all(
+            plain
+                .submit(vec![1, 2, 3], budget, greedy_cfg(), NO_EOS, None, None)
+                .expect("queue has room"),
+        );
+        let from_paged = drain_all(
+            paged
+                .submit(vec![1, 2, 3], budget, greedy_cfg(), NO_EOS, None, None)
+                .expect("queue has room"),
+        );
+        assert_eq!(from_plain.len(), budget);
+        assert_eq!(from_plain, from_paged);
+    }
+
+    // A sequence that outgrows the pool stops cleanly — every token it did
+    // produce is delivered and the outcome is Length — and the pages it hands
+    // back on the way out serve the next request. Running out of KV memory
+    // must never take the engine down.
+    #[test]
+    fn paged_pool_exhaustion_ends_the_sequence_not_the_engine() {
+        let limits = EngineLimits {
+            kv_pool_pages: Some(2), // 2 pages × 16 tokens, single-layer model
+            ..Default::default()
+        };
+        let engine = start_tiny_engine(limits, 256);
+
+        let (tokens, finish) = drain_with_finish(
+            engine
+                .submit(vec![1, 2, 3], 200, greedy_cfg(), NO_EOS, None, None)
+                .expect("queue has room"),
+        );
+        assert!(
+            !tokens.is_empty() && tokens.len() < 200,
+            "expected a short but non-empty completion, got {}",
+            tokens.len()
+        );
+        assert_eq!(finish, Finish::Length);
+
+        // The engine is still alive and the pool is usable again.
+        let (again, finish_again) = drain_with_finish(
+            engine
+                .submit(vec![4, 5], 6, greedy_cfg(), NO_EOS, None, None)
+                .expect("engine still accepts work"),
+        );
+        assert_eq!(again.len(), 6);
+        assert_eq!(finish_again, Finish::Length);
+    }
+
     // With max_active=1 and queue_capacity=1, a third request is rejected
     // with Busy instead of queueing without bound.
     #[test]
@@ -806,6 +919,7 @@ mod tests {
         let limits = EngineLimits {
             max_active: 1,
             queue_capacity: 1,
+            ..Default::default()
         };
         let engine = start_tiny_engine(limits, 256);
 

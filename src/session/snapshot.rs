@@ -435,6 +435,7 @@ mod tests {
             n_kv_heads: meta.n_kv_heads as usize,
             head_dim: meta.head_dim as usize,
             lora_adapter: None,
+            page_pool: None,
         }
     }
 

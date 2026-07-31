@@ -138,6 +138,7 @@ impl Model {
             n_kv_heads: self.config.head_count_kv as usize,
             head_dim: self.config.head_dim() as usize,
             lora_adapter: opts.lora_adapter.clone(),
+            page_pool: None,
         });
         if let Some(spec) = &opts.constraint {
             // Build a vocab index from the tokenizer's raw vocabulary strings.
@@ -316,6 +317,7 @@ impl Model {
             n_kv_heads: self.config.head_count_kv as usize,
             head_dim: self.config.head_dim() as usize,
             lora_adapter: opts.lora_adapter.clone(),
+            page_pool: None,
         };
         let mut session = restore_session(snap, session_opts)?;
         if let Some(spec) = &opts.constraint {

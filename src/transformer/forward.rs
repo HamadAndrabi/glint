@@ -5,7 +5,7 @@ use rayon::prelude::*;
 
 use super::weights::{LayerWeights, TransformerWeights};
 use crate::backend::GpuBackend;
-use crate::cache::{KvCache, KvCacheQ8, KvStore};
+use crate::cache::{KvCache, KvCacheQ8, KvStore, PagePool, PagedKvCache};
 use crate::model::config::ModelConfig;
 use crate::model::lora::{LoraLayerAdapters, LoraWeights};
 use crate::sampling::Sampler;
@@ -972,6 +972,45 @@ pub fn generate_cached_q8(
     )
 }
 
+/// Sampler-based generation with a paged f32 KV-cache.
+///
+/// Drop-in replacement for [`generate_cached`] with bit-identical output: the
+/// cache holds the same f32 rows, just in [`PAGE_SIZE`]-token pages taken from
+/// a private pool as the sequence grows, instead of one `context_length`
+/// allocation made up front.
+///
+/// Server-side callers should build one [`PagePool`] shared by every sequence
+/// (see `EngineLimits::kv_pool_pages`) — that is where paging pays off.
+pub fn generate_cached_paged(
+    weights: &TransformerWeights,
+    config: &ModelConfig,
+    prompt_tokens: &[u32],
+    max_new_tokens: usize,
+    sampler: &mut Sampler,
+    eos_token: u32,
+    gpu: &mut Option<&mut GpuBackend>,
+) -> Vec<u32> {
+    let n_layers = config.block_count as usize;
+    // Private pool sized for this one sequence's worst case, so page
+    // allocation can never fail part-way through the generation.
+    let pool = PagePool::new(
+        PagePool::pages_for(config.context_length as usize, n_layers),
+        config.head_count_kv as usize,
+        config.head_dim() as usize,
+    );
+    let mut cache = PagedKvCache::new(&pool, n_layers);
+    generate_with_cache(
+        weights,
+        config,
+        prompt_tokens,
+        max_new_tokens,
+        sampler,
+        eos_token,
+        &mut cache,
+        gpu,
+    )
+}
+
 fn generate_with_cache(
     weights: &TransformerWeights,
     config: &ModelConfig,
@@ -1607,6 +1646,100 @@ mod tests {
         for (i, (&a, &b)) in l_f32.data().iter().zip(l_q8.data()).enumerate() {
             assert!((a - b).abs() < 0.05, "index {i}: f32={a:.4}, q8={b:.4}");
         }
+    }
+
+    /// End-to-end check that the paged cache is invisible to the forward pass:
+    /// a batched prefill followed by decode steps must produce exactly the same
+    /// logits as the contiguous f32 cache, bit for bit.
+    #[test]
+    fn test_paged_cache_matches_kv_cache_end_to_end() {
+        let (weights, config) = make_tiny_weights();
+        let n_layers = config.block_count as usize;
+        let prompt: Vec<u32> = vec![1, 3, 5, 2, 7];
+
+        let mut plain = KvCache::new(
+            n_layers,
+            config.context_length as usize,
+            config.head_count_kv as usize,
+            config.head_dim() as usize,
+        );
+        // A pool with room for the whole context, shared by nobody else.
+        let pool = PagePool::new(
+            PagePool::pages_for(config.context_length as usize, n_layers),
+            config.head_count_kv as usize,
+            config.head_dim() as usize,
+        );
+        let mut paged = PagedKvCache::new(&pool, n_layers);
+
+        let mut l_plain = forward_prefill(&weights, &config, &prompt, &mut plain, 0, &mut None);
+        let mut l_paged = forward_prefill(&weights, &config, &prompt, &mut paged, 0, &mut None);
+
+        // Decode far enough to cross two page boundaries (PAGE_SIZE = 16).
+        let mut tokens = prompt.clone();
+        for step in 0..25 {
+            for (i, (&a, &b)) in l_plain.data().iter().zip(l_paged.data()).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "step {step} logit {i}: kv={a:.6} paged={b:.6}"
+                );
+            }
+            let next = l_plain
+                .data()
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.total_cmp(b))
+                .map(|(i, _)| i as u32)
+                .unwrap_or(0);
+            tokens.push(next);
+            let pos = tokens.len() - 1;
+            l_plain = forward_one(&weights, &config, next, pos, &mut plain, &mut None);
+            l_paged = forward_one(&weights, &config, next, pos, &mut paged, &mut None);
+        }
+
+        assert_eq!(plain.len(), paged.len());
+        assert_eq!(paged.pages_per_layer(), tokens.len().div_ceil(16));
+        assert_eq!(pool.live_pages(), paged.allocated_pages());
+    }
+
+    /// A sequence forked from a prefilled prompt shares that prompt's pages and
+    /// still decodes to the same logits as one that computed the prefix itself
+    /// — the property prefix caching will be built on.
+    #[test]
+    fn test_forked_cache_decodes_like_a_fresh_one() {
+        let (weights, config) = make_tiny_weights();
+        let n_layers = config.block_count as usize;
+        let prompt: Vec<u32> = vec![1, 3, 5, 2, 7, 4];
+
+        let pool = PagePool::new(
+            64,
+            config.head_count_kv as usize,
+            config.head_dim() as usize,
+        );
+        let mut base = PagedKvCache::new(&pool, n_layers);
+        forward_prefill(&weights, &config, &prompt, &mut base, 0, &mut None);
+
+        // Fork the whole prompt instead of prefilling it again.
+        let mut forked = base.fork_from(prompt.len());
+        assert!(forked.is_page_shared(0, 0), "the prefix page is shared");
+
+        let mut fresh = PagedKvCache::new(&pool, n_layers);
+        forward_prefill(&weights, &config, &prompt, &mut fresh, 0, &mut None);
+
+        let mut tokens = prompt.clone();
+        for _ in 0..8 {
+            let pos = tokens.len();
+            let tok = (pos as u32) % config.vocab_size;
+            let l_fresh = forward_one(&weights, &config, tok, pos, &mut fresh, &mut None);
+            let l_forked = forward_one(&weights, &config, tok, pos, &mut forked, &mut None);
+            for (i, (&a, &b)) in l_fresh.data().iter().zip(l_forked.data()).enumerate() {
+                assert_eq!(a.to_bits(), b.to_bits(), "pos {pos} logit {i}");
+            }
+            tokens.push(tok);
+        }
+        // Writing into the forked tail page copied it; the base is untouched.
+        assert_eq!(base.len(), prompt.len());
+        assert!(!base.is_page_shared(0, 0));
     }
 
     #[test]
