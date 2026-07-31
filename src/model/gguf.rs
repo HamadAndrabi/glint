@@ -567,6 +567,15 @@ impl<'a> Cursor<'a> {
     fn read_tensor_info(&mut self) -> Result<TensorInfo> {
         let name = self.read_string()?;
         let n_dims = self.read_u32()? as usize;
+        // `n_dims` is attacker-controlled and was being fed straight to
+        // `with_capacity`: a descriptor claiming `u32::MAX` dimensions asks for
+        // a ~34 GB allocation before a single dimension is read. Validate it
+        // against what is actually left first, exactly as `read_string` does —
+        // each dimension is a u64, so a descriptor declaring more dims than the
+        // remaining bytes can hold is malformed and should be rejected outright
+        // rather than merely capped. (The header-level `tensor_count` /
+        // `metadata_kv_count` clamps do not cover this nested field.)
+        self.check_remaining(n_dims.saturating_mul(8))?;
         let mut dimensions = Vec::with_capacity(n_dims);
         for _ in 0..n_dims {
             dimensions.push(self.read_u64()?);
@@ -986,6 +995,39 @@ mod tests {
         data.extend_from_slice(&u64::MAX.to_le_bytes()); // tensor_count
         data.extend_from_slice(&0u64.to_le_bytes()); // metadata_kv_count
         assert!(GgufModel::from_bytes(data).is_err());
+    }
+
+    // Regression test for an OOM found by `cargo fuzz run gguf_parse`.
+    //
+    // The header-level count clamps do not reach `n_dims`, which sits inside
+    // each tensor descriptor. This 84-byte input walks two well-formed
+    // all-zero descriptors and then declares 0x8000_0000 dimensions for a
+    // third — enough for `Vec::with_capacity` to ask for ~17 GB. It must be
+    // rejected as malformed instead.
+    #[test]
+    fn test_huge_tensor_n_dims_does_not_oom() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&GGUF_MAGIC.to_le_bytes());
+        data.extend_from_slice(&2u32.to_le_bytes()); // version
+        data.extend_from_slice(&4_194_432u64.to_le_bytes()); // tensor_count
+        data.extend_from_slice(&0u64.to_le_bytes()); // metadata_kv_count
+
+        // Two complete descriptors: empty name, 0 dims, type 0, offset 0.
+        for _ in 0..2 {
+            data.extend_from_slice(&0u64.to_le_bytes()); // name length
+            data.extend_from_slice(&0u32.to_le_bytes()); // n_dims
+            data.extend_from_slice(&0u32.to_le_bytes()); // ggml type
+            data.extend_from_slice(&0u64.to_le_bytes()); // offset
+        }
+        // Third descriptor: empty name, then a wildly oversized n_dims.
+        data.extend_from_slice(&0u64.to_le_bytes()); // name length
+        data.extend_from_slice(&0x8000_0000u32.to_le_bytes()); // n_dims
+        assert_eq!(data.len(), 84, "matches the fuzzer's minimized input");
+
+        assert!(
+            GgufModel::from_bytes(data).is_err(),
+            "an oversized n_dims must be rejected, not preallocated"
+        );
     }
 
     #[test]
