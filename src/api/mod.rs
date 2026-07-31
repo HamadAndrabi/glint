@@ -1,8 +1,9 @@
 //! High-level Rust library API for Glint.
 //!
-//! [`Model`] is the main entry point: load a GGUF file, create [`Session`]s,
-//! and drive generation via the methods below.  This API is the authoritative
-//! surface that Python, WASM, and C FFI bindings will layer on top of.
+//! [`Model`] is the main entry point: load a GGUF file (or a HuggingFace
+//! SafeTensors directory), create [`Session`]s, and drive generation via the
+//! methods below.  This API is the authoritative surface that Python, WASM,
+//! and C FFI bindings will layer on top of.
 //!
 //! # Example
 //! ```no_run
@@ -25,6 +26,7 @@ use crate::model::config::ModelConfig;
 use crate::model::gguf::GgufModel;
 use crate::model::lora::LoraWeights;
 use crate::model::lora_registry::AdapterRegistry;
+use crate::model::safetensors::{is_safetensors_path, HfModelDir};
 use crate::model::tokenizer::Tokenizer;
 use crate::sampling::SamplerConfig;
 use crate::session::snapshot::{
@@ -86,8 +88,41 @@ pub struct Model {
 }
 
 impl Model {
-    /// Load a GGUF model from `path`.
+    /// Load a model from `path`.
+    ///
+    /// GGUF is the default. A directory that looks like a HuggingFace
+    /// checkpoint — or a `.safetensors` file inside one — is routed to
+    /// [`Model::load_safetensors`] instead.
     pub fn load(path: &Path) -> Result<Self, GlintError> {
+        if is_safetensors_path(path) {
+            return Self::load_safetensors(path);
+        }
+        Self::load_gguf(path)
+    }
+
+    /// Load a HuggingFace SafeTensors checkpoint.
+    ///
+    /// `path` is the model directory (holding `config.json`, `tokenizer.json`,
+    /// and one or more `.safetensors` files) or any of its weight files.
+    pub fn load_safetensors(path: &Path) -> Result<Self, GlintError> {
+        let hf = HfModelDir::open(path)?;
+        let weights =
+            TransformerWeights::from_safetensors(&hf.weights, &hf.config, hf.tie_word_embeddings)?;
+        // Hash over the checkpoint's total size rather than a single file's,
+        // so a snapshot is still rejected if the weights are swapped out.
+        let hash = model_hash(&hf.root.to_string_lossy(), hf.weights.byte_len() as u64);
+
+        Ok(Self {
+            weights: Arc::new(weights),
+            config: Arc::new(hf.config),
+            tokenizer: Arc::new(hf.tokenizer),
+            model_hash: hash,
+            adapter_registry: AdapterRegistry::new(),
+        })
+    }
+
+    /// Load a GGUF model from `path`.
+    pub fn load_gguf(path: &Path) -> Result<Self, GlintError> {
         let path_str = path.to_string_lossy().into_owned();
         let gguf = GgufModel::load(path).map_err(|e| GlintError::TensorReadError {
             name: "model".into(),
