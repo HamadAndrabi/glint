@@ -101,6 +101,7 @@ unsafe fn hsum_avx2(v: __m256) -> f32 {
 /// the decode is pure integer work, so single and batched kernels feed
 /// bit-identical `w` registers to the FMA chain below.
 #[cfg(target_arch = "x86_64")]
+#[inline]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn unpack_i8x32(weights_i8: __m256i) -> [__m256; 4] {
     // Split 32 i8 values into lower and upper 16
@@ -123,6 +124,7 @@ unsafe fn unpack_i8x32(weights_i8: __m256i) -> [__m256; 4] {
 /// FMA-accumulate an already-decoded 32-element weight block against one
 /// input vector: `acc += scale × dot32(w, input)`.
 #[cfg(target_arch = "x86_64")]
+#[inline]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn accum_block_w(w: &[__m256; 4], input_ptr: *const f32, scale: f32, acc: __m256) -> __m256 {
     // Load 32 f32 input values (4×8)
@@ -144,6 +146,7 @@ unsafe fn accum_block_w(w: &[__m256; 4], input_ptr: *const f32, scale: f32, acc:
 /// Convert 32 signed i8 values into f32 and FMA-accumulate them against one
 /// input vector into `acc`.
 #[cfg(target_arch = "x86_64")]
+#[inline]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn accum_block_q8(
     weights_i8: __m256i,
@@ -249,6 +252,7 @@ pub(crate) unsafe fn matvec_q8_0_avx2(
 /// The two scalars are returned separately so the caller can share the
 /// `input_sum` across multiple sub-block passes.
 #[cfg(target_arch = "x86_64")]
+#[inline]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn dot_and_sum_q4k(nibbles: __m256i, input_ptr: *const f32) -> (f32, f32) {
     // Convert 32 nibbles (u8, 0..15) → 4×__m256 of f32.
@@ -259,6 +263,7 @@ unsafe fn dot_and_sum_q4k(nibbles: __m256i, input_ptr: *const f32) -> (f32, f32)
 /// [`dot_and_sum_q4k`] against an already-decoded weight block, so a batched
 /// kernel can decode the nibbles once and reuse them across sequences.
 #[cfg(target_arch = "x86_64")]
+#[inline]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn dot_and_sum_w(w: &[__m256; 4], input_ptr: *const f32) -> (f32, f32) {
     // Load 32 f32 input values.
@@ -497,6 +502,7 @@ pub(crate) unsafe fn matvec_q5_k_avx2(
 /// i8 values are sign-extended to i16 → i32 → f32, then multiplied and summed.
 /// Handles 16 elements using two AVX2 registers of 8 f32 each.
 #[cfg(target_arch = "x86_64")]
+#[inline]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn dot16_i8_f32(weights: __m128i, input_ptr: *const f32) -> f32 {
     dot16_w(&unpack_i8x16(weights), input_ptr)
@@ -507,6 +513,7 @@ unsafe fn dot16_i8_f32(weights: __m128i, input_ptr: *const f32) -> f32 {
 /// Split out of [`dot16_i8_f32`] so the batched Q6_K kernel decodes each
 /// 16-element group once and dots it against every sequence.
 #[cfg(target_arch = "x86_64")]
+#[inline]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn unpack_i8x16(weights: __m128i) -> [__m256; 2] {
     // Sign-extend 16 × i8 → 16 × i16 (256-bit register)
@@ -520,6 +527,7 @@ unsafe fn unpack_i8x16(weights: __m128i) -> [__m256; 2] {
 
 /// [`dot16_i8_f32`] against an already-decoded 16-element weight group.
 #[cfg(target_arch = "x86_64")]
+#[inline]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn dot16_w(w: &[__m256; 2], input_ptr: *const f32) -> f32 {
     // Load 16 f32 input values
