@@ -10,6 +10,7 @@ dequantize_row_* function in llama.cpp's ggml/src/ggml-quants.c (fetched
   block_q4_K : d(f16) dmin(f16) scales[12] qs[128]                  = 144 B
   block_q5_K : d(f16) dmin(f16) scales[12] qh[32] qs[128]           = 176 B
   block_q6_K : ql[128] qh[64] scales[16:int8] d(f16)                = 210 B
+  block_q4_0 : d(f16) qs[16]                                        =  18 B
   block_q5_0 : d(f16) qh[4] qs[16]                                  =  22 B
   block_q5_1 : d(f16) m(f16) qh[4] qs[16]                           =  24 B
   block_iq4nl: d(f16) qs[16]                                        =  18 B
@@ -219,6 +220,28 @@ for k in range(2):
                             pat(12, k * 12, 83, 29), D)
 emit("Q3K", vals, kq_positions)
 
+def dequantize_q4_0(qs, d):
+    # dequantize_row_q4_0, ggml/src/ggml-quants.c:
+    #
+    #     for (int j = 0; j < qk/2; ++j) {
+    #         const int x0 = (x[i].qs[j] & 0x0F) - 8;
+    #         const int x1 = (x[i].qs[j] >>   4) - 8;
+    #         y[i*qk + j + 0   ] = x0*d;
+    #         y[i*qk + j + qk/2] = x1*d;
+    #     }
+    #
+    # Split-plane, exactly like Q5_0/Q5_1/IQ4_NL: byte j holds element j in its
+    # low nibble and element j+16 in its high nibble — NOT elements 2j/2j+1.
+    # quantize_row_q4_0_ref packs it the same way
+    # (`y[i].qs[j] = xi0; y[i].qs[j] |= xi1 << 4;` with
+    #  x0 = x[i*qk + 0 + j], x1 = x[i*qk + qk/2 + j]).
+    y = [0.0] * 32
+    for j in range(16):
+        y[j] = ((qs[j] & 0x0F) - 8) * d
+        y[j + 16] = ((qs[j] >> 4) - 8) * d
+    return y
+
+
 def dequantize_q5_0(qh_bytes, qs, d):
     qh = int.from_bytes(qh_bytes, 'little')
     y = [0.0] * 32
@@ -240,6 +263,11 @@ def dequantize_q5_1(qh_bytes, qs, d, m):
         y[j + 16] = ((qs[j] >> 4) | xh1) * d + m
     return y
 
+
+vals = []
+for k in range(2):
+    vals += dequantize_q4_0(pat(16, k * 16, 37, 11), D)
+emit("Q4_0", vals, list(range(64)))
 
 vals = []
 for k in range(2):
