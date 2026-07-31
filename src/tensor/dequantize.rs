@@ -18,6 +18,7 @@ pub fn dequantize(data: &[u8], ggml_type: GgmlType, n_elements: usize) -> Vec<f3
         GgmlType::BF16 => dequantize_bf16(data, n_elements),
         GgmlType::Q8_0 => dequantize_q8_0(data, n_elements),
         GgmlType::Q4_0 => dequantize_q4_0(data, n_elements),
+        GgmlType::Q4_1 => dequantize_q4_1(data, n_elements),
         GgmlType::Q5_0 => dequantize_q5_0(data, n_elements),
         GgmlType::Q5_1 => dequantize_q5_1(data, n_elements),
         GgmlType::Q4K => dequantize_q4_k(data, n_elements),
@@ -492,6 +493,43 @@ fn dequantize_q3_k(data: &[u8], n_elements: usize) -> Vec<f32> {
     out
 }
 
+/// Unpack one Q4_1 block (20 bytes) into 32 f32 values.
+///
+/// Mirrors `dequantize_row_q4_1` in ggml-quants.c exactly. Block layout:
+/// `[f16 d] [f16 m] [qs u8×16]`. Split-plane nibbles like Q5_0/IQ4_NL — the
+/// low nibble of byte `j` is element `j` and the high nibble is element
+/// `j + 16`. Affine (`x = q*d + m`) with `q` unsigned in [0, 15], so unlike
+/// Q4_0 there is no −8 centering: the offset lives in `m`.
+///
+/// Anchored externally by `ggml_reference_tests::q4_1_matches_ggml_reference`.
+pub(crate) fn unpack_q4_1_block(b: &[u8], out: &mut [f32; 32]) {
+    let d = f16::from_le_bytes([b[0], b[1]]).to_f32();
+    let m = f16::from_le_bytes([b[2], b[3]]).to_f32();
+    let qs = &b[4..20];
+    for j in 0..16 {
+        out[j] = (qs[j] & 0x0F) as f32 * d + m;
+        out[j + 16] = (qs[j] >> 4) as f32 * d + m;
+    }
+}
+
+/// Q4_1 dequantization. See [`unpack_q4_1_block`] for the layout.
+fn dequantize_q4_1(data: &[u8], n_elements: usize) -> Vec<f32> {
+    const BLOCK_SIZE: usize = 32;
+    const BLOCK_BYTES: usize = 20;
+
+    let n_blocks = n_elements.div_ceil(BLOCK_SIZE);
+    assert!(data.len() >= n_blocks * BLOCK_BYTES);
+
+    let mut out = Vec::with_capacity(n_blocks * BLOCK_SIZE);
+    let mut buf = [0.0f32; BLOCK_SIZE];
+    for block in 0..n_blocks {
+        unpack_q4_1_block(&data[block * BLOCK_BYTES..], &mut buf);
+        out.extend_from_slice(&buf);
+    }
+    out.truncate(n_elements);
+    out
+}
+
 /// Unpack one Q5_0 block (22 bytes) into 32 f32 values.
 ///
 /// Mirrors `dequantize_row_q5_0` in ggml-quants.c exactly. Block layout:
@@ -725,6 +763,102 @@ mod tests {
                 i,
                 v
             );
+        }
+    }
+
+    /// Build a 32-element block from `[f16 header…] [16 nibble bytes]`.
+    fn block_with_nibbles(header: &[[u8; 2]], qs_byte: u8) -> Vec<u8> {
+        let mut data: Vec<u8> = header.iter().flatten().copied().collect();
+        data.extend(std::iter::repeat_n(qs_byte, 16));
+        data
+    }
+
+    /// Q4_1: d=0.5, m=-1.25, every qs byte 0xA3 (low nibble 3, high nibble 10).
+    ///
+    /// Split-plane nibbles, so the low nibbles are elements 0..16 and the high
+    /// nibbles elements 16..32 (an interleaved reading would alternate instead):
+    ///   elements  0..16: 3 × 0.5 − 1.25 =  0.25
+    ///   elements 16..32: 10 × 0.5 − 1.25 = 3.75
+    #[test]
+    fn test_dequantize_q4_1() {
+        let data = block_with_nibbles(
+            &[
+                f16::from_f32(0.5).to_le_bytes(),
+                f16::from_f32(-1.25).to_le_bytes(),
+            ],
+            0xA3,
+        );
+
+        let result = dequantize_q4_1(&data, 32);
+        assert_eq!(result.len(), 32);
+        for (i, &v) in result.iter().enumerate() {
+            let expected = if i < 16 { 0.25 } else { 3.75 };
+            assert_eq!(v, expected, "index {i}");
+        }
+    }
+
+    /// Q5_0: d=0.25, qh=0x0001_0002 (bit 1 and bit 16 set), qs bytes 0xA3.
+    ///
+    /// The 5th bit of element `j` is qh bit `j`, so only elements 1 and 16 gain
+    /// the +16:
+    ///   element 0, 2..16:  (3 − 16)  × 0.25 = −3.25
+    ///   element 1:         (19 − 16) × 0.25 =  0.75
+    ///   element 16:        (26 − 16) × 0.25 =  2.5
+    ///   elements 17..32:   (10 − 16) × 0.25 = −1.5
+    #[test]
+    fn test_dequantize_q5_0() {
+        let qh = 0x0001_0002u32.to_le_bytes();
+        let data = block_with_nibbles(
+            &[
+                f16::from_f32(0.25).to_le_bytes(),
+                [qh[0], qh[1]],
+                [qh[2], qh[3]],
+            ],
+            0xA3,
+        );
+
+        let result = dequantize_q5_0(&data, 32);
+        assert_eq!(result.len(), 32);
+        for (i, &v) in result.iter().enumerate() {
+            let expected = match i {
+                1 => 0.75,
+                16 => 2.5,
+                0..=15 => -3.25,
+                _ => -1.5,
+            };
+            assert_eq!(v, expected, "index {i}");
+        }
+    }
+
+    /// Q5_1: same quants as `test_dequantize_q5_0` but affine — d=0.25, m=1.5,
+    /// and the 5-bit values are used uncentered:
+    ///   element 0, 2..16:  3 × 0.25 + 1.5  = 2.25
+    ///   element 1:        19 × 0.25 + 1.5  = 6.25
+    ///   element 16:       26 × 0.25 + 1.5  = 8.0
+    ///   elements 17..32:  10 × 0.25 + 1.5  = 4.0
+    #[test]
+    fn test_dequantize_q5_1() {
+        let qh = 0x0001_0002u32.to_le_bytes();
+        let data = block_with_nibbles(
+            &[
+                f16::from_f32(0.25).to_le_bytes(),
+                f16::from_f32(1.5).to_le_bytes(),
+                [qh[0], qh[1]],
+                [qh[2], qh[3]],
+            ],
+            0xA3,
+        );
+
+        let result = dequantize_q5_1(&data, 32);
+        assert_eq!(result.len(), 32);
+        for (i, &v) in result.iter().enumerate() {
+            let expected = match i {
+                1 => 6.25,
+                16 => 8.0,
+                0..=15 => 2.25,
+                _ => 4.0,
+            };
+            assert_eq!(v, expected, "index {i}");
         }
     }
 }
@@ -1047,6 +1181,87 @@ mod ggml_reference_tests {
         (511, 2.0),
     ];
     const Q3K_SUM: f64 = -271.5;
+
+    // block_q4_1: d(f16) m(f16) qs[16] — affine 4-bit, split-plane nibbles
+    #[test]
+    fn q4_1_matches_ggml_reference() {
+        let mut data = Vec::new();
+        for k in 0..2 {
+            data.extend_from_slice(&f16_bytes(D));
+            data.extend_from_slice(&f16_bytes(DMIN));
+            data.extend_from_slice(&patterned(16, k * 16, 37, 11));
+        }
+        let vals = dequantize(&data, GgmlType::Q4_1, 64);
+        check(&vals, Q4_1_EXPECTED, Q4_1_SUM, "q4_1");
+    }
+
+    const Q4_1_EXPECTED: &[(usize, f32)] = &[
+        (0, 5.75),
+        (1, 0.25),
+        (2, 2.75),
+        (3, 5.25),
+        (4, 7.75),
+        (5, 2.25),
+        (6, 4.75),
+        (7, 7.25),
+        (8, 1.75),
+        (9, 4.25),
+        (10, 6.75),
+        (11, 1.25),
+        (12, 3.75),
+        (13, 6.25),
+        (14, 0.75),
+        (15, 3.25),
+        (16, 0.25),
+        (17, 1.75),
+        (18, 2.75),
+        (19, 3.75),
+        (20, 4.75),
+        (21, 6.25),
+        (22, 7.25),
+        (23, 0.25),
+        (24, 1.75),
+        (25, 2.75),
+        (26, 3.75),
+        (27, 5.25),
+        (28, 6.25),
+        (29, 7.25),
+        (30, 0.75),
+        (31, 1.75),
+        (32, 5.75),
+        (33, 0.25),
+        (34, 2.75),
+        (35, 5.25),
+        (36, 7.75),
+        (37, 2.25),
+        (38, 4.75),
+        (39, 7.25),
+        (40, 1.75),
+        (41, 4.25),
+        (42, 6.75),
+        (43, 1.25),
+        (44, 3.75),
+        (45, 6.25),
+        (46, 0.75),
+        (47, 3.25),
+        (48, 2.75),
+        (49, 4.25),
+        (50, 5.25),
+        (51, 6.25),
+        (52, 7.25),
+        (53, 0.75),
+        (54, 1.75),
+        (55, 2.75),
+        (56, 4.25),
+        (57, 5.25),
+        (58, 6.25),
+        (59, 7.75),
+        (60, 0.75),
+        (61, 1.75),
+        (62, 3.25),
+        (63, 4.25),
+    ];
+    const Q4_1_SUM: f64 = 249.0;
 
     // block_q5_0: d(f16) qh[4] qs[16] — 32-element blocks, 5th bit in qh
     #[test]
