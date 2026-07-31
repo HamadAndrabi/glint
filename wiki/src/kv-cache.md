@@ -37,13 +37,14 @@ For a 100-token generation, the cache reduces attention matvecs from ~5000 to 10
 
 ## The `KvStore` Trait
 
-Both cache implementations share a common interface:
+All cache implementations share a common interface:
 
 ```rust
 pub trait KvStore: Send + Sync {
     fn read_k_head(&self, layer: usize, pos: usize, kv_h: usize, head_dim: usize, buf: &mut [f32]);
     fn read_v_head(&self, layer: usize, pos: usize, kv_h: usize, head_dim: usize, buf: &mut [f32]);
     fn write(&mut self, layer: usize, pos: usize, k: &[f32], v: &[f32]);
+    fn reserve(&mut self, total_positions: usize) -> Result<(), GlintError>;  // capacity, up front
     fn advance(&mut self);          // called once per token, after writing all layers
     fn len(&self) -> usize;         // number of valid positions
     fn truncate(&mut self, new_len: usize);  // roll back (used by speculative decoding)
@@ -52,6 +53,8 @@ pub trait KvStore: Send + Sync {
 ```
 
 The flash attention implementation and the forward pass are both written against `KvStore`, making them format-agnostic.
+
+`reserve` defaults to a no-op: `KvCache` and `KvCacheQ8` own every slot from the moment they are constructed. Only `PagedKvCache` does real work there, which is how a caller finds out it is out of KV memory *before* a forward pass rather than during one.
 
 ---
 
@@ -132,6 +135,59 @@ The rounding error introduced per token is small (max ~0.1% relative error per e
 
 ---
 
+## `PagedKvCache` (paged f32)
+
+Source: `src/cache/paged.rs`
+
+The same f32 rows as `KvCache`, but handed out in fixed-size **pages** of `PAGE_SIZE` (16) positions drawn from a shared, capacity-bounded `PagePool` — the PagedAttention idea from [vLLM](https://arxiv.org/abs/2309.05657).
+
+```rust
+pub struct PagedKvCache {
+    pool: PagePool,               // shared handle: free list + capacity + refcounts
+    table: Vec<Vec<Arc<PageBuf>>>, // table[layer][page] — the page table
+    kv_dim: usize,
+    len: usize,
+}
+```
+
+One page holds `PAGE_SIZE` positions of K and V for a **single layer**, laid out exactly like a `KvCache` layer (`row = slot * kv_dim`), so reads are the same arithmetic behind one page indirection and attention output is bit-identical to `KvCache`.
+
+### Why it matters
+
+`KvCache` reserves `context_length` rows per sequence at admission. With 100 concurrent requests against a 4096-token context that is 100 full-context allocations, even if most requests stop after 50 tokens. A paged sequence only holds `ceil(len / 16)` pages per layer, and its pages return to the pool when it finishes.
+
+### Allocation and hot path
+
+- A page is allocated only when a write crosses a page boundary — never per token.
+- Reads and in-page writes touch the sequence's own page table: no locking, no allocation.
+- The pool lock is taken once per boundary crossing, per copy-on-write, and on release.
+
+### Sharing and copy-on-write
+
+Pages are reference-counted, which is the primitive prefix caching needs:
+
+```rust
+let child = parent.fork_from(prompt_len);  // shares pages, copies nothing
+```
+
+The fork's page table points at the parent's pages. A page reachable from more than one cache is immutable: the first write into one (typically the partially-filled tail page the fork inherited) copies it into a fresh page owned by the writer, so neither sequence can observe the other's tokens. Whole prefix pages, which neither side writes, stay shared for their lifetime.
+
+### Running out of pages
+
+The pool is bounded, so allocation can fail. `reserve` reports `GlintError::KvPagePoolExhausted` and the caller decides what to do; the inference engine ends that one sequence with `Finish::Length` and keeps serving everything else.
+
+### Using it
+
+```bash
+glint serve model.gguf --kv-cache paged
+```
+
+or, in library code, `SessionOptions::page_pool` / `EngineLimits::kv_pool_pages` / `generate_cached_paged`.
+
+Paged storage is f32-only today — a `CacheFormat::Q8` session still gets the contiguous `KvCacheQ8`.
+
+---
+
 ## Speculative Decoding and Cache Rollback
 
 The `truncate(new_len)` method enables speculative decoding to roll back the cache when draft tokens are rejected:
@@ -149,7 +205,7 @@ This is why the cache supports truncation: it's not just for clearing at convers
 
 ## Context Window Management
 
-The cache is pre-allocated for `max_seq_len` positions (from `config.context_length`). Attempts to write beyond this raise a panic:
+`KvCache` and `KvCacheQ8` are pre-allocated for `max_seq_len` positions (from `config.context_length`). Attempts to write beyond this raise a panic:
 
 ```rust
 assert!(pos < self.max_seq_len, "KV-cache overflow: pos {pos} >= {}", self.max_seq_len);

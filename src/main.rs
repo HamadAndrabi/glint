@@ -10,6 +10,8 @@ use std::time::Instant;
 use glint::api::Model as GlintModel;
 use glint::bench;
 #[cfg(feature = "server")]
+use glint::cache::{PagePool, PAGE_SIZE};
+#[cfg(feature = "server")]
 use glint::constrained::VocabIndex;
 use glint::model::chat_template::{ChatTemplate, Message};
 use glint::model::config::ModelConfig;
@@ -182,7 +184,9 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         gpu: bool,
 
-        /// KV-cache storage format: "f32" (default, full precision) or "q8" (~3.8× smaller).
+        /// KV-cache storage format: "f32" (default, full precision),
+        /// "q8" (~3.8× smaller), or "paged" (f32 in on-demand 16-token pages
+        /// shared by all requests — memory follows real usage).
         #[arg(long, default_value = "f32")]
         kv_cache: String,
     },
@@ -1098,17 +1102,32 @@ async fn serve_model(path: &PathBuf, host: &str, port: u16, use_gpu: bool, kv_ca
     let weights = Arc::new(weights);
     let config_arc = Arc::new(config);
 
-    // Parse cache format from CLI arg.
+    // Parse cache format from CLI arg. "paged" keeps f32 storage but hands it
+    // out in pages from one shared pool instead of pre-allocating a full
+    // context per request.
+    let mut limits = glint::server::EngineLimits::default();
     let cache_format = match kv_cache {
         "q8" => CacheFormat::Q8,
         _ => CacheFormat::F32,
     };
+    if kv_cache == "paged" {
+        // Sized for the worst case (every active sequence filling the context),
+        // so paging never rejects work the contiguous cache would have taken;
+        // pages are allocated lazily, so idle capacity costs nothing.
+        limits.kv_pool_pages = Some(
+            PagePool::pages_for(
+                config_arc.context_length as usize,
+                config_arc.block_count as usize,
+            ) * limits.max_active,
+        );
+    }
     eprintln!(
         "KV-cache format: {}",
-        if cache_format == CacheFormat::Q8 {
-            "Q8 (quantised)"
-        } else {
-            "F32 (full precision)"
+        match (cache_format, limits.kv_pool_pages) {
+            (CacheFormat::Q8, _) => "Q8 (quantised)".to_string(),
+            (CacheFormat::F32, Some(pages)) =>
+                format!("F32 paged ({pages} pages × {PAGE_SIZE} tokens)"),
+            (CacheFormat::F32, None) => "F32 (full precision)".to_string(),
         }
     );
 
@@ -1133,7 +1152,7 @@ async fn serve_model(path: &PathBuf, host: &str, port: u16, use_gpu: bool, kv_ca
         cache_format,
         Arc::clone(&vocab_index),
         engine_registry,
-        glint::server::EngineLimits::default(),
+        limits,
     ));
 
     let state = AppState {

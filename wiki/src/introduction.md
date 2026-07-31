@@ -84,7 +84,7 @@ See [Architecture](./architecture.md) for a deeper walkthrough.
 | [Tensors & Ops](./tensors.md) | f32 Tensor type, matmul, RMSNorm, RoPE |
 | [Forward Pass](./forward-pass.md) | End-to-end inference walkthrough |
 | [Tokenization](./tokenization.md) | BPE, GPT-2 mapping, special tokens |
-| [KV Cache](./kv-cache.md) | f32 and Q8_0 cache, KvStore trait |
+| [KV Cache](./kv-cache.md) | f32, Q8_0 and paged caches, KvStore trait |
 | [Sampling](./sampling.md) | Temperature, top-k/p, min-p, repetition penalty |
 | [Session API & Snapshots](./session-api.md) | `Model`/`Session`, snapshot export/import, deterministic resume |
 | [SIMD](./simd.md) | AVX2/FMA kernels, dispatch, unsafe discipline |

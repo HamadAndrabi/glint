@@ -55,6 +55,15 @@ pub enum GlintError {
         expected: usize,
         found: usize,
     },
+    // ── KV-cache errors ───────────────────────────────────────────────────────
+    /// A paged KV-cache could not get the pages it asked for — the shared pool
+    /// is full. Recoverable: the caller decides whether to queue the sequence,
+    /// evict another one, or reject the request.
+    KvPagePoolExhausted {
+        needed: usize,
+        available: usize,
+        capacity: usize,
+    },
 }
 
 impl fmt::Display for GlintError {
@@ -135,6 +144,16 @@ impl fmt::Display for GlintError {
                 write!(
                     f,
                     "snapshot cache layer {layer}: expected {expected} bytes, found {found}"
+                )
+            }
+            Self::KvPagePoolExhausted {
+                needed,
+                available,
+                capacity,
+            } => {
+                write!(
+                    f,
+                    "KV page pool exhausted: needed {needed} page(s), {available} of {capacity} free"
                 )
             }
         }
