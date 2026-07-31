@@ -310,7 +310,11 @@ impl QuantizedTensor {
                 GgmlType::Q5K => gpu.matvec_q5_k(buf_name, vec, self.rows as u32, self.cols as u32),
                 GgmlType::Q6K => gpu.matvec_q6_k(buf_name, vec, self.rows as u32, self.cols as u32),
                 GgmlType::F32 => gpu.matvec_f32(buf_name, vec, self.rows as u32, self.cols as u32),
-                // Remaining formats fall through to CPU
+                // Deliberate CPU fallback — there is no shader in
+                // `src/backend/shaders/` for Q4_1, Q5_0, Q5_1, Q2_K, Q3_K or
+                // IQ4_NL, nor for the non-quantized F16/BF16 weights. Every one
+                // of those is handled by `matvec`, so falling back is correct,
+                // just slower. Adding a shader means adding an arm above.
                 _ => return self.matvec(vec),
             };
             match result {
