@@ -36,16 +36,23 @@ All five original phases have shipped to varying degrees:
 
 ## Near-Term: Planned Work
 
-### PagedAttention
+### PagedAttention — shipped ✅
 
-The core innovation from [vLLM (Kwon et al.)](https://arxiv.org/abs/2309.05657). Instead of pre-allocating a contiguous KV cache for each request, use virtual memory-style paging:
+The core innovation from [vLLM (Kwon et al.)](https://arxiv.org/abs/2309.05657): instead of pre-allocating a contiguous KV cache for each request, use virtual memory-style paging. `PagedKvCache` and `PagePool` (`src/cache/paged.rs`) implement it:
 
-- KV cache divided into fixed-size **pages** (e.g., 16 tokens per page)
-- Pages allocated on demand and freed when sequences complete
-- Sequences can share pages for common prefixes (e.g., system prompts)
-- Eliminates memory fragmentation from variable-length sequences
+- KV divided into fixed-size **pages** of 16 tokens, one page per layer
+- Pages allocated on demand from a shared pool and returned when sequences finish
+- Pages are reference-counted, so sequences can share a common prefix
+  (`fork_from`), with copy-on-write the moment either side writes a shared page
+- Pool exhaustion is a recoverable error, not a panic: the engine ends that one
+  sequence and keeps serving
 
-**Why it matters:** Current `KvCache` pre-allocates `max_seq_len` slots per request. With 100 concurrent requests and 4096 context, that's 100 × full KV-cache allocations even if most requests are short. PagedAttention reduces peak memory usage significantly.
+Opt in with `glint serve --kv-cache paged`, or `EngineLimits::kv_pool_pages` /
+`SessionOptions::page_pool` in library code. The default is still the
+pre-allocated `KvCache`. See [KV Cache](./kv-cache.md) for the design.
+
+**Still open:** using page sharing for [prefix caching](#prefix-caching), and
+paged storage for the Q8 cache format.
 
 ### SafeTensors Format Support
 
@@ -84,7 +91,7 @@ Architecture question: shared memory-mapped weight files, or separate process-pe
 
 Reuse KV-cache across requests that share a common prefix (e.g., a long system prompt). If 1000 users all send a 2048-token system prompt, the KV-cache for those tokens could be computed once and shared.
 
-Requires the PagedAttention infrastructure (shared pages) to implement efficiently.
+The PagedAttention infrastructure this needs has shipped: `PagedKvCache::fork_from(upto_position)` hands a new sequence the pages of a prefix another sequence already computed, and copy-on-write keeps the two from corrupting each other. What is missing is the bookkeeping above it — matching an incoming prompt against cached prefixes, and deciding what to keep.
 
 ### Quantized Training / QLoRA
 
@@ -160,7 +167,6 @@ If you're looking for a well-scoped contribution:
 | Intermediate | Add SafeTensors loading |
 | Intermediate | Implement prefix caching for the HTTP server |
 | Intermediate | Add Python streaming callback (generator-based) |
-| Advanced | PagedAttention KV cache manager |
 | Advanced | Continuous batching (multiple sequences per forward pass) |
 | Advanced | MoE routing in `forward.rs` |
 
