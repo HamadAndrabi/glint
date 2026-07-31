@@ -53,7 +53,8 @@ jobs:
       - name: Clippy (library, C FFI feature)
         run: cargo clippy --lib --features cffi -- -D warnings
 
-  # Build the fuzz targets (GGUF parser + snapshot importer) so they cannot rot.
+  # Build the fuzz targets (GGUF parser, snapshot importer, SafeTensors parser)
+  # so they cannot rot.
   # A short smoke run on each catches crashes without gating the pipeline on a
   # long fuzzing budget.
   fuzz-smoke:
@@ -86,6 +87,9 @@ jobs:
       - name: Smoke-run snapshot_import
         run: |
           cargo fuzz run --target "$FUZZ_TARGET" snapshot_import -- -runs=20000 -max_total_time=60
+      - name: Smoke-run safetensors_parse
+        run: |
+          cargo fuzz run --target "$FUZZ_TARGET" safetensors_parse -- -runs=20000 -max_total_time=60
 
   # Run the unsafe-heavy, pure-compute modules under Miri to catch undefined
   # behaviour (out-of-bounds reads, invalid transmutes) that tests running on
