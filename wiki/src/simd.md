@@ -81,6 +81,8 @@ let hi = _mm256_sub_epi8(hi, _mm256_set1_epi8(8));
 
 After unpacking, the computation is similar to Q8_0 but operates on 4-bit quantities extended to 8-bit.
 
+The two nibble planes stay separate: the 16 low nibbles are elements 0–15 and the 16 high nibbles are elements 16–31 (ggml's split-plane layout — see [Quantization](./quantization.md)), so they drop straight into the low and high 128-bit halves of the `__m256i` with no per-byte interleave.
+
 ---
 
 ## K-Quant SIMD

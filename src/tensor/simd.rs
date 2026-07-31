@@ -157,6 +157,13 @@ unsafe fn dot_row_q8_0(data: &[u8], row_start: usize, n_blocks: usize, vec: &[f3
 }
 
 /// Compute the dot product of one Q4_0 row against the input vector.
+///
+/// The nibbles are split-plane (see
+/// [`super::dequantize::unpack_q4_0_block`]): the low nibbles of the 16
+/// packed bytes are elements 0..16 and the high nibbles are elements 16..32.
+/// That maps straight onto the two 128-bit halves of the `__m256i` that
+/// `accum_block_q8` consumes (byte `k` ↔ element `k`), so no per-byte
+/// interleave is needed.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn dot_row_q4_0(data: &[u8], row_start: usize, n_blocks: usize, vec: &[f32]) -> f32 {
@@ -172,12 +179,12 @@ unsafe fn dot_row_q4_0(data: &[u8], row_start: usize, n_blocks: usize, vec: &[f3
         let scale = f16::from_le_bytes([block[0], block[1]]).to_f32();
 
         let packed = _mm_loadu_si128(block[2..].as_ptr() as *const __m128i);
-        let lo_nib = _mm_and_si128(packed, low_mask);
-        let hi_nib = _mm_and_si128(_mm_srli_epi16(packed, 4), low_mask);
-        let interleaved_lo = _mm_unpacklo_epi8(lo_nib, hi_nib);
-        let interleaved_hi = _mm_unpackhi_epi8(lo_nib, hi_nib);
-        let values_u8 =
-            _mm256_inserti128_si256::<1>(_mm256_castsi128_si256(interleaved_lo), interleaved_hi);
+        // `_mm_srli_epi16` shifts 16-bit lanes, so a byte's high nibble lands
+        // in the low nibble of the same byte position; the mask drops the bits
+        // that bled in from the neighbouring byte.
+        let lo_nib = _mm_and_si128(packed, low_mask); // elements 0..16
+        let hi_nib = _mm_and_si128(_mm_srli_epi16(packed, 4), low_mask); // elements 16..32
+        let values_u8 = _mm256_inserti128_si256::<1>(_mm256_castsi128_si256(lo_nib), hi_nib);
         let centered = _mm256_sub_epi8(values_u8, offset_8);
 
         acc = accum_block_q8(centered, vec.as_ptr().add(b * BLOCK_ELEMS), scale, acc);

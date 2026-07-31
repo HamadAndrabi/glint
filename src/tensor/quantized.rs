@@ -428,8 +428,12 @@ pub(crate) fn matvec_q8_0_scalar(data: &[u8], rows: usize, cols: usize, vec: &[f
 ///   [f16 scale (2 bytes)] [16 bytes of packed nibbles, 2 per byte]
 ///
 /// Nibble values are unsigned (0–15), centered by subtracting 8 → [-8, +7].
+/// The nibbles are split-plane, matching the ggml-anchored
+/// [`super::dequantize::unpack_q4_0_block`]: the low nibble of byte `j` is
+/// element `j` and its high nibble is element `j + 16`, not `2j`/`2j+1`.
 pub(crate) fn matvec_q4_0_scalar(data: &[u8], rows: usize, cols: usize, vec: &[f32]) -> Vec<f32> {
     const BLOCK_ELEMS: usize = 32;
+    const HALF: usize = BLOCK_ELEMS / 2;
     const BLOCK_BYTES: usize = 18; // 2 (f16 scale) + 16 (packed nibbles)
 
     let n_blocks = cols / BLOCK_ELEMS;
@@ -442,15 +446,13 @@ pub(crate) fn matvec_q4_0_scalar(data: &[u8], rows: usize, cols: usize, vec: &[f
             for b in 0..n_blocks {
                 let block = &data[row_start + b * BLOCK_BYTES..];
                 let scale = f16::from_le_bytes([block[0], block[1]]).to_f32();
+                let x = &vec[b * BLOCK_ELEMS..b * BLOCK_ELEMS + BLOCK_ELEMS];
                 let mut block_sum = 0.0f32;
-                for j in 0..BLOCK_ELEMS {
-                    let byte = block[2 + j / 2];
-                    let nibble = if j % 2 == 0 {
-                        (byte & 0x0F) as i32
-                    } else {
-                        ((byte >> 4) & 0x0F) as i32
-                    };
-                    block_sum += (nibble - 8) as f32 * vec[b * BLOCK_ELEMS + j];
+                for j in 0..HALF {
+                    let byte = block[2 + j];
+                    let lo = (byte & 0x0F) as i32 - 8;
+                    let hi = ((byte >> 4) & 0x0F) as i32 - 8;
+                    block_sum += lo as f32 * x[j] + hi as f32 * x[j + HALF];
                 }
                 sum += block_sum * scale;
             }
@@ -1369,6 +1371,37 @@ mod tests {
             (result[0] - 32.0).abs() < 0.1,
             "IQ4_NL expected 32.0, got {}",
             result[0]
+        );
+    }
+
+    /// Q4_0: verify the scalar kernel matches dequantize-then-dot.
+    ///
+    /// This ties `matvec_q4_0_scalar` to `unpack_q4_0_block`, which is itself
+    /// anchored to ggml by
+    /// `dequantize::ggml_reference_tests::q4_0_matches_ggml_reference`. A
+    /// distinct input per element means a within-block nibble permutation
+    /// (the pre-fix interleaved reading) changes the dot product.
+    #[test]
+    fn test_q4_0_matvec_matches_dequantize() {
+        use crate::model::gguf::GgmlType;
+        use crate::tensor::dequantize::dequantize;
+
+        let mut block = vec![0u8; 18];
+        block[0..2].copy_from_slice(&half::f16::from_f32(0.5).to_le_bytes());
+        for j in 0..16 {
+            block[2 + j] = ((j * 37 + 11) & 0xFF) as u8;
+        }
+
+        let input: Vec<f32> = (0..32).map(|i| 1.0 + i as f32).collect();
+        let deq = dequantize(&block, GgmlType::Q4_0, 32);
+        let expected: f32 = deq.iter().zip(&input).map(|(a, b)| a * b).sum();
+
+        let result = matvec_q4_0_scalar(&block, 1, 32, &input);
+        assert!(
+            (result[0] - expected).abs() < 1e-3,
+            "Q4_0 matvec: got {}, expected {}",
+            result[0],
+            expected
         );
     }
 

@@ -124,13 +124,31 @@ pub(super) fn get_scale_min_q4k(j: usize, scales: &[u8]) -> (u8, u8) {
     }
 }
 
+/// Unpack one Q4_0 block (18 bytes) into 32 f32 values.
+///
+/// Mirrors `dequantize_row_q4_0` in ggml-quants.c exactly: the nibbles are
+/// stored in *split planes* — the low nibbles of bytes 0..16 are elements
+/// 0..16 and the high nibbles are elements 16..32 (NOT interleaved per byte
+/// like a naive reading would suggest), the same convention as
+/// Q5_0/Q5_1/IQ4_NL. Values are unsigned [0..15], centered by subtracting 8
+/// to get the signed range [-8..7], then scaled by `d`.
+///
+/// Anchored externally by `ggml_reference_tests::q4_0_matches_ggml_reference`.
+pub(crate) fn unpack_q4_0_block(b: &[u8], out: &mut [f32; 32]) {
+    let d = f16::from_le_bytes([b[0], b[1]]).to_f32();
+    let qs = &b[2..18];
+    for j in 0..16 {
+        out[j] = ((qs[j] & 0x0F) as i32 - 8) as f32 * d;
+        out[j + 16] = ((qs[j] >> 4) as i32 - 8) as f32 * d;
+    }
+}
+
 /// Q4_0 dequantization.
 ///
 /// Block layout (18 bytes per block of 32 elements):
 ///   [f16 scale] [16 × packed bytes, each containing two 4-bit values]
 ///
-/// The 4-bit values are unsigned [0..15], centered by subtracting 8
-/// to get signed range [-8..7]. Then multiplied by scale.
+/// See [`unpack_q4_0_block`] for the element layout.
 fn dequantize_q4_0(data: &[u8], n_elements: usize) -> Vec<f32> {
     const BLOCK_SIZE: usize = 32;
     const BLOCK_BYTES: usize = 18; // 2 (scale) + 16 (packed nibbles)
@@ -138,26 +156,13 @@ fn dequantize_q4_0(data: &[u8], n_elements: usize) -> Vec<f32> {
     let n_blocks = n_elements.div_ceil(BLOCK_SIZE);
     assert!(data.len() >= n_blocks * BLOCK_BYTES);
 
-    let mut out = Vec::with_capacity(n_elements);
-
+    let mut out = Vec::with_capacity(n_blocks * BLOCK_SIZE);
+    let mut buf = [0.0f32; BLOCK_SIZE];
     for block in 0..n_blocks {
-        let block_data = &data[block * BLOCK_BYTES..];
-        let scale = f16::from_le_bytes([block_data[0], block_data[1]]).to_f32();
-        let quants = &block_data[2..2 + 16];
-        let remaining = (n_elements - block * BLOCK_SIZE).min(BLOCK_SIZE);
-
-        for i in 0..remaining {
-            let byte = quants[i / 2];
-            // Low nibble for even indices, high nibble for odd
-            let nibble = if i % 2 == 0 {
-                (byte & 0x0F) as i32
-            } else {
-                ((byte >> 4) & 0x0F) as i32
-            };
-            // Center: subtract 8 to get signed range [-8, 7]
-            out.push((nibble - 8) as f32 * scale);
-        }
+        unpack_q4_0_block(&data[block * BLOCK_BYTES..], &mut buf);
+        out.extend_from_slice(&buf);
     }
+    out.truncate(n_elements);
     out
 }
 
