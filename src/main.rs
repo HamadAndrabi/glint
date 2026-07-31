@@ -1,4 +1,4 @@
-//! Glint CLI — inspect, run, and serve GGUF models.
+//! Glint CLI — inspect, run, and serve GGUF and SafeTensors models.
 
 use clap::{Parser, Subcommand};
 use std::io::{self, BufRead, Write as IoWrite};
@@ -20,6 +20,7 @@ use glint::model::gguf::GgufModel;
 use glint::model::lora_registry::AdapterRegistry;
 #[cfg(feature = "server")]
 use glint::model::pull::{pull_model, search_huggingface};
+use glint::model::safetensors::{is_safetensors_path, HfModelDir, SafeTensorsModel};
 use glint::model::tokenizer::Tokenizer;
 use glint::sampling::{Sampler, SamplerConfig};
 #[cfg(feature = "server")]
@@ -41,9 +42,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Inspect a GGUF model file.
+    /// Inspect a GGUF or SafeTensors model.
     Inspect {
-        /// Path to the .gguf model file.
+        /// Path to a .gguf file, or a HuggingFace model directory / .safetensors file.
         #[arg(short, long)]
         file: PathBuf,
 
@@ -56,9 +57,9 @@ enum Commands {
         show_tensors: bool,
     },
 
-    /// Generate text from a GGUF model with a text prompt.
+    /// Generate text from a model with a text prompt.
     Run {
-        /// Path to the .gguf model file.
+        /// Path to a .gguf file, or a HuggingFace model directory / .safetensors file.
         #[arg(short, long)]
         file: PathBuf,
 
@@ -109,7 +110,7 @@ enum Commands {
 
     /// Generate tokens from raw token IDs (for debugging).
     Generate {
-        /// Path to the .gguf model file.
+        /// Path to a .gguf file, or a HuggingFace model directory / .safetensors file.
         #[arg(short, long)]
         file: PathBuf,
 
@@ -122,9 +123,9 @@ enum Commands {
         max_tokens: usize,
     },
 
-    /// Interactive multi-turn chat with a GGUF model.
+    /// Interactive multi-turn chat with a model.
     Chat {
-        /// Path to the .gguf model file.
+        /// Path to a .gguf file, or a HuggingFace model directory / .safetensors file.
         #[arg(short, long)]
         file: PathBuf,
 
@@ -168,7 +169,7 @@ enum Commands {
     /// Start the OpenAI-compatible HTTP inference server.
     #[cfg(feature = "server")]
     Serve {
-        /// Path to the .gguf model file.
+        /// Path to a .gguf file, or a HuggingFace model directory / .safetensors file.
         #[arg(short, long)]
         file: PathBuf,
 
@@ -209,7 +210,7 @@ enum Commands {
 
     /// Benchmark inference performance (prefill, decode, concurrency, cache formats).
     Bench {
-        /// Path to the .gguf model file.
+        /// Path to a .gguf file, or a HuggingFace model directory / .safetensors file.
         #[arg(short, long)]
         file: PathBuf,
 
@@ -456,6 +457,10 @@ fn main() {
 }
 
 fn inspect_model(path: &PathBuf, show_metadata: bool, show_tensors: bool) {
+    if is_safetensors_path(path) {
+        return inspect_safetensors(path, show_metadata, show_tensors);
+    }
+
     println!("Loading GGUF file: {}", path.display());
     println!();
 
@@ -548,6 +553,200 @@ fn inspect_model(path: &PathBuf, show_metadata: bool, show_tensors: bool) {
     }
 }
 
+/// `glint inspect` for a HuggingFace SafeTensors checkpoint.
+fn inspect_safetensors(path: &PathBuf, show_metadata: bool, show_tensors: bool) {
+    println!("Loading SafeTensors model: {}", path.display());
+    println!();
+
+    let model = match SafeTensorsModel::open(path) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("Error loading safetensors model: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    println!("═══ Header ═══");
+    println!("Shards:            {}", model.shard_count());
+    println!("Tensor count:      {}", model.tensor_count());
+    println!();
+
+    // config.json sits next to the weights; show it when it is present and
+    // parseable, but a bare `.safetensors` file is still inspectable.
+    let root = if path.is_dir() {
+        path.clone()
+    } else {
+        path.parent().unwrap_or(Path::new(".")).to_path_buf()
+    };
+    match std::fs::read_to_string(root.join("config.json")).map(|t| ModelConfig::from_hf_json(&t)) {
+        Ok(Ok(config)) => {
+            println!("═══ Model Configuration ═══");
+            print!("{config}");
+            println!();
+        }
+        Ok(Err(e)) => println!("config.json could not be mapped: {e}\n"),
+        Err(_) => println!("No config.json next to the weights.\n"),
+    }
+
+    if show_metadata {
+        println!("═══ Metadata ═══");
+        println!("  (safetensors headers carry only the optional __metadata__ map)");
+        println!();
+    }
+
+    if show_tensors {
+        println!("═══ Tensors ({}) ═══", model.tensor_count());
+        for name in model.names() {
+            if let Some(view) = model.get(name) {
+                let shape: Vec<String> = view.shape.iter().map(|d| d.to_string()).collect();
+                println!(
+                    "  {:50} {:>8} [{}]  ({} bytes)",
+                    name,
+                    view.dtype.name(),
+                    shape.join(" × "),
+                    view.nbytes(),
+                );
+            }
+        }
+        println!();
+    }
+
+    println!("═══ Summary ═══");
+    let total_bytes: usize = model
+        .names()
+        .iter()
+        .filter_map(|n| model.get(n))
+        .map(|v| v.nbytes())
+        .sum();
+    let total_params: u64 = model
+        .names()
+        .iter()
+        .filter_map(|n| model.get(n))
+        .map(|v| v.n_elements() as u64)
+        .sum();
+    println!(
+        "Total parameters:  {} ({:.1}M)",
+        format_number(total_params),
+        total_params as f64 / 1_000_000.0,
+    );
+    println!(
+        "Total tensor data: {} ({:.1} MB)",
+        format_bytes(total_bytes as u64),
+        total_bytes as f64 / (1024.0 * 1024.0),
+    );
+}
+
+// ── Model loading ─────────────────────────────────────────────────────────────
+
+/// A loaded model's three pieces, from either source format.
+struct LoadedModel {
+    config: ModelConfig,
+    /// Kept as a `Result` so `glint generate` — which only needs weights — can
+    /// still run against a GGUF file that carries no vocabulary. Commands that
+    /// need text call [`LoadedModel::tokenizer`], which reports the failure.
+    tokenizer: Result<Tokenizer, glint::error::GlintError>,
+    weights: TransformerWeights,
+}
+
+impl LoadedModel {
+    /// Split into `(config, tokenizer, weights)`, exiting if the model has no
+    /// usable tokenizer.
+    fn into_parts(self) -> (ModelConfig, Tokenizer, TransformerWeights) {
+        match self.tokenizer {
+            Ok(t) => (self.config, t, self.weights),
+            Err(e) => {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
+/// Load a model, choosing the loader from the path.
+///
+/// GGUF remains the default; a directory holding `config.json` +
+/// `*.safetensors` (or a `.safetensors` file inside one) goes through the
+/// HuggingFace path instead.
+fn load_model(path: &Path) -> LoadedModel {
+    if is_safetensors_path(path) {
+        load_safetensors_model(path)
+    } else {
+        load_gguf_model(path)
+    }
+}
+
+fn load_gguf_model(path: &Path) -> LoadedModel {
+    let model = match GgufModel::load(path) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("Error loading GGUF file: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let config = match ModelConfig::from_metadata(&model.metadata) {
+        Some(c) => c,
+        None => {
+            eprintln!("Error: could not extract model configuration from GGUF metadata");
+            std::process::exit(1);
+        }
+    };
+
+    eprintln!("Loading tokenizer...");
+    let tokenizer = Tokenizer::from_gguf(&model);
+    if let Ok(t) = &tokenizer {
+        eprintln!("Tokenizer: {} tokens", t.vocab_size());
+    }
+
+    eprintln!("Loading weights...");
+    let weights = match TransformerWeights::load(&model, &config) {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    LoadedModel {
+        config,
+        tokenizer,
+        weights,
+    }
+}
+
+fn load_safetensors_model(path: &Path) -> LoadedModel {
+    eprintln!("Loading HuggingFace model: {}", path.display());
+    let hf = match HfModelDir::open(path) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("Error loading safetensors model: {e}");
+            std::process::exit(1);
+        }
+    };
+    eprintln!(
+        "Tokenizer: {} tokens; weights: {} tensors in {} file(s)",
+        hf.tokenizer.vocab_size(),
+        hf.weights.tensor_count(),
+        hf.weights.shard_count()
+    );
+
+    let weights =
+        match TransformerWeights::from_safetensors(&hf.weights, &hf.config, hf.tie_word_embeddings)
+        {
+            Ok(w) => w,
+            Err(e) => {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        };
+
+    LoadedModel {
+        config: hf.config,
+        tokenizer: Ok(hf.tokenizer),
+        weights,
+    }
+}
+
 /// Initialize GPU backend if requested and the `vulkan` feature is enabled.
 ///
 /// Returns `Some(GpuBackend)` with weights uploaded, or `None` if GPU is not
@@ -599,31 +798,7 @@ fn run_model(
     lora_path: Option<&Path>,
     use_gpu: bool,
 ) {
-    let model = match GgufModel::load(path) {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!("Error loading GGUF file: {e}");
-            std::process::exit(1);
-        }
-    };
-
-    let config = match ModelConfig::from_metadata(&model.metadata) {
-        Some(c) => c,
-        None => {
-            eprintln!("Error: could not extract model configuration from GGUF metadata");
-            std::process::exit(1);
-        }
-    };
-
-    eprintln!("Loading tokenizer...");
-    let tokenizer = match Tokenizer::from_gguf(&model) {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("Error: {e}");
-            std::process::exit(1);
-        }
-    };
-    eprintln!("Tokenizer: {} tokens", tokenizer.vocab_size());
+    let (config, tokenizer, weights) = load_model(path).into_parts();
 
     let prompt_tokens = tokenizer.encode_prompt(prompt);
 
@@ -634,14 +809,6 @@ fn run_model(
         prompt_tokens.len()
     );
 
-    eprintln!("Loading weights...");
-    let weights = match TransformerWeights::load(&model, &config) {
-        Ok(w) => w,
-        Err(e) => {
-            eprintln!("Error: {e}");
-            std::process::exit(1);
-        }
-    };
     let mut weights = if let Some(lp) = lora_path {
         let lora_model = match GgufModel::load(lp) {
             Ok(m) => m,
@@ -674,27 +841,8 @@ fn run_model(
 
     let output = if let Some(draft_path) = draft_path {
         // Speculative decoding path
-        let draft_model = match GgufModel::load(draft_path) {
-            Ok(m) => m,
-            Err(e) => {
-                eprintln!("Error loading draft model: {e}");
-                std::process::exit(1);
-            }
-        };
-        let draft_config = match ModelConfig::from_metadata(&draft_model.metadata) {
-            Some(c) => c,
-            None => {
-                eprintln!("Error: could not extract draft model config");
-                std::process::exit(1);
-            }
-        };
-        let draft_weights = match TransformerWeights::load(&draft_model, &draft_config) {
-            Ok(w) => w,
-            Err(e) => {
-                eprintln!("Error loading draft weights: {e}");
-                std::process::exit(1);
-            }
-        };
+        let draft = load_model(draft_path);
+        let (draft_config, draft_weights) = (draft.config, draft.weights);
         eprintln!("Speculative decoding: lookahead={lookahead}");
         speculative_decode(
             &draft_weights,
@@ -746,21 +894,8 @@ fn run_model(
 }
 
 fn generate_tokens(path: &PathBuf, tokens_str: &str, max_tokens: usize) {
-    let model = match GgufModel::load(path) {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!("Error loading GGUF file: {e}");
-            std::process::exit(1);
-        }
-    };
-
-    let config = match ModelConfig::from_metadata(&model.metadata) {
-        Some(c) => c,
-        None => {
-            eprintln!("Error: could not extract model configuration from GGUF metadata");
-            std::process::exit(1);
-        }
-    };
+    let loaded = load_model(path);
+    let (config, weights) = (loaded.config, loaded.weights);
     println!("Model: {} ({})", config.architecture, path.display());
     println!("{config}");
 
@@ -770,15 +905,6 @@ fn generate_tokens(path: &PathBuf, tokens_str: &str, max_tokens: usize) {
         .collect();
     println!("Prompt tokens: {:?}", prompt_tokens);
     println!();
-
-    eprintln!("Loading weights...");
-    let weights = match TransformerWeights::load(&model, &config) {
-        Ok(w) => w,
-        Err(e) => {
-            eprintln!("Error: {e}");
-            std::process::exit(1);
-        }
-    };
 
     eprintln!("Generating...");
     let output = generate_greedy_cached(&weights, &config, &prompt_tokens, max_tokens, &mut None);
@@ -855,40 +981,7 @@ fn chat_model(
     lora_path: Option<&Path>,
     use_gpu: bool,
 ) {
-    let model = match GgufModel::load(path) {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!("Error loading GGUF file: {e}");
-            std::process::exit(1);
-        }
-    };
-
-    let config = match ModelConfig::from_metadata(&model.metadata) {
-        Some(c) => c,
-        None => {
-            eprintln!("Error: could not extract model configuration from GGUF metadata");
-            std::process::exit(1);
-        }
-    };
-
-    eprintln!("Loading tokenizer...");
-    let tokenizer = match Tokenizer::from_gguf(&model) {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("Error: {e}");
-            std::process::exit(1);
-        }
-    };
-    eprintln!("Tokenizer: {} tokens", tokenizer.vocab_size());
-
-    eprintln!("Loading weights...");
-    let weights = match TransformerWeights::load(&model, &config) {
-        Ok(w) => w,
-        Err(e) => {
-            eprintln!("Error: {e}");
-            std::process::exit(1);
-        }
-    };
+    let (config, tokenizer, weights) = load_model(path).into_parts();
     let mut weights = if let Some(lp) = lora_path {
         let lora_model = match GgufModel::load(lp) {
             Ok(m) => m,
@@ -1045,40 +1138,7 @@ fn chat_model(
 
 #[cfg(feature = "server")]
 async fn serve_model(path: &PathBuf, host: &str, port: u16, use_gpu: bool, kv_cache: &str) {
-    let model = match GgufModel::load(path) {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!("Error loading GGUF file: {e}");
-            std::process::exit(1);
-        }
-    };
-
-    let config = match ModelConfig::from_metadata(&model.metadata) {
-        Some(c) => c,
-        None => {
-            eprintln!("Error: could not extract model configuration from GGUF metadata");
-            std::process::exit(1);
-        }
-    };
-
-    eprintln!("Loading tokenizer...");
-    let tokenizer = match Tokenizer::from_gguf(&model) {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("Error: {e}");
-            std::process::exit(1);
-        }
-    };
-    eprintln!("Tokenizer: {} tokens", tokenizer.vocab_size());
-
-    eprintln!("Loading weights...");
-    let weights = match TransformerWeights::load(&model, &config) {
-        Ok(w) => w,
-        Err(e) => {
-            eprintln!("Error: {e}");
-            std::process::exit(1);
-        }
-    };
+    let (config, tokenizer, weights) = load_model(path).into_parts();
     eprintln!("Weights loaded.");
 
     let mut weights = weights; // make mutable for GPU upload

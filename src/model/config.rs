@@ -1,8 +1,10 @@
-//! Model hyperparameters extracted from GGUF metadata.
+//! Model hyperparameters extracted from GGUF metadata or a HuggingFace
+//! `config.json`.
 
 use std::collections::HashMap;
 
 use super::gguf::MetadataValue;
+use crate::error::GlintError;
 
 /// Model hyperparameters extracted from GGUF metadata.
 #[derive(Debug, Clone)]
@@ -98,6 +100,202 @@ impl ModelConfig {
     pub fn head_dim(&self) -> u32 {
         self.embedding_length / self.head_count
     }
+
+    /// Map a HuggingFace `config.json` onto a [`ModelConfig`].
+    ///
+    /// Shorthand for [`HfConfig::from_json`] when the HF-only fields
+    /// (`tie_word_embeddings`, BOS/EOS ids) are not needed.
+    pub fn from_hf_json(text: &str) -> Result<Self, GlintError> {
+        Ok(HfConfig::from_json(text)?.config)
+    }
+}
+
+// ── HuggingFace config.json ──────────────────────────────────────────────────
+
+/// Model families whose HF `config.json` maps cleanly onto Glint's LLaMA-style
+/// forward pass (RMSNorm + SwiGLU MLP + RoPE + optional GQA).
+///
+/// Anything outside this list is rejected rather than silently mis-run: a
+/// `gemma`/`gpt2`/`mixtral` checkpoint would load tensor-by-tensor but produce
+/// nonsense, which is much worse than a clear error.
+const SUPPORTED_HF_ARCHITECTURES: &[&str] = &["llama", "mistral", "phi3", "qwen2"];
+
+/// A parsed HuggingFace `config.json`.
+///
+/// Everything Glint's forward pass needs lands in [`ModelConfig`]; the few
+/// fields that only matter at load time (weight tying) or that belong to the
+/// tokenizer (BOS/EOS ids) are kept alongside it.
+#[derive(Debug, Clone)]
+pub struct HfConfig {
+    pub config: ModelConfig,
+    /// `tie_word_embeddings` — when true the LM head reuses the embedding table.
+    pub tie_word_embeddings: bool,
+    pub bos_token_id: Option<u32>,
+    pub eos_token_id: Option<u32>,
+}
+
+impl HfConfig {
+    /// Parse a HuggingFace `config.json` (LlamaConfig-style keys).
+    ///
+    /// Required: `hidden_size`, `num_hidden_layers`, `num_attention_heads`,
+    /// `vocab_size`, `max_position_embeddings`, and an architecture
+    /// (`model_type`, or the first entry of `architectures`).
+    /// Everything else falls back to the HF default for that field.
+    pub fn from_json(text: &str) -> Result<Self, GlintError> {
+        let value: serde_json::Value =
+            serde_json::from_str(text).map_err(|e| GlintError::HfInvalidJson {
+                file: "config.json".to_string(),
+                detail: e.to_string(),
+            })?;
+        let obj = value.as_object().ok_or_else(|| GlintError::HfInvalidJson {
+            file: "config.json".to_string(),
+            detail: "top level value is not a JSON object".to_string(),
+        })?;
+
+        let get_u32 = |key: &str| -> Option<u32> {
+            obj.get(key)
+                .and_then(|v| v.as_u64())
+                .and_then(|n| u32::try_from(n).ok())
+        };
+        let get_f32 =
+            |key: &str| -> Option<f32> { obj.get(key).and_then(|v| v.as_f64()).map(|f| f as f32) };
+        let req_u32 = |key: &'static str| -> Result<u32, GlintError> {
+            get_u32(key).ok_or(GlintError::HfMissingConfigField(key))
+        };
+
+        // `model_type` is the canonical family name ("llama"); fall back to the
+        // first `architectures` entry ("LlamaForCausalLM" → "llama") for the
+        // handful of configs that omit it.
+        let architecture = obj
+            .get("model_type")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_ascii_lowercase())
+            .or_else(|| {
+                obj.get("architectures")
+                    .and_then(|v| v.as_array())
+                    .and_then(|a| a.first())
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.trim_end_matches("ForCausalLM").to_ascii_lowercase())
+            })
+            .ok_or(GlintError::HfMissingConfigField("model_type"))?;
+
+        if !SUPPORTED_HF_ARCHITECTURES.contains(&architecture.as_str()) {
+            return Err(GlintError::HfUnsupported(format!(
+                "model_type '{architecture}' — Glint's safetensors loader handles \
+                 LLaMA-style models ({}); convert to GGUF for anything else",
+                SUPPORTED_HF_ARCHITECTURES.join(", ")
+            )));
+        }
+
+        let embedding_length = req_u32("hidden_size")?;
+        let block_count = req_u32("num_hidden_layers")?;
+        let head_count = req_u32("num_attention_heads")?;
+        let vocab_size = req_u32("vocab_size")?;
+        let context_length = req_u32("max_position_embeddings")?;
+        let head_count_kv = get_u32("num_key_value_heads").unwrap_or(head_count);
+
+        if head_count == 0 || head_count_kv == 0 {
+            return Err(GlintError::HfUnsupported(
+                "num_attention_heads / num_key_value_heads must be non-zero".to_string(),
+            ));
+        }
+        if embedding_length % head_count != 0 {
+            return Err(GlintError::HfUnsupported(format!(
+                "hidden_size {embedding_length} is not divisible by \
+                 num_attention_heads {head_count}"
+            )));
+        }
+        if head_count % head_count_kv != 0 {
+            return Err(GlintError::HfUnsupported(format!(
+                "num_attention_heads {head_count} is not a multiple of \
+                 num_key_value_heads {head_count_kv}"
+            )));
+        }
+        // Glint derives head_dim as hidden_size / n_heads (see
+        // `ModelConfig::head_dim`). Newer configs may state it explicitly and
+        // decouple it from that ratio — which the forward pass cannot express.
+        if let Some(head_dim) = get_u32("head_dim") {
+            if head_dim != embedding_length / head_count {
+                return Err(GlintError::HfUnsupported(format!(
+                    "explicit head_dim {head_dim} != hidden_size / num_attention_heads \
+                     ({})",
+                    embedding_length / head_count
+                )));
+            }
+        }
+
+        // Qwen2 sets `use_sliding_window: false` while still carrying a
+        // `sliding_window` value — honour the switch.
+        let sliding_window = match obj.get("use_sliding_window").and_then(|v| v.as_bool()) {
+            Some(false) => None,
+            _ => get_u32("sliding_window").filter(|&w| w > 0),
+        };
+
+        // Only linear RoPE scaling is implemented (`ops::rope` divides the
+        // position by a constant). `llama3`/`dynamic`/`yarn` schedules would
+        // need their own frequency tables, so they are refused rather than
+        // approximated.
+        let rope_scaling_factor = match obj.get("rope_scaling") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(scaling) => {
+                let kind = scaling
+                    .get("rope_type")
+                    .or_else(|| scaling.get("type"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("linear");
+                let factor = scaling.get("factor").and_then(|v| v.as_f64());
+                match (kind, factor) {
+                    ("linear", Some(f)) => Some(f as f32),
+                    ("default", _) => None,
+                    _ => {
+                        return Err(GlintError::HfUnsupported(format!(
+                            "rope_scaling type '{kind}' — only linear scaling is implemented"
+                        )))
+                    }
+                }
+            }
+        };
+
+        let config = ModelConfig {
+            architecture,
+            context_length,
+            embedding_length,
+            block_count,
+            head_count,
+            head_count_kv,
+            vocab_size,
+            feed_forward_length: get_u32("intermediate_size"),
+            // HF's LlamaConfig default; GGUF's loader uses the same fallback.
+            rms_norm_eps: get_f32("rms_norm_eps").unwrap_or(1e-5),
+            rope_freq_base: get_f32("rope_theta"),
+            // `config.json` has no chat template — it lives in
+            // `tokenizer_config.json` and is filled in by the directory loader.
+            chat_template: None,
+            sliding_window,
+            rope_scaling_factor,
+            partial_rotary_factor: get_f32("partial_rotary_factor"),
+        };
+
+        // `eos_token_id` is a list on some LLaMA-3 derivatives (EOS + EOT);
+        // the first entry is the one generation should stop on.
+        let eos_token_id = get_u32("eos_token_id").or_else(|| {
+            obj.get("eos_token_id")
+                .and_then(|v| v.as_array())
+                .and_then(|a| a.first())
+                .and_then(|v| v.as_u64())
+                .and_then(|n| u32::try_from(n).ok())
+        });
+
+        Ok(Self {
+            config,
+            tie_word_embeddings: obj
+                .get("tie_word_embeddings")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            bos_token_id: get_u32("bos_token_id"),
+            eos_token_id,
+        })
+    }
 }
 
 impl std::fmt::Display for ModelConfig {
@@ -124,5 +322,185 @@ impl std::fmt::Display for ModelConfig {
             writeln!(f, "RoPE scale factor:  {sf}")?;
         }
         Ok(())
+    }
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A minimal but realistic LLaMA-family `config.json`.
+    fn llama_config_json() -> &'static str {
+        r#"{
+            "architectures": ["LlamaForCausalLM"],
+            "model_type": "llama",
+            "hidden_size": 576,
+            "num_hidden_layers": 30,
+            "num_attention_heads": 9,
+            "num_key_value_heads": 3,
+            "intermediate_size": 1536,
+            "max_position_embeddings": 8192,
+            "rms_norm_eps": 1e-05,
+            "rope_theta": 100000.0,
+            "vocab_size": 49152,
+            "tie_word_embeddings": true,
+            "bos_token_id": 1,
+            "eos_token_id": 2
+        }"#
+    }
+
+    #[test]
+    fn test_hf_config_maps_every_model_config_field() {
+        let hf = HfConfig::from_json(llama_config_json()).unwrap();
+        let c = &hf.config;
+        assert_eq!(c.architecture, "llama");
+        assert_eq!(c.context_length, 8192);
+        assert_eq!(c.embedding_length, 576);
+        assert_eq!(c.block_count, 30);
+        assert_eq!(c.head_count, 9);
+        assert_eq!(c.head_count_kv, 3);
+        assert_eq!(c.vocab_size, 49152);
+        assert_eq!(c.feed_forward_length, Some(1536));
+        assert!((c.rms_norm_eps - 1e-5).abs() < 1e-12);
+        assert_eq!(c.rope_freq_base, Some(100000.0));
+        assert_eq!(c.chat_template, None);
+        assert_eq!(c.sliding_window, None);
+        assert_eq!(c.rope_scaling_factor, None);
+        assert_eq!(c.partial_rotary_factor, None);
+        assert_eq!(c.head_dim(), 64);
+
+        assert!(hf.tie_word_embeddings);
+        assert_eq!(hf.bos_token_id, Some(1));
+        assert_eq!(hf.eos_token_id, Some(2));
+    }
+
+    #[test]
+    fn test_hf_config_defaults_optional_fields() {
+        let json = r#"{
+            "model_type": "llama",
+            "hidden_size": 8,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 2,
+            "vocab_size": 16,
+            "max_position_embeddings": 32
+        }"#;
+        let hf = HfConfig::from_json(json).unwrap();
+        // num_key_value_heads defaults to num_attention_heads (no GQA).
+        assert_eq!(hf.config.head_count_kv, 2);
+        assert_eq!(hf.config.feed_forward_length, None);
+        assert!((hf.config.rms_norm_eps - 1e-5).abs() < 1e-12);
+        assert_eq!(hf.config.rope_freq_base, None);
+        assert!(!hf.tie_word_embeddings);
+        assert_eq!(hf.eos_token_id, None);
+    }
+
+    #[test]
+    fn test_hf_config_missing_required_field_is_named() {
+        let json = r#"{"model_type": "llama", "hidden_size": 8}"#;
+        let err = HfConfig::from_json(json).unwrap_err();
+        assert!(
+            err.to_string().contains("num_hidden_layers"),
+            "error should name the missing field, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_hf_config_rejects_non_llama_architecture() {
+        let json = r#"{
+            "model_type": "gemma2",
+            "hidden_size": 8,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 2,
+            "vocab_size": 16,
+            "max_position_embeddings": 32
+        }"#;
+        let err = HfConfig::from_json(json).unwrap_err();
+        assert!(err.to_string().contains("gemma2"), "got: {err}");
+    }
+
+    #[test]
+    fn test_hf_config_architecture_falls_back_to_architectures_list() {
+        let json = r#"{
+            "architectures": ["MistralForCausalLM"],
+            "hidden_size": 8,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 2,
+            "vocab_size": 16,
+            "max_position_embeddings": 32
+        }"#;
+        assert_eq!(
+            HfConfig::from_json(json).unwrap().config.architecture,
+            "mistral"
+        );
+    }
+
+    #[test]
+    fn test_hf_config_rejects_indivisible_hidden_size() {
+        let json = r#"{
+            "model_type": "llama",
+            "hidden_size": 9,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 2,
+            "vocab_size": 16,
+            "max_position_embeddings": 32
+        }"#;
+        assert!(HfConfig::from_json(json).is_err());
+    }
+
+    #[test]
+    fn test_hf_config_linear_rope_scaling_and_sliding_window() {
+        let json = r#"{
+            "model_type": "mistral",
+            "hidden_size": 8,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 2,
+            "vocab_size": 16,
+            "max_position_embeddings": 32,
+            "sliding_window": 4096,
+            "rope_scaling": {"type": "linear", "factor": 4.0}
+        }"#;
+        let c = HfConfig::from_json(json).unwrap().config;
+        assert_eq!(c.sliding_window, Some(4096));
+        assert_eq!(c.rope_scaling_factor, Some(4.0));
+    }
+
+    #[test]
+    fn test_hf_config_rejects_unimplemented_rope_scaling() {
+        let json = r#"{
+            "model_type": "llama",
+            "hidden_size": 8,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 2,
+            "vocab_size": 16,
+            "max_position_embeddings": 32,
+            "rope_scaling": {"rope_type": "llama3", "factor": 8.0}
+        }"#;
+        let err = HfConfig::from_json(json).unwrap_err();
+        assert!(err.to_string().contains("llama3"), "got: {err}");
+    }
+
+    #[test]
+    fn test_hf_config_eos_token_id_list_takes_first() {
+        let json = r#"{
+            "model_type": "llama",
+            "hidden_size": 8,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 2,
+            "vocab_size": 16,
+            "max_position_embeddings": 32,
+            "eos_token_id": [128001, 128009]
+        }"#;
+        assert_eq!(
+            HfConfig::from_json(json).unwrap().eos_token_id,
+            Some(128001)
+        );
+    }
+
+    #[test]
+    fn test_hf_config_rejects_garbage_json() {
+        assert!(HfConfig::from_json("not json").is_err());
+        assert!(HfConfig::from_json("[1, 2, 3]").is_err());
     }
 }
