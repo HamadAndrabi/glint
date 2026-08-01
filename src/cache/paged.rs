@@ -634,6 +634,26 @@ mod tests {
 
     // ── Equivalence with the contiguous f32 cache ────────────────────────
 
+    /// Bitwise equality on real hardware. Under Miri, transcendental
+    /// functions (the `exp` in flash attention's online softmax) are
+    /// deliberately non-deterministic between calls, so two runs of the same
+    /// computation drift by a few ULP there — same as the RoPE sin/cos case
+    /// in `ops::tests::test_rope_scaling_factor`. A tight tolerance still
+    /// fails loudly for a real paging bug (a wrong row or page moves the
+    /// output by whole units, not 1e-5).
+    fn assert_flash_eq(want: &[f32], got: &[f32], ctx: &str) {
+        for (d, (w, g)) in want.iter().zip(got).enumerate() {
+            if cfg!(miri) {
+                assert!(
+                    (w - g).abs() <= 1e-4 * w.abs().max(1.0),
+                    "{ctx} dim {d}: {w} vs {g}"
+                );
+            } else {
+                assert_eq!(w.to_bits(), g.to_bits(), "{ctx} dim {d}: {w} vs {g}");
+            }
+        }
+    }
+
     /// The paged cache must be indistinguishable from `KvCache` through the
     /// flash-attention path — same f32 values, same order, so bit-identical.
     #[test]
@@ -657,15 +677,7 @@ mod tests {
                 flash_attn_1d(
                     &q, &paged, layer, kv_h, 0, seq_len, HEAD_DIM, scale, &mut got,
                 );
-                for d in 0..HEAD_DIM {
-                    assert_eq!(
-                        want[d].to_bits(),
-                        got[d].to_bits(),
-                        "layer {layer} head {kv_h} dim {d}: {} vs {}",
-                        want[d],
-                        got[d]
-                    );
-                }
+                assert_flash_eq(&want, &got, &format!("layer {layer} head {kv_h}"));
             }
         }
     }
@@ -691,7 +703,7 @@ mod tests {
         let mut got = vec![0.0f32; HEAD_DIM];
         flash_attn_1d(&q, &plain, 0, 1, start, span, HEAD_DIM, scale, &mut want);
         flash_attn_1d(&q, &paged, 0, 1, start, span, HEAD_DIM, scale, &mut got);
-        assert_eq!(want, got);
+        assert_flash_eq(&want, &got, "windowed read");
     }
 
     #[test]
