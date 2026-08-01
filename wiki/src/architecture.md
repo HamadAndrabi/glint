@@ -83,6 +83,7 @@ GgufModel { metadata, tensor_infos, mmap }
 | `src/tensor/dequantize.rs` | Reference dequantization for all 8 formats |
 | `src/tensor/simd.rs` | AVX2 + FMA matvec kernels (x86_64 + rayon only) |
 | `src/cache/mod.rs` | `KvCache` (f32), `KvCacheQ8` (Q8_0), `KvStore` trait |
+| `src/cache/paged.rs` | `PagedKvCache` + `PagePool`: PagedAttention-style 16-token pages with refcounted sharing |
 | `src/api/mod.rs` | Library-facing `Model` / `GenerationOptions` / `Session` workflow |
 | `src/session/mod.rs` | `Session`, `CacheFormat`, prompt/generation state |
 | `src/session/snapshot.rs` | KV snapshot serialization, validation, restore helpers |
@@ -112,6 +113,8 @@ GgufModel { metadata, tensor_infos, mmap }
 | `LayerWeights` | `transformer/weights.rs` | Per-layer attention and FFN weights |
 | `KvCache` | `cache/mod.rs` | f32 key-value cache |
 | `KvCacheQ8` | `cache/mod.rs` | Q8_0-compressed KV cache (~3.8× smaller than f32) |
+| `PagedKvCache` | `cache/paged.rs` | f32 KV in pooled 16-token pages, shareable across sequences |
+| `PagePool` | `cache/paged.rs` | Shared, capacity-bounded page allocator (free list + refcounts) |
 | `KvStore` | `cache/mod.rs` | Trait abstracting over cache formats |
 | `Session` | `session/mod.rs` | All mutable state for one in-flight generation |
 | `KvSnapshot` | `session/snapshot.rs` | Serialized session/cache state for deterministic resume |
@@ -141,9 +144,15 @@ tokio async threads          OS thread (blocking)
 ─────────────────          ─────────────────────
 route handler              InferenceEngine::run_loop()
   │                            │
-  │ engine.submit(tokens) ──▶  │ forward_one() per token
-  │                            │
+  │ engine.submit(tokens) ──▶  │ forward_batch() — one pass per step,
+  │                            │   covering every active sequence
   │ ◀── mpsc::Receiver ──────  │ sender.send(token_id)
   │
   └─▶ SSE stream to client
 ```
+
+Active sequences are decoded together rather than one at a time: each step runs
+a single batched forward pass, so the model's weights are streamed from memory
+once per step instead of once per sequence. Sequences join and leave the batch
+as requests are admitted and complete — see
+[Continuous batching](./server-api.md#continuous-batching).

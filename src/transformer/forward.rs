@@ -5,7 +5,7 @@ use rayon::prelude::*;
 
 use super::weights::{LayerWeights, TransformerWeights};
 use crate::backend::GpuBackend;
-use crate::cache::{KvCache, KvCacheQ8, KvStore};
+use crate::cache::{KvCache, KvCacheQ8, KvStore, PagePool, PagedKvCache};
 use crate::model::config::ModelConfig;
 use crate::model::lora::{LoraLayerAdapters, LoraWeights};
 use crate::sampling::Sampler;
@@ -163,6 +163,45 @@ fn attention(
 
     let attn_vec = Tensor::from_vec(attn_output, &[embed_dim]);
     layer.attn_output.matvec(attn_vec.data())
+}
+
+/// CPU multi-head flash attention for the single query at `pos`.
+///
+/// Shared by the single-sequence decode ([`attention_cached`]) and the batched
+/// decode step ([`forward_batch`]): a sequence must walk its KV cache exactly
+/// the same way whether or not it shares the step with other sequences, so
+/// there is one loop rather than two that have to be kept in agreement.
+///
+/// `out` is `n_heads * head_dim` long and must be pre-zeroed —
+/// [`tensor::flash_attn_1d`] accumulates into it.
+fn attn_heads_cpu(
+    q_all: &[f32],
+    cache: &dyn KvStore,
+    layer_idx: usize,
+    window_start: usize,
+    attend_len: usize,
+    n_heads: usize,
+    kv_group_size: usize,
+    head_dim: usize,
+    scale: f32,
+    out: &mut [f32],
+) {
+    // Tiled online softmax — O(1) extra memory per head.
+    for h in 0..n_heads {
+        let kv_h = h / kv_group_size;
+        let q_offset = h * head_dim;
+        tensor::flash_attn_1d(
+            &q_all[q_offset..q_offset + head_dim],
+            cache,
+            layer_idx,
+            kv_h,
+            window_start,
+            attend_len,
+            head_dim,
+            scale,
+            &mut out[q_offset..q_offset + head_dim],
+        );
+    }
 }
 
 /// SwiGLU feed-forward: `down(silu(gate(x)) * up(x))`.
@@ -509,22 +548,18 @@ fn attention_cached(
     let attn_vec = if let Some(t) = gpu_attn {
         t
     } else {
-        // CPU flash attention (tiled online softmax, O(1) extra memory per head)
-        for h in 0..n_heads {
-            let kv_h = h / kv_group_size;
-            let q_offset = h * head_dim;
-            tensor::flash_attn_1d(
-                &q_all.data()[q_offset..q_offset + head_dim],
-                cache_ro,
-                layer_idx,
-                kv_h,
-                window_start,
-                attend_len,
-                head_dim,
-                scale,
-                &mut attn_output[q_offset..q_offset + head_dim],
-            );
-        }
+        attn_heads_cpu(
+            q_all.data(),
+            cache_ro,
+            layer_idx,
+            window_start,
+            attend_len,
+            n_heads,
+            kv_group_size,
+            head_dim,
+            scale,
+            &mut attn_output,
+        );
         Tensor::from_vec(attn_output, &[embed_dim])
     };
     let mut out = matvec_maybe_gpu(&layer.attn_output, attn_vec.data(), reborrow(gpu));
@@ -972,6 +1007,45 @@ pub fn generate_cached_q8(
     )
 }
 
+/// Sampler-based generation with a paged f32 KV-cache.
+///
+/// Drop-in replacement for [`generate_cached`] with bit-identical output: the
+/// cache holds the same f32 rows, just in [`PAGE_SIZE`]-token pages taken from
+/// a private pool as the sequence grows, instead of one `context_length`
+/// allocation made up front.
+///
+/// Server-side callers should build one [`PagePool`] shared by every sequence
+/// (see `EngineLimits::kv_pool_pages`) — that is where paging pays off.
+pub fn generate_cached_paged(
+    weights: &TransformerWeights,
+    config: &ModelConfig,
+    prompt_tokens: &[u32],
+    max_new_tokens: usize,
+    sampler: &mut Sampler,
+    eos_token: u32,
+    gpu: &mut Option<&mut GpuBackend>,
+) -> Vec<u32> {
+    let n_layers = config.block_count as usize;
+    // Private pool sized for this one sequence's worst case, so page
+    // allocation can never fail part-way through the generation.
+    let pool = PagePool::new(
+        PagePool::pages_for(config.context_length as usize, n_layers),
+        config.head_count_kv as usize,
+        config.head_dim() as usize,
+    );
+    let mut cache = PagedKvCache::new(&pool, n_layers);
+    generate_with_cache(
+        weights,
+        config,
+        prompt_tokens,
+        max_new_tokens,
+        sampler,
+        eos_token,
+        &mut cache,
+        gpu,
+    )
+}
+
 fn generate_with_cache(
     weights: &TransformerWeights,
     config: &ModelConfig,
@@ -1030,24 +1104,74 @@ pub fn generate_streaming(
     tokens
 }
 
-// ── Batched decode (multi-sequence) ──────────────────────────────────────────
+// ── Batched decode (continuous batching) ─────────────────────────────────────
 
-/// Decode one step for multiple sequences simultaneously.
+/// Interleaved `[rows, B]` kernel output → one owned `Tensor` per sequence.
+///
+/// `scratch` is reused across every matvec of a step, so a decode step
+/// allocates its per-sequence activations and nothing else.
+fn batch_matvec(
+    weight: &QuantizedTensor,
+    inputs: &[&[f32]],
+    scratch: &mut Vec<f32>,
+) -> Vec<Tensor> {
+    let batch = inputs.len();
+    let rows = weight.rows();
+    scratch.clear();
+    scratch.resize(rows * batch, 0.0);
+    weight.matvec_batch_into(inputs, scratch);
+    (0..batch)
+        .map(|s| {
+            let mut column = vec![0.0f32; rows];
+            for (i, o) in column.iter_mut().enumerate() {
+                *o = scratch[i * batch + s];
+            }
+            Tensor::from_vec(column, &[rows])
+        })
+        .collect()
+}
+
+/// Borrow every sequence's activation vector, in batch order.
+fn data_refs(tensors: &[Tensor]) -> Vec<&[f32]> {
+    tensors.iter().map(|t| t.data()).collect()
+}
+
+/// Decode one token for several sequences in a **single** forward pass.
 ///
 /// Each element `i` provides:
-/// - `tokens[i]`    — current token to decode
-/// - `positions[i]` — current decode position (0-based from prompt start)
-/// - `caches[i]`    — exclusive KV cache for sequence `i`
+/// - `tokens[i]`    — the token to decode
+/// - `positions[i]` — its absolute position (0-based from the prompt start)
+/// - `caches[i]`    — its own exclusive KV cache
 ///
-/// Returns one logits [`Tensor`] per sequence.
+/// Returns one logits [`Tensor`] per sequence, in the same order.
 ///
-/// ## Throughput strategy (CPU)
+/// # Why this exists
 ///
-/// The embedding lookup and Q/K/V projections for all N sequences are
-/// dispatched with `rayon::par_iter` when the `rayon` feature is active,
-/// giving N-way parallelism on multi-core hosts.  Attention is per-sequence
-/// (independent caches) and likewise rayon-parallelised.  When GPU is active,
-/// sequences are processed sequentially to avoid conflicting GPU borrows.
+/// Decoding is memory-bound: a step reads every weight matrix once and does
+/// only one multiply-add per weight. Running `B` sequences as `B` separate
+/// `forward_one` calls therefore streams the whole model from RAM `B` times to
+/// do `B` multiply-adds per weight. This function streams it **once** and does
+/// all `B` — the per-layer matvecs go through
+/// [`QuantizedTensor::matvec_batch_into`], which applies each decoded weight
+/// block to every sequence before moving on. That is the throughput multiplier
+/// behind continuous batching in the server engine.
+///
+/// Attention stays per-sequence: each sequence has its own KV cache and its own
+/// position, so there is nothing to share — those are run in parallel across
+/// sequences instead (rayon), and the matvecs keep their usual row-parallelism.
+///
+/// # Batching is invisible
+///
+/// The logits returned here are **bit-identical** to what [`forward_one`] would
+/// produce for the same sequence on its own: the batched kernels preserve each
+/// sequence's accumulation order, and everything outside them (norms, RoPE,
+/// attention, residuals) is per-sequence code shared with the single-sequence
+/// path. A request must never get different tokens because the server happened
+/// to be busy. `forward_batch_matches_forward_one` pins this.
+///
+/// A batch of one, or an active GPU backend (a single device context, so
+/// nothing to interleave), falls through to `forward_one` unchanged — including
+/// its allocation profile.
 pub fn forward_batch(
     weights: &TransformerWeights,
     config: &ModelConfig,
@@ -1056,47 +1180,65 @@ pub fn forward_batch(
     caches: &mut [&mut dyn KvStore],
     gpu: &mut Option<&mut GpuBackend>,
 ) -> Vec<Tensor> {
+    forward_batch_lora(weights, config, tokens, positions, caches, gpu, &[])
+}
+
+/// Like [`forward_batch`] but with a per-sequence LoRA override.
+///
+/// `loras` is either empty (every sequence uses the model's built-in adapter,
+/// if any) or one entry per sequence — sequences carrying *different* adapters
+/// can share a step, since the base weights are what the batch amortises and
+/// each adapter's low-rank update is applied to its own sequence afterwards.
+pub fn forward_batch_lora(
+    weights: &TransformerWeights,
+    config: &ModelConfig,
+    tokens: &[u32],
+    positions: &[usize],
+    caches: &mut [&mut dyn KvStore],
+    gpu: &mut Option<&mut GpuBackend>,
+    loras: &[Option<&LoraWeights>],
+) -> Vec<Tensor> {
     let n_seqs = tokens.len();
+    assert_eq!(
+        positions.len(),
+        n_seqs,
+        "forward_batch: positions/tokens len"
+    );
+    assert_eq!(caches.len(), n_seqs, "forward_batch: caches/tokens len");
+    assert!(
+        loras.is_empty() || loras.len() == n_seqs,
+        "forward_batch: loras must be empty or one per sequence"
+    );
     if n_seqs == 0 {
         return vec![];
     }
+    let lora_for = |s: usize| loras.get(s).copied().flatten();
 
-    // Fast path: single sequence — use the battle-tested forward_one.
-    if n_seqs == 1 {
-        return vec![forward_one(
-            weights,
-            config,
-            tokens[0],
-            positions[0],
-            caches[0],
-            gpu,
-        )];
-    }
-
-    // GPU path: sequential to avoid simultaneous GPU borrows.
-    // CPU path below uses rayon.
-    if gpu.is_some() {
-        return tokens
-            .iter()
-            .zip(positions.iter())
-            .zip(caches.iter_mut())
-            .map(|((&tok, &pos), cache)| forward_one(weights, config, tok, pos, *cache, gpu))
-            .collect();
+    // Nothing to amortise across (B = 1), or a GPU backend that owns a single
+    // context: run the single-sequence path exactly as before.
+    if n_seqs == 1 || gpu.is_some() {
+        let mut logits = Vec::with_capacity(n_seqs);
+        for (s, cache) in caches.iter_mut().enumerate() {
+            logits.push(forward_one_lora(
+                weights,
+                config,
+                tokens[s],
+                positions[s],
+                &mut **cache,
+                gpu,
+                lora_for(s),
+            ));
+        }
+        return logits;
     }
 
     // ── CPU batch path ─────────────────────────────────────────────────────
-
-    // 1. Initial token embeddings for all sequences.
-    let mut hiddens: Vec<Tensor> = tokens
-        .iter()
-        .map(|&t| weights.token_embedding.row_as_f32(t as usize))
-        .collect();
 
     let embed_dim = config.embedding_length as usize;
     let n_heads = config.head_count as usize;
     let n_kv_heads = config.head_count_kv as usize;
     let head_dim = config.head_dim() as usize;
-    let kv_group_sz = n_heads / n_kv_heads;
+    let kv_group_size = n_heads / n_kv_heads;
     let freq_base = config.rope_freq_base.unwrap_or(10000.0);
     let rope_scaling = config.rope_scaling_factor.unwrap_or(1.0);
     let rot_dim = config
@@ -1105,320 +1247,150 @@ pub fn forward_batch(
         .unwrap_or(head_dim);
     let scale = 1.0 / (head_dim as f32).sqrt();
 
+    // Interleaved matvec output, reused by every batched matvec in the step.
+    let mut scratch: Vec<f32> = Vec::new();
+    let mut hidden: Vec<Tensor> = tokens
+        .iter()
+        .map(|&t| weights.token_embedding.row_as_f32(t as usize))
+        .collect();
+
     for (layer_idx, layer) in weights.layers.iter().enumerate() {
-        let lora_layer = weights.lora.as_ref().and_then(|l| l.layers.get(layer_idx));
-
-        // 2a. RMS-norm every hidden state — embarrassingly parallel.
-        #[cfg(feature = "rayon")]
-        let normed: Vec<Tensor> = hiddens
-            .par_iter()
-            .map(|h| tensor::rms_norm(h, &layer.attn_norm, config.rms_norm_eps))
-            .collect();
-        #[cfg(not(feature = "rayon"))]
-        let normed: Vec<Tensor> = hiddens
-            .iter()
-            .map(|h| tensor::rms_norm(h, &layer.attn_norm, config.rms_norm_eps))
-            .collect();
-
-        // 2b. Q/K/V projections — parallel across sequences.
-        #[cfg(feature = "rayon")]
-        let qkv: Vec<(Tensor, Tensor, Tensor)> = normed
-            .par_iter()
-            .map(|n| {
-                let mut q = layer.attn_q.matvec(n.data());
-                let mut k = layer.attn_k.matvec(n.data());
-                let mut v = layer.attn_v.matvec(n.data());
-                if let Some(ll) = lora_layer {
-                    if let Some(a) = &ll.attn_q {
-                        a.apply(n.data(), q.data_mut());
-                    }
-                    if let Some(a) = &ll.attn_k {
-                        a.apply(n.data(), k.data_mut());
-                    }
-                    if let Some(a) = &ll.attn_v {
-                        a.apply(n.data(), v.data_mut());
-                    }
-                }
-                (q, k, v)
-            })
-            .collect();
-        #[cfg(not(feature = "rayon"))]
-        let qkv: Vec<(Tensor, Tensor, Tensor)> = normed
-            .iter()
-            .map(|n| {
-                let mut q = layer.attn_q.matvec(n.data());
-                let mut k = layer.attn_k.matvec(n.data());
-                let mut v = layer.attn_v.matvec(n.data());
-                if let Some(ll) = lora_layer {
-                    if let Some(a) = &ll.attn_q {
-                        a.apply(n.data(), q.data_mut());
-                    }
-                    if let Some(a) = &ll.attn_k {
-                        a.apply(n.data(), k.data_mut());
-                    }
-                    if let Some(a) = &ll.attn_v {
-                        a.apply(n.data(), v.data_mut());
-                    }
-                }
-                (q, k, v)
+        let lora_layers: Vec<Option<&LoraLayerAdapters>> = (0..n_seqs)
+            .map(|s| {
+                lora_for(s)
+                    .or(weights.lora.as_ref())
+                    .and_then(|l| l.layers.get(layer_idx))
             })
             .collect();
 
-        // 2c. RoPE (position-dependent, cheap) + K/V cache write (sequential, fast memcpy).
-        let mut q_roped: Vec<Tensor> = Vec::with_capacity(n_seqs);
-        for (i, (q, k, v)) in qkv.into_iter().enumerate() {
-            let pos = positions[i];
-            let q_r = tensor::rope(&q, pos, head_dim, freq_base, rope_scaling, rot_dim);
-            let k_r = tensor::rope(&k, pos, head_dim, freq_base, rope_scaling, rot_dim);
-            caches[i].write(layer_idx, pos, k_r.data(), v.data());
-            q_roped.push(q_r);
+        // ── Attention ──────────────────────────────────────────────────────
+        let normed: Vec<Tensor> = hidden
+            .iter()
+            .map(|h| tensor::rms_norm(h, &layer.attn_norm, config.rms_norm_eps))
+            .collect();
+        let inputs = data_refs(&normed);
+        let mut q = batch_matvec(&layer.attn_q, &inputs, &mut scratch);
+        let mut k = batch_matvec(&layer.attn_k, &inputs, &mut scratch);
+        let mut v = batch_matvec(&layer.attn_v, &inputs, &mut scratch);
+        for (s, ll) in lora_layers.iter().enumerate() {
+            if let Some(ll) = ll {
+                if let Some(a) = &ll.attn_q {
+                    a.apply(normed[s].data(), q[s].data_mut());
+                }
+                if let Some(a) = &ll.attn_k {
+                    a.apply(normed[s].data(), k[s].data_mut());
+                }
+                if let Some(a) = &ll.attn_v {
+                    a.apply(normed[s].data(), v[s].data_mut());
+                }
+            }
         }
 
-        // 2d. Attention — each sequence reads its own cache independently.
-        //     Parallelise via rayon; each iteration captures only its own cache slice.
-        //     We need immutable refs to caches for reading.
-        let attn_vecs: Vec<Tensor> = {
-            // Collect K/V reads into per-sequence buffers so we can release the
-            // mutable cache borrow before parallelising.
-            let per_seq: Vec<(Vec<f32>, usize, usize)> = (0..n_seqs)
-                .map(|i| {
-                    let pos = positions[i];
-                    let window_start = config
-                        .sliding_window
-                        .map(|w| (pos as i64 - w as i64 + 1).max(0) as usize)
-                        .unwrap_or(0);
-                    let attend_len = pos + 1 - window_start;
-                    let kv_stride = n_kv_heads * head_dim;
-                    let mut kv_flat = vec![0.0f32; attend_len * kv_stride * 2];
-                    let cache_ro: &dyn KvStore = caches[i];
-                    for t in 0..attend_len {
-                        for kv_h in 0..n_kv_heads {
-                            let off_k = t * kv_stride + kv_h * head_dim;
-                            let off_v = attend_len * kv_stride + t * kv_stride + kv_h * head_dim;
-                            cache_ro.read_k_head(
-                                layer_idx,
-                                window_start + t,
-                                kv_h,
-                                head_dim,
-                                &mut kv_flat[off_k..off_k + head_dim],
-                            );
-                            cache_ro.read_v_head(
-                                layer_idx,
-                                window_start + t,
-                                kv_h,
-                                head_dim,
-                                &mut kv_flat[off_v..off_v + head_dim],
-                            );
-                        }
-                    }
-                    (kv_flat, attend_len, window_start)
-                })
-                .collect();
+        // RoPE, then publish this position's K/V into each sequence's cache.
+        for s in 0..n_seqs {
+            let pos = positions[s];
+            q[s] = tensor::rope(&q[s], pos, head_dim, freq_base, rope_scaling, rot_dim);
+            let k_roped = tensor::rope(&k[s], pos, head_dim, freq_base, rope_scaling, rot_dim);
+            caches[s].write(layer_idx, pos, k_roped.data(), v[s].data());
+        }
 
+        // Attention itself is per-sequence — independent caches and positions,
+        // so the sequences run in parallel rather than sharing a traversal.
+        let attn_vecs: Vec<Tensor> = {
+            let read_only: Vec<&dyn KvStore> = caches.iter().map(|c| &**c).collect();
+            let attend = |s: usize| {
+                let pos = positions[s];
+                let window_start = config
+                    .sliding_window
+                    .map(|w| (pos as i64 - w as i64 + 1).max(0) as usize)
+                    .unwrap_or(0);
+                let mut out = vec![0.0f32; embed_dim];
+                attn_heads_cpu(
+                    q[s].data(),
+                    read_only[s],
+                    layer_idx,
+                    window_start,
+                    pos + 1 - window_start,
+                    n_heads,
+                    kv_group_size,
+                    head_dim,
+                    scale,
+                    &mut out,
+                );
+                Tensor::from_vec(out, &[embed_dim])
+            };
             #[cfg(feature = "rayon")]
-            let results: Vec<Tensor> = per_seq
-                .into_par_iter()
-                .zip(q_roped.par_iter())
-                .map(|((kv_flat, attend_len, _window_start), q)| {
-                    let kv_stride = n_kv_heads * head_dim;
-                    let mut output = vec![0.0f32; embed_dim];
-                    for h in 0..n_heads {
-                        let kv_h = h / kv_group_sz;
-                        let q_off = h * head_dim;
-                        let q_head = &q.data()[q_off..q_off + head_dim];
-                        // Build per-head K/V slices from kv_flat
-                        let mut k_buf = vec![0.0f32; attend_len * head_dim];
-                        let mut v_buf = vec![0.0f32; attend_len * head_dim];
-                        for t in 0..attend_len {
-                            let k_src = &kv_flat[t * kv_stride + kv_h * head_dim..][..head_dim];
-                            let v_src = &kv_flat
-                                [attend_len * kv_stride + t * kv_stride + kv_h * head_dim..]
-                                [..head_dim];
-                            k_buf[t * head_dim..(t + 1) * head_dim].copy_from_slice(k_src);
-                            v_buf[t * head_dim..(t + 1) * head_dim].copy_from_slice(v_src);
-                        }
-                        // Scaled dot-product attention (online softmax)
-                        let out_off = h * head_dim;
-                        batch_attn_head(
-                            q_head,
-                            &k_buf,
-                            &v_buf,
-                            attend_len,
-                            head_dim,
-                            scale,
-                            &mut output[out_off..out_off + head_dim],
-                        );
-                    }
-                    Tensor::from_vec(output, &[embed_dim])
-                })
-                .collect();
+            {
+                (0..n_seqs).into_par_iter().map(attend).collect()
+            }
             #[cfg(not(feature = "rayon"))]
-            let results: Vec<Tensor> = per_seq
-                .into_iter()
-                .zip(q_roped.iter())
-                .map(|((kv_flat, attend_len, _window_start), q)| {
-                    let kv_stride = n_kv_heads * head_dim;
-                    let mut output = vec![0.0f32; embed_dim];
-                    for h in 0..n_heads {
-                        let kv_h = h / kv_group_sz;
-                        let q_off = h * head_dim;
-                        let q_head = &q.data()[q_off..q_off + head_dim];
-                        let mut k_buf = vec![0.0f32; attend_len * head_dim];
-                        let mut v_buf = vec![0.0f32; attend_len * head_dim];
-                        for t in 0..attend_len {
-                            let k_src = &kv_flat[t * kv_stride + kv_h * head_dim..][..head_dim];
-                            let v_src = &kv_flat
-                                [attend_len * kv_stride + t * kv_stride + kv_h * head_dim..]
-                                [..head_dim];
-                            k_buf[t * head_dim..(t + 1) * head_dim].copy_from_slice(k_src);
-                            v_buf[t * head_dim..(t + 1) * head_dim].copy_from_slice(v_src);
-                        }
-                        let out_off = h * head_dim;
-                        batch_attn_head(
-                            q_head,
-                            &k_buf,
-                            &v_buf,
-                            attend_len,
-                            head_dim,
-                            scale,
-                            &mut output[out_off..out_off + head_dim],
-                        );
-                    }
-                    Tensor::from_vec(output, &[embed_dim])
-                })
-                .collect();
-            results
+            {
+                (0..n_seqs).map(attend).collect()
+            }
         };
 
-        // 2e. Output projection + residual (parallel across sequences).
-        #[cfg(feature = "rayon")]
-        let after_attn: Vec<Tensor> = attn_vecs
-            .into_par_iter()
-            .zip(hiddens.par_iter())
-            .map(|(attn_vec, h)| {
-                let mut out = layer.attn_output.matvec(attn_vec.data());
-                if let Some(ll) = lora_layer {
-                    if let Some(a) = &ll.attn_output {
-                        a.apply(attn_vec.data(), out.data_mut());
-                    }
-                }
-                tensor::add(h, &out)
-            })
-            .collect();
-        #[cfg(not(feature = "rayon"))]
-        let after_attn: Vec<Tensor> = attn_vecs
-            .into_iter()
-            .zip(hiddens.iter())
-            .map(|(attn_vec, h)| {
-                let mut out = layer.attn_output.matvec(attn_vec.data());
-                if let Some(ll) = lora_layer {
-                    if let Some(a) = &ll.attn_output {
-                        a.apply(attn_vec.data(), out.data_mut());
-                    }
-                }
-                tensor::add(h, &out)
-            })
+        let attn_inputs = data_refs(&attn_vecs);
+        let mut proj = batch_matvec(&layer.attn_output, &attn_inputs, &mut scratch);
+        for (s, ll) in lora_layers.iter().enumerate() {
+            if let Some(a) = ll.and_then(|l| l.attn_output.as_ref()) {
+                a.apply(attn_vecs[s].data(), proj[s].data_mut());
+            }
+        }
+        let after_attn: Vec<Tensor> = hidden
+            .iter()
+            .zip(&proj)
+            .map(|(h, p)| tensor::add(h, p))
             .collect();
 
-        // 2f. FFN + residual (parallel).
-        #[cfg(feature = "rayon")]
-        {
-            hiddens = after_attn
-                .into_par_iter()
-                .map(|h| {
-                    let normed_ffn = tensor::rms_norm(&h, &layer.ffn_norm, config.rms_norm_eps);
-                    let ffn_out = feed_forward_no_gpu(&normed_ffn, layer, lora_layer);
-                    tensor::add(&h, &ffn_out)
-                })
-                .collect();
+        // ── Feed-forward ───────────────────────────────────────────────────
+        let normed_ffn: Vec<Tensor> = after_attn
+            .iter()
+            .map(|h| tensor::rms_norm(h, &layer.ffn_norm, config.rms_norm_eps))
+            .collect();
+        let ffn_inputs = data_refs(&normed_ffn);
+        let mut gate = batch_matvec(&layer.ffn_gate, &ffn_inputs, &mut scratch);
+        let mut up = batch_matvec(&layer.ffn_up, &ffn_inputs, &mut scratch);
+        for (s, ll) in lora_layers.iter().enumerate() {
+            if let Some(ll) = ll {
+                if let Some(a) = &ll.ffn_gate {
+                    a.apply(normed_ffn[s].data(), gate[s].data_mut());
+                }
+                if let Some(a) = &ll.ffn_up {
+                    a.apply(normed_ffn[s].data(), up[s].data_mut());
+                }
+            }
         }
-        #[cfg(not(feature = "rayon"))]
-        {
-            hiddens = after_attn
-                .into_iter()
-                .map(|h| {
-                    let normed_ffn = tensor::rms_norm(&h, &layer.ffn_norm, config.rms_norm_eps);
-                    let ffn_out = feed_forward_no_gpu(&normed_ffn, layer, lora_layer);
-                    tensor::add(&h, &ffn_out)
-                })
-                .collect();
+        let activated: Vec<Tensor> = gate
+            .iter()
+            .zip(&up)
+            .map(|(g, u)| tensor::mul(&tensor::silu(g), u))
+            .collect();
+        let down_inputs = data_refs(&activated);
+        let mut down = batch_matvec(&layer.ffn_down, &down_inputs, &mut scratch);
+        for (s, ll) in lora_layers.iter().enumerate() {
+            if let Some(a) = ll.and_then(|l| l.ffn_down.as_ref()) {
+                a.apply(activated[s].data(), down[s].data_mut());
+            }
         }
+        hidden = after_attn
+            .iter()
+            .zip(&down)
+            .map(|(h, d)| tensor::add(h, d))
+            .collect();
     }
 
-    // 3. Advance all caches.
     for cache in caches.iter_mut() {
         cache.advance();
     }
 
-    // 4. Final norm + LM head (parallel).
-    #[cfg(feature = "rayon")]
-    let logits: Vec<Tensor> = hiddens
-        .into_par_iter()
-        .map(|h| {
-            let normed = tensor::rms_norm(&h, &weights.output_norm, config.rms_norm_eps);
-            weights.output.matvec(normed.data())
-        })
+    // Final norm + LM head. The LM head is the widest matrix in the model, so
+    // it is also where batching saves the most.
+    let normed: Vec<Tensor> = hidden
+        .iter()
+        .map(|h| tensor::rms_norm(h, &weights.output_norm, config.rms_norm_eps))
         .collect();
-    #[cfg(not(feature = "rayon"))]
-    let logits: Vec<Tensor> = hiddens
-        .into_iter()
-        .map(|h| {
-            let normed = tensor::rms_norm(&h, &weights.output_norm, config.rms_norm_eps);
-            weights.output.matvec(normed.data())
-        })
-        .collect();
-    logits
-}
-
-/// Scaled dot-product attention for a single head — used by `forward_batch`.
-///
-/// `k_flat[t * head_dim .. (t+1)*head_dim]` holds the key for position `t`.
-/// `v_flat` has the same layout.  Online softmax (numerically stable).
-fn batch_attn_head(
-    q: &[f32],
-    k_flat: &[f32],
-    v_flat: &[f32],
-    attend_len: usize,
-    head_dim: usize,
-    scale: f32,
-    out: &mut [f32],
-) {
-    // Online softmax: compute max, then weighted sum.
-    let mut scores = vec![0.0f32; attend_len];
-    for t in 0..attend_len {
-        let k = &k_flat[t * head_dim..(t + 1) * head_dim];
-        scores[t] = q.iter().zip(k).map(|(qi, ki)| qi * ki).sum::<f32>() * scale;
-    }
-    let max_s = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    let mut exp_sum = 0.0f32;
-    for s in &mut scores {
-        *s = (*s - max_s).exp();
-        exp_sum += *s;
-    }
-    if exp_sum > 0.0 {
-        for s in &mut scores {
-            *s /= exp_sum;
-        }
-    }
-
-    for x in out.iter_mut() {
-        *x = 0.0;
-    }
-    for t in 0..attend_len {
-        let v = &v_flat[t * head_dim..(t + 1) * head_dim];
-        for (o, vi) in out.iter_mut().zip(v) {
-            *o += scores[t] * vi;
-        }
-    }
-}
-
-/// CPU-only FFN (no GPU dispatch) — used by `forward_batch`.
-fn feed_forward_no_gpu(
-    x: &Tensor,
-    layer: &LayerWeights,
-    lora: Option<&LoraLayerAdapters>,
-) -> Tensor {
-    feed_forward(x, layer, lora, &mut None)
+    let inputs = data_refs(&normed);
+    batch_matvec(&weights.output, &inputs, &mut scratch)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -1609,6 +1581,100 @@ mod tests {
         }
     }
 
+    /// End-to-end check that the paged cache is invisible to the forward pass:
+    /// a batched prefill followed by decode steps must produce exactly the same
+    /// logits as the contiguous f32 cache, bit for bit.
+    #[test]
+    fn test_paged_cache_matches_kv_cache_end_to_end() {
+        let (weights, config) = make_tiny_weights();
+        let n_layers = config.block_count as usize;
+        let prompt: Vec<u32> = vec![1, 3, 5, 2, 7];
+
+        let mut plain = KvCache::new(
+            n_layers,
+            config.context_length as usize,
+            config.head_count_kv as usize,
+            config.head_dim() as usize,
+        );
+        // A pool with room for the whole context, shared by nobody else.
+        let pool = PagePool::new(
+            PagePool::pages_for(config.context_length as usize, n_layers),
+            config.head_count_kv as usize,
+            config.head_dim() as usize,
+        );
+        let mut paged = PagedKvCache::new(&pool, n_layers);
+
+        let mut l_plain = forward_prefill(&weights, &config, &prompt, &mut plain, 0, &mut None);
+        let mut l_paged = forward_prefill(&weights, &config, &prompt, &mut paged, 0, &mut None);
+
+        // Decode far enough to cross two page boundaries (PAGE_SIZE = 16).
+        let mut tokens = prompt.clone();
+        for step in 0..25 {
+            for (i, (&a, &b)) in l_plain.data().iter().zip(l_paged.data()).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "step {step} logit {i}: kv={a:.6} paged={b:.6}"
+                );
+            }
+            let next = l_plain
+                .data()
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.total_cmp(b))
+                .map(|(i, _)| i as u32)
+                .unwrap_or(0);
+            tokens.push(next);
+            let pos = tokens.len() - 1;
+            l_plain = forward_one(&weights, &config, next, pos, &mut plain, &mut None);
+            l_paged = forward_one(&weights, &config, next, pos, &mut paged, &mut None);
+        }
+
+        assert_eq!(plain.len(), paged.len());
+        assert_eq!(paged.pages_per_layer(), tokens.len().div_ceil(16));
+        assert_eq!(pool.live_pages(), paged.allocated_pages());
+    }
+
+    /// A sequence forked from a prefilled prompt shares that prompt's pages and
+    /// still decodes to the same logits as one that computed the prefix itself
+    /// — the property prefix caching will be built on.
+    #[test]
+    fn test_forked_cache_decodes_like_a_fresh_one() {
+        let (weights, config) = make_tiny_weights();
+        let n_layers = config.block_count as usize;
+        let prompt: Vec<u32> = vec![1, 3, 5, 2, 7, 4];
+
+        let pool = PagePool::new(
+            64,
+            config.head_count_kv as usize,
+            config.head_dim() as usize,
+        );
+        let mut base = PagedKvCache::new(&pool, n_layers);
+        forward_prefill(&weights, &config, &prompt, &mut base, 0, &mut None);
+
+        // Fork the whole prompt instead of prefilling it again.
+        let mut forked = base.fork_from(prompt.len());
+        assert!(forked.is_page_shared(0, 0), "the prefix page is shared");
+
+        let mut fresh = PagedKvCache::new(&pool, n_layers);
+        forward_prefill(&weights, &config, &prompt, &mut fresh, 0, &mut None);
+
+        let mut tokens = prompt.clone();
+        for _ in 0..8 {
+            let pos = tokens.len();
+            let tok = (pos as u32) % config.vocab_size;
+            let l_fresh = forward_one(&weights, &config, tok, pos, &mut fresh, &mut None);
+            let l_forked = forward_one(&weights, &config, tok, pos, &mut forked, &mut None);
+            for (i, (&a, &b)) in l_fresh.data().iter().zip(l_forked.data()).enumerate() {
+                assert_eq!(a.to_bits(), b.to_bits(), "pos {pos} logit {i}");
+            }
+            tokens.push(tok);
+        }
+        // Writing into the forked tail page copied it; the base is untouched.
+        assert_eq!(base.len(), prompt.len());
+        assert!(!base.is_page_shared(0, 0));
+    }
+
     #[test]
     fn test_feed_forward_shape() {
         let layer = LayerWeights {
@@ -1624,6 +1690,460 @@ mod tests {
         };
         let x = Tensor::from_vec(vec![1.0, 2.0, 3.0, 4.0], &[4]);
         assert_eq!(feed_forward(&x, &layer, None, &mut None).shape(), &[4]);
+    }
+
+    // ── Batched decode ───────────────────────────────────────────────────
+    //
+    // Continuous batching is only acceptable if it is invisible to a request:
+    // whatever the server's load, a sequence must produce the same tokens it
+    // would have produced alone. Because sampling is a function of the logits,
+    // that reduces to bit-identical logits — asserted here on the f32 bit
+    // patterns, not on a tolerance.
+
+    /// A KV cache holding `prompt` plus the prompt's final logits — ready for
+    /// the next decode step at position `prompt.len()`.
+    fn prefill_for_test(
+        weights: &TransformerWeights,
+        config: &ModelConfig,
+        prompt: &[u32],
+    ) -> (KvCache, Tensor) {
+        let mut cache = KvCache::new(
+            config.block_count as usize,
+            config.context_length as usize,
+            config.head_count_kv as usize,
+            config.head_dim() as usize,
+        );
+        let logits = forward_prefill(weights, config, prompt, &mut cache, 0, &mut None);
+        (cache, logits)
+    }
+
+    fn prefilled_cache(
+        weights: &TransformerWeights,
+        config: &ModelConfig,
+        prompt: &[u32],
+    ) -> KvCache {
+        prefill_for_test(weights, config, prompt).0
+    }
+
+    fn assert_same_logits(expected: &Tensor, got: &Tensor, what: &str) {
+        assert_eq!(expected.shape(), got.shape(), "{what}: shape");
+        for (i, (&a, &b)) in expected.data().iter().zip(got.data()).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "{what}: logit {i} single={a} batched={b}"
+            );
+        }
+    }
+
+    /// Sequences with different prompt lengths (so different positions and
+    /// different cached histories) share one batched step; every sequence must
+    /// get exactly the logits `forward_one` gives it on its own.
+    #[test]
+    fn forward_batch_matches_forward_one() {
+        let (weights, config) = make_tiny_weights();
+        let prompts: [&[u32]; 4] = [&[1, 2, 3], &[4], &[5, 0, 6, 7], &[2, 2]];
+        let next: [u32; 4] = [3, 6, 1, 7];
+
+        for batch in [1usize, 2, 4] {
+            let expected: Vec<Tensor> = (0..batch)
+                .map(|s| {
+                    let mut cache = prefilled_cache(&weights, &config, prompts[s]);
+                    forward_one(
+                        &weights,
+                        &config,
+                        next[s],
+                        prompts[s].len(),
+                        &mut cache,
+                        &mut None,
+                    )
+                })
+                .collect();
+
+            let mut caches: Vec<KvCache> = (0..batch)
+                .map(|s| prefilled_cache(&weights, &config, prompts[s]))
+                .collect();
+            let mut cache_refs: Vec<&mut dyn KvStore> =
+                caches.iter_mut().map(|c| c as &mut dyn KvStore).collect();
+            let tokens: Vec<u32> = next[..batch].to_vec();
+            let positions: Vec<usize> = (0..batch).map(|s| prompts[s].len()).collect();
+            let got = forward_batch(
+                &weights,
+                &config,
+                &tokens,
+                &positions,
+                &mut cache_refs,
+                &mut None,
+            );
+
+            assert_eq!(got.len(), batch);
+            for s in 0..batch {
+                assert_same_logits(&expected[s], &got[s], &format!("batch={batch} seq={s}"));
+            }
+        }
+    }
+
+    /// The batched step must also leave each cache in the state the
+    /// single-sequence step would have — otherwise the *next* step diverges
+    /// even though this one matched.
+    #[test]
+    fn forward_batch_writes_the_same_cache_state() {
+        let (weights, config) = make_tiny_weights();
+        let prompts: [&[u32]; 2] = [&[1, 2, 3], &[5, 0]];
+        let next: [u32; 2] = [4, 6];
+
+        let solo: Vec<KvCache> = (0..2)
+            .map(|s| {
+                let mut cache = prefilled_cache(&weights, &config, prompts[s]);
+                forward_one(
+                    &weights,
+                    &config,
+                    next[s],
+                    prompts[s].len(),
+                    &mut cache,
+                    &mut None,
+                );
+                cache
+            })
+            .collect();
+
+        let mut batched: Vec<KvCache> = (0..2)
+            .map(|s| prefilled_cache(&weights, &config, prompts[s]))
+            .collect();
+        let mut cache_refs: Vec<&mut dyn KvStore> =
+            batched.iter_mut().map(|c| c as &mut dyn KvStore).collect();
+        let positions: Vec<usize> = (0..2).map(|s| prompts[s].len()).collect();
+        forward_batch(
+            &weights,
+            &config,
+            &next,
+            &positions,
+            &mut cache_refs,
+            &mut None,
+        );
+
+        for s in 0..2 {
+            assert_eq!(solo[s].len(), batched[s].len(), "seq {s} cache length");
+            for pos in 0..solo[s].len() {
+                assert_eq!(
+                    solo[s].k_at(0, pos),
+                    batched[s].k_at(0, pos),
+                    "seq {s} K@{pos}"
+                );
+                assert_eq!(
+                    solo[s].v_at(0, pos),
+                    batched[s].v_at(0, pos),
+                    "seq {s} V@{pos}"
+                );
+            }
+        }
+    }
+
+    /// Parity has to hold *step after step*, not just for the first token:
+    /// a batch decodes for many steps, and each one reads the cache the
+    /// previous one wrote.
+    #[test]
+    fn forward_batch_stays_identical_over_many_steps() {
+        let (weights, config) = make_tiny_weights();
+        let prompts: [&[u32]; 3] = [&[1, 2], &[3, 4, 5], &[6]];
+        let steps = 6;
+
+        let argmax = |t: &Tensor| {
+            t.data()
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.total_cmp(b))
+                .map(|(i, _)| i as u32)
+                .unwrap()
+        };
+
+        // Reference: each sequence decoded entirely on its own.
+        let solo: Vec<Vec<u32>> = (0..3)
+            .map(|s| {
+                let (mut cache, mut logits) = prefill_for_test(&weights, &config, prompts[s]);
+                let mut produced = Vec::new();
+                let mut pos = prompts[s].len();
+                for _ in 0..steps {
+                    let tok = argmax(&logits);
+                    produced.push(tok);
+                    logits = forward_one(&weights, &config, tok, pos, &mut cache, &mut None);
+                    pos += 1;
+                }
+                produced
+            })
+            .collect();
+
+        // Batched: all three sequences share every step.
+        let mut caches: Vec<KvCache> = Vec::new();
+        let mut logits: Vec<Tensor> = Vec::new();
+        for prompt in prompts {
+            let (cache, first) = prefill_for_test(&weights, &config, prompt);
+            caches.push(cache);
+            logits.push(first);
+        }
+        let mut positions: Vec<usize> = (0..3).map(|s| prompts[s].len()).collect();
+        let mut produced: Vec<Vec<u32>> = vec![Vec::new(); 3];
+
+        for _ in 0..steps {
+            let tokens: Vec<u32> = logits.iter().map(argmax).collect();
+            for (s, &tok) in tokens.iter().enumerate() {
+                produced[s].push(tok);
+            }
+            let mut cache_refs: Vec<&mut dyn KvStore> =
+                caches.iter_mut().map(|c| c as &mut dyn KvStore).collect();
+            logits = forward_batch(
+                &weights,
+                &config,
+                &tokens,
+                &positions,
+                &mut cache_refs,
+                &mut None,
+            );
+            for p in positions.iter_mut() {
+                *p += 1;
+            }
+        }
+
+        assert_eq!(
+            produced, solo,
+            "batched decoding diverged from solo decoding"
+        );
+    }
+
+    /// Quantize `rows × cols` samples of `f` into a Q8_0 tensor.
+    ///
+    /// The tiny fixture above is F32, which takes the dequantize-then-dot
+    /// fallback. Real models are quantized and hit the SIMD kernels, so the
+    /// batched forward pass needs a fixture that does too.
+    fn q8_0_tensor(rows: usize, cols: usize, f: impl Fn(usize, usize) -> f32) -> QuantizedTensor {
+        use crate::model::gguf::GgmlType;
+        assert_eq!(cols % 32, 0);
+        let mut data = Vec::with_capacity(rows * (cols / 32) * 34);
+        for r in 0..rows {
+            for b in 0..cols / 32 {
+                let values: Vec<f32> = (0..32).map(|j| f(r, b * 32 + j)).collect();
+                let max_abs = values.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+                let d = half::f16::from_f32(if max_abs > 0.0 { max_abs / 127.0 } else { 1.0 });
+                data.extend_from_slice(&d.to_le_bytes());
+                let d = d.to_f32();
+                for v in values {
+                    data.push(((v / d).round().clamp(-127.0, 127.0) as i8) as u8);
+                }
+            }
+        }
+        QuantizedTensor::from_raw(data, rows, cols, GgmlType::Q8_0)
+    }
+
+    /// One-layer model with Q8_0 weights: embed 32, 2 query heads over 1 KV
+    /// head (GQA), head_dim 16, FFN 64, vocab 32.
+    fn make_tiny_q8_weights() -> (TransformerWeights, ModelConfig) {
+        let config = ModelConfig {
+            architecture: "test-q8".to_string(),
+            context_length: 32,
+            embedding_length: 32,
+            block_count: 1,
+            head_count: 2,
+            head_count_kv: 1,
+            vocab_size: 32,
+            feed_forward_length: Some(64),
+            rms_norm_eps: 1e-5,
+            rope_freq_base: Some(10000.0),
+            chat_template: None,
+            sliding_window: None,
+            rope_scaling_factor: None,
+            partial_rotary_factor: None,
+        };
+        let wave = |k: f32| move |r: usize, c: usize| ((r * 31 + c * 7) as f32 * 0.021).sin() * k;
+        let weights = TransformerWeights {
+            token_embedding: q8_0_tensor(32, 32, wave(0.7)),
+            layers: vec![LayerWeights {
+                attn_norm: Tensor::from_vec(
+                    (0..32).map(|i| 1.0 + i as f32 * 0.01).collect(),
+                    &[32],
+                ),
+                ffn_norm: Tensor::from_vec(
+                    (0..32).map(|i| 1.0 - i as f32 * 0.005).collect(),
+                    &[32],
+                ),
+                attn_q: q8_0_tensor(32, 32, wave(0.4)),
+                attn_k: q8_0_tensor(16, 32, wave(0.35)),
+                attn_v: q8_0_tensor(16, 32, wave(0.5)),
+                attn_output: q8_0_tensor(32, 32, wave(0.3)),
+                ffn_gate: q8_0_tensor(64, 32, wave(0.25)),
+                ffn_up: q8_0_tensor(64, 32, wave(0.45)),
+                ffn_down: q8_0_tensor(32, 64, wave(0.2)),
+            }],
+            output_norm: Tensor::from_vec(vec![1.0; 32], &[32]),
+            output: q8_0_tensor(32, 32, wave(0.6)),
+            lora: None,
+        };
+        (weights, config)
+    }
+
+    /// Parity on a quantized model — this is the path a real deployment takes
+    /// (and, on x86, the batched AVX2 kernels).
+    #[test]
+    fn forward_batch_matches_forward_one_quantized() {
+        let (weights, config) = make_tiny_q8_weights();
+        let prompts: [&[u32]; 4] = [&[1, 2, 3], &[9], &[5, 0, 6, 7], &[11, 11]];
+        let next: [u32; 4] = [3, 6, 1, 7];
+
+        for batch in [2usize, 4] {
+            let expected: Vec<Tensor> = (0..batch)
+                .map(|s| {
+                    let mut cache = prefilled_cache(&weights, &config, prompts[s]);
+                    forward_one(
+                        &weights,
+                        &config,
+                        next[s],
+                        prompts[s].len(),
+                        &mut cache,
+                        &mut None,
+                    )
+                })
+                .collect();
+
+            let mut caches: Vec<KvCache> = (0..batch)
+                .map(|s| prefilled_cache(&weights, &config, prompts[s]))
+                .collect();
+            let mut cache_refs: Vec<&mut dyn KvStore> =
+                caches.iter_mut().map(|c| c as &mut dyn KvStore).collect();
+            let tokens: Vec<u32> = next[..batch].to_vec();
+            let positions: Vec<usize> = (0..batch).map(|s| prompts[s].len()).collect();
+            let got = forward_batch(
+                &weights,
+                &config,
+                &tokens,
+                &positions,
+                &mut cache_refs,
+                &mut None,
+            );
+
+            for s in 0..batch {
+                assert_same_logits(&expected[s], &got[s], &format!("q8 batch={batch} seq={s}"));
+            }
+        }
+    }
+
+    /// The same parity, with the Q8_0-compressed KV cache rather than f32 —
+    /// the batched step must read a quantized cache exactly as the single one
+    /// does.
+    #[test]
+    fn forward_batch_matches_forward_one_q8_cache() {
+        let (weights, config) = make_tiny_q8_weights();
+        let prompts: [&[u32]; 2] = [&[1, 2, 3], &[8, 4]];
+        let next: [u32; 2] = [5, 6];
+
+        let new_cache = || {
+            KvCacheQ8::new(
+                config.block_count as usize,
+                config.context_length as usize,
+                config.head_count_kv as usize,
+                config.head_dim() as usize,
+            )
+        };
+        let expected: Vec<Tensor> = (0..2)
+            .map(|s| {
+                let mut cache = new_cache();
+                forward_prefill(&weights, &config, prompts[s], &mut cache, 0, &mut None);
+                forward_one(
+                    &weights,
+                    &config,
+                    next[s],
+                    prompts[s].len(),
+                    &mut cache,
+                    &mut None,
+                )
+            })
+            .collect();
+
+        let mut caches: Vec<KvCacheQ8> = (0..2)
+            .map(|s| {
+                let mut cache = new_cache();
+                forward_prefill(&weights, &config, prompts[s], &mut cache, 0, &mut None);
+                cache
+            })
+            .collect();
+        let mut cache_refs: Vec<&mut dyn KvStore> =
+            caches.iter_mut().map(|c| c as &mut dyn KvStore).collect();
+        let positions: Vec<usize> = (0..2).map(|s| prompts[s].len()).collect();
+        let got = forward_batch(
+            &weights,
+            &config,
+            &next,
+            &positions,
+            &mut cache_refs,
+            &mut None,
+        );
+
+        for s in 0..2 {
+            assert_same_logits(&expected[s], &got[s], &format!("q8-cache seq={s}"));
+        }
+    }
+
+    /// Sequences carrying different LoRA adapters can share a step: the base
+    /// weights are what the batch amortises, and each adapter's update is
+    /// applied to its own sequence afterwards.
+    #[test]
+    fn forward_batch_applies_per_sequence_lora() {
+        use crate::model::lora::{LoraAdapter, LoraLayerAdapters, LoraWeights};
+
+        let (weights, config) = make_tiny_weights();
+        let embed = config.embedding_length as usize;
+        // Rank-1 adapter on the output projection of the single layer.
+        let make_lora = |k: f32| LoraWeights {
+            layers: vec![LoraLayerAdapters {
+                attn_output: Some(LoraAdapter {
+                    a: Tensor::from_vec(vec![k; embed], &[1, embed]),
+                    b: Tensor::from_vec(vec![0.5; embed], &[embed, 1]),
+                    scale: 2.0,
+                }),
+                ..Default::default()
+            }],
+        };
+        let lora_a = make_lora(0.25);
+        let lora_b = make_lora(-0.5);
+        let prompts: [&[u32]; 2] = [&[1, 2], &[3]];
+        let next: [u32; 2] = [4, 5];
+        let loras: [Option<&LoraWeights>; 2] = [Some(&lora_a), Some(&lora_b)];
+
+        let expected: Vec<Tensor> = (0..2)
+            .map(|s| {
+                let mut cache = prefilled_cache(&weights, &config, prompts[s]);
+                forward_one_lora(
+                    &weights,
+                    &config,
+                    next[s],
+                    prompts[s].len(),
+                    &mut cache,
+                    &mut None,
+                    loras[s],
+                )
+            })
+            .collect();
+
+        let mut caches: Vec<KvCache> = (0..2)
+            .map(|s| prefilled_cache(&weights, &config, prompts[s]))
+            .collect();
+        let mut cache_refs: Vec<&mut dyn KvStore> =
+            caches.iter_mut().map(|c| c as &mut dyn KvStore).collect();
+        let positions: Vec<usize> = (0..2).map(|s| prompts[s].len()).collect();
+        let got = forward_batch_lora(
+            &weights,
+            &config,
+            &next,
+            &positions,
+            &mut cache_refs,
+            &mut None,
+            &loras,
+        );
+
+        for s in 0..2 {
+            assert_same_logits(&expected[s], &got[s], &format!("lora seq={s}"));
+        }
+        // Sanity: the two adapters really do produce different logits, so the
+        // test above is not comparing a sequence against itself.
+        assert_ne!(got[0].data()[0].to_bits(), got[1].data()[0].to_bits());
     }
 
     /// Verify `embed_batch([a, b])` produces the same results as `[embed(a), embed(b)]`.

@@ -22,6 +22,22 @@ pub enum GlintError {
     MissingVocabulary,
     /// The GGUF metadata does not contain a recognised model architecture.
     MissingModelConfig,
+    // ── SafeTensors / HuggingFace loading ─────────────────────────────────────
+    /// A `.safetensors` file is malformed: bad header length, unparseable JSON
+    /// header, or tensor offsets that do not describe the data region.
+    SafeTensorsMalformed(String),
+    /// A `.safetensors` tensor uses a dtype Glint cannot load.
+    SafeTensorsUnsupportedDtype { name: String, dtype: String },
+    /// A HuggingFace model directory is missing a file Glint needs.
+    HfMissingFile { dir: String, file: String },
+    /// A HuggingFace JSON file (`config.json`, `tokenizer.json`, …) is invalid.
+    HfInvalidJson { file: String, detail: String },
+    /// A HuggingFace `config.json` is missing a field Glint requires.
+    HfMissingConfigField(&'static str),
+    /// A HuggingFace model uses a feature Glint's forward pass cannot express.
+    HfUnsupported(String),
+    /// Reading a model file from disk failed.
+    Io { path: String, detail: String },
     /// No compatible GPU adapter was found (Vulkan/Metal/DX12).
     #[cfg(feature = "vulkan")]
     GpuAdapterNotFound,
@@ -55,6 +71,15 @@ pub enum GlintError {
         expected: usize,
         found: usize,
     },
+    // ── KV-cache errors ───────────────────────────────────────────────────────
+    /// A paged KV-cache could not get the pages it asked for — the shared pool
+    /// is full. Recoverable: the caller decides whether to queue the sequence,
+    /// evict another one, or reject the request.
+    KvPagePoolExhausted {
+        needed: usize,
+        available: usize,
+        capacity: usize,
+    },
 }
 
 impl fmt::Display for GlintError {
@@ -87,6 +112,30 @@ impl fmt::Display for GlintError {
                     f,
                     "could not extract model configuration from GGUF metadata"
                 )
+            }
+            Self::SafeTensorsMalformed(detail) => {
+                write!(f, "malformed safetensors file: {detail}")
+            }
+            Self::SafeTensorsUnsupportedDtype { name, dtype } => {
+                write!(
+                    f,
+                    "tensor '{name}' has dtype '{dtype}' — Glint can load F32, F16, and BF16"
+                )
+            }
+            Self::HfMissingFile { dir, file } => {
+                write!(f, "HuggingFace model directory '{dir}' has no '{file}'")
+            }
+            Self::HfInvalidJson { file, detail } => {
+                write!(f, "could not parse '{file}': {detail}")
+            }
+            Self::HfMissingConfigField(field) => {
+                write!(f, "config.json is missing the required field '{field}'")
+            }
+            Self::HfUnsupported(detail) => {
+                write!(f, "unsupported HuggingFace model: {detail}")
+            }
+            Self::Io { path, detail } => {
+                write!(f, "could not read '{path}': {detail}")
             }
             #[cfg(feature = "vulkan")]
             Self::GpuAdapterNotFound => {
@@ -135,6 +184,16 @@ impl fmt::Display for GlintError {
                 write!(
                     f,
                     "snapshot cache layer {layer}: expected {expected} bytes, found {found}"
+                )
+            }
+            Self::KvPagePoolExhausted {
+                needed,
+                available,
+                capacity,
+            } => {
+                write!(
+                    f,
+                    "KV page pool exhausted: needed {needed} page(s), {available} of {capacity} free"
                 )
             }
         }

@@ -116,7 +116,7 @@ Dequantize: `float = int8_value * scale`
 
 Each block of 32 values (18 bytes): `[f16 scale (2 bytes)] [16 × packed bytes (16 bytes)]`
 
-Each byte packs two 4-bit unsigned ints (low nibble first), centered by subtracting 8 → signed range [-8, 7].
+Each byte packs two 4-bit unsigned ints, centered by subtracting 8 → signed range [-8, 7]. The nibbles are split-plane, as in ggml: byte `j` holds element `j` in its low nibble and element `j + 16` in its high nibble (not elements `2j`/`2j+1`).
 
 Dequantize: `float = (nibble - 8) * scale`
 

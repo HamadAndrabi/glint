@@ -83,6 +83,31 @@ fn par_rows(rows: usize) -> rayon::range::Iter<usize> {
 fn par_rows(rows: usize) -> std::ops::Range<usize> {
     0..rows
 }
+
+/// Parallel iterator over the per-row slices of a `[rows, batch]` output
+/// buffer (rayon when available, sequential otherwise).
+///
+/// Rows stay the outer, parallel dimension exactly as in the single-vector
+/// kernels; sequences are the inner loop inside each row.
+#[cfg(feature = "rayon")]
+fn par_out_rows(out: &mut [f32], rows: usize, batch: usize) -> rayon::slice::ChunksMut<'_, f32> {
+    debug_assert_eq!(
+        out.len(),
+        rows * batch,
+        "batched output must be rows × batch"
+    );
+    out.par_chunks_mut(batch)
+}
+
+#[cfg(not(feature = "rayon"))]
+fn par_out_rows(out: &mut [f32], rows: usize, batch: usize) -> std::slice::ChunksMut<'_, f32> {
+    debug_assert_eq!(
+        out.len(),
+        rows * batch,
+        "batched output must be rows × batch"
+    );
+    out.chunks_mut(batch)
+}
 use super::dequantize::{dequantize, get_scale_min_q4k};
 
 /// A weight matrix stored in its original quantized format.
@@ -216,8 +241,9 @@ impl QuantizedTensor {
 
     /// Matrix-vector multiply: `[rows, cols] × [cols] → [rows]`.
     ///
-    /// Dispatches to the quantized kernel for Q8_0/Q4_0,
-    /// or falls back to on-the-fly dequantization for other types.
+    /// Dispatches to the direct kernel for every supported quantized format,
+    /// or falls back to on-the-fly dequantization (F32/F16/BF16 and anything
+    /// without a kernel yet).
     pub fn matvec(&self, vec: &[f32]) -> Tensor {
         assert_eq!(
             vec.len(),
@@ -235,8 +261,9 @@ impl QuantizedTensor {
             GgmlType::Q2K => dispatch_q2_k(self.data.as_slice(), self.rows, self.cols, vec),
             GgmlType::Q3K => dispatch_q3_k(self.data.as_slice(), self.rows, self.cols, vec),
             GgmlType::IQ4NL => dispatch_iq4_nl(self.data.as_slice(), self.rows, self.cols, vec),
-            GgmlType::Q5_0 => matvec_q5_0_scalar(self.data.as_slice(), self.rows, self.cols, vec),
-            GgmlType::Q5_1 => matvec_q5_1_scalar(self.data.as_slice(), self.rows, self.cols, vec),
+            GgmlType::Q4_1 => dispatch_q4_1(self.data.as_slice(), self.rows, self.cols, vec),
+            GgmlType::Q5_0 => dispatch_q5_0(self.data.as_slice(), self.rows, self.cols, vec),
+            GgmlType::Q5_1 => dispatch_q5_1(self.data.as_slice(), self.rows, self.cols, vec),
             _ => matvec_fallback(
                 self.data.as_slice(),
                 self.ggml_type,
@@ -246,6 +273,89 @@ impl QuantizedTensor {
             ),
         };
         Tensor::from_vec(out, &[self.rows])
+    }
+
+    /// Batched matrix-vector multiply: `[rows, cols] × B×[cols] → [rows × B]`.
+    ///
+    /// This is the kernel-level half of continuous batching. Where `matvec`
+    /// streams the whole weight matrix through the cache hierarchy to serve one
+    /// activation vector, `matvec_batch_into` streams it **once** for `B` of
+    /// them: every weight block is decoded a single time and immediately
+    /// applied to all `B` inputs before the kernel moves on. Decode throughput
+    /// for `B` concurrent sequences therefore stops being `B ×` the cost of one.
+    ///
+    /// `out` is written in `[rows, B]` interleaved layout — `out[i * B + s]` is
+    /// row `i` for input `s` — which keeps each row's results contiguous so
+    /// rows remain the unit of rayon parallelism.
+    ///
+    /// # Numerical parity
+    ///
+    /// Every input keeps its own accumulator and sees the same floating-point
+    /// operations in the same order as it would through [`matvec`], so
+    /// `matvec_batch_into` is **bit-identical** to calling `matvec` once per
+    /// input. Batching a request must never change the tokens it produces.
+    ///
+    /// # Panics
+    ///
+    /// If `inputs` is empty, any input's length is not `cols`, or `out.len()`
+    /// is not `rows × inputs.len()`.
+    pub fn matvec_batch_into(&self, inputs: &[&[f32]], out: &mut [f32]) {
+        let batch = inputs.len();
+        assert!(batch > 0, "matvec_batch: empty batch");
+        for (s, v) in inputs.iter().enumerate() {
+            assert_eq!(
+                v.len(),
+                self.cols,
+                "matvec_batch: input {s} length {} != cols {}",
+                v.len(),
+                self.cols
+            );
+        }
+        assert_eq!(
+            out.len(),
+            self.rows * batch,
+            "matvec_batch: out length {} != rows {} × batch {batch}",
+            out.len(),
+            self.rows
+        );
+
+        let data = self.data.as_slice();
+        match self.ggml_type {
+            GgmlType::Q8_0 => dispatch_q8_0_batch(data, self.rows, self.cols, inputs, out),
+            GgmlType::Q4_0 => dispatch_q4_0_batch(data, self.rows, self.cols, inputs, out),
+            GgmlType::Q4K => dispatch_q4_k_batch(data, self.rows, self.cols, inputs, out),
+            GgmlType::Q5K => dispatch_q5_k_batch(data, self.rows, self.cols, inputs, out),
+            GgmlType::Q6K => dispatch_q6_k_batch(data, self.rows, self.cols, inputs, out),
+            GgmlType::Q2K => matvec_q2_k_batch_scalar(data, self.rows, self.cols, inputs, out),
+            GgmlType::Q3K => matvec_q3_k_batch_scalar(data, self.rows, self.cols, inputs, out),
+            GgmlType::IQ4NL => matvec_iq4_nl_batch_scalar(data, self.rows, self.cols, inputs, out),
+            GgmlType::Q4_1 => dispatch_q4_1_batch(data, self.rows, self.cols, inputs, out),
+            GgmlType::Q5_0 => dispatch_q5_0_batch(data, self.rows, self.cols, inputs, out),
+            GgmlType::Q5_1 => dispatch_q5_1_batch(data, self.rows, self.cols, inputs, out),
+            _ => matvec_fallback_batch(data, self.ggml_type, self.rows, self.cols, inputs, out),
+        }
+    }
+
+    /// [`matvec_batch_into`] with one owned [`Tensor`] per input vector.
+    ///
+    /// Convenience wrapper for callers that do not keep a scratch buffer
+    /// around; the hot path in `forward_batch` uses `matvec_batch_into`
+    /// directly to reuse one.
+    ///
+    /// [`matvec_batch_into`]: Self::matvec_batch_into
+    pub fn matvec_batch(&self, inputs: &[&[f32]]) -> Vec<Tensor> {
+        let batch = inputs.len();
+        let mut interleaved = vec![0.0f32; self.rows * batch];
+        self.matvec_batch_into(inputs, &mut interleaved);
+        (0..batch)
+            .map(|s| {
+                let mut row = vec![0.0f32; self.rows];
+                for (i, o) in row.iter_mut().enumerate() {
+                    *o = interleaved[i * batch + s];
+                }
+                Tensor::from_vec(row, &[self.rows])
+            })
+            .collect()
     }
 
     /// Dequantize a single row and return it as a 1D `Tensor`.
@@ -308,7 +418,11 @@ impl QuantizedTensor {
                 GgmlType::Q5K => gpu.matvec_q5_k(buf_name, vec, self.rows as u32, self.cols as u32),
                 GgmlType::Q6K => gpu.matvec_q6_k(buf_name, vec, self.rows as u32, self.cols as u32),
                 GgmlType::F32 => gpu.matvec_f32(buf_name, vec, self.rows as u32, self.cols as u32),
-                // Remaining formats fall through to CPU
+                // Deliberate CPU fallback — there is no shader in
+                // `src/backend/shaders/` for Q4_1, Q5_0, Q5_1, Q2_K, Q3_K or
+                // IQ4_NL, nor for the non-quantized F16/BF16 weights. Every one
+                // of those is handled by `matvec`, so falling back is correct,
+                // just slower. Adding a shader means adding an arm above.
                 _ => return self.matvec(vec),
             };
             match result {
@@ -388,6 +502,42 @@ fn dispatch_q4_0(data: &[u8], rows: usize, cols: usize, vec: &[f32]) -> Vec<f32>
     matvec_q4_0_scalar(data, rows, cols, vec)
 }
 
+fn dispatch_q4_1(data: &[u8], rows: usize, cols: usize, vec: &[f32]) -> Vec<f32> {
+    #[cfg(all(target_arch = "x86_64", feature = "rayon"))]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            // SAFETY: AVX2+FMA verified above; kernel length contract upheld by
+            // the validated descriptor (see `dispatch_q8_0` for the full note).
+            return unsafe { crate::tensor::simd::matvec_q4_1_avx2(data, rows, cols, vec) };
+        }
+    }
+    matvec_q4_1_scalar(data, rows, cols, vec)
+}
+
+fn dispatch_q5_0(data: &[u8], rows: usize, cols: usize, vec: &[f32]) -> Vec<f32> {
+    #[cfg(all(target_arch = "x86_64", feature = "rayon"))]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            // SAFETY: AVX2+FMA verified above; kernel length contract upheld by
+            // the validated descriptor (see `dispatch_q8_0` for the full note).
+            return unsafe { crate::tensor::simd::matvec_q5_0_avx2(data, rows, cols, vec) };
+        }
+    }
+    matvec_q5_0_scalar(data, rows, cols, vec)
+}
+
+fn dispatch_q5_1(data: &[u8], rows: usize, cols: usize, vec: &[f32]) -> Vec<f32> {
+    #[cfg(all(target_arch = "x86_64", feature = "rayon"))]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            // SAFETY: AVX2+FMA verified above; kernel length contract upheld by
+            // the validated descriptor (see `dispatch_q8_0` for the full note).
+            return unsafe { crate::tensor::simd::matvec_q5_1_avx2(data, rows, cols, vec) };
+        }
+    }
+    matvec_q5_1_scalar(data, rows, cols, vec)
+}
+
 // ── Scalar Kernels ───────────────────────────────────────────────────────────
 
 /// Q8_0 matrix-vector multiply (scalar fallback).
@@ -428,8 +578,12 @@ pub(crate) fn matvec_q8_0_scalar(data: &[u8], rows: usize, cols: usize, vec: &[f
 ///   [f16 scale (2 bytes)] [16 bytes of packed nibbles, 2 per byte]
 ///
 /// Nibble values are unsigned (0–15), centered by subtracting 8 → [-8, +7].
+/// The nibbles are split-plane, matching the ggml-anchored
+/// [`super::dequantize::unpack_q4_0_block`]: the low nibble of byte `j` is
+/// element `j` and its high nibble is element `j + 16`, not `2j`/`2j+1`.
 pub(crate) fn matvec_q4_0_scalar(data: &[u8], rows: usize, cols: usize, vec: &[f32]) -> Vec<f32> {
     const BLOCK_ELEMS: usize = 32;
+    const HALF: usize = BLOCK_ELEMS / 2;
     const BLOCK_BYTES: usize = 18; // 2 (f16 scale) + 16 (packed nibbles)
 
     let n_blocks = cols / BLOCK_ELEMS;
@@ -442,15 +596,13 @@ pub(crate) fn matvec_q4_0_scalar(data: &[u8], rows: usize, cols: usize, vec: &[f
             for b in 0..n_blocks {
                 let block = &data[row_start + b * BLOCK_BYTES..];
                 let scale = f16::from_le_bytes([block[0], block[1]]).to_f32();
+                let x = &vec[b * BLOCK_ELEMS..b * BLOCK_ELEMS + BLOCK_ELEMS];
                 let mut block_sum = 0.0f32;
-                for j in 0..BLOCK_ELEMS {
-                    let byte = block[2 + j / 2];
-                    let nibble = if j % 2 == 0 {
-                        (byte & 0x0F) as i32
-                    } else {
-                        ((byte >> 4) & 0x0F) as i32
-                    };
-                    block_sum += (nibble - 8) as f32 * vec[b * BLOCK_ELEMS + j];
+                for j in 0..HALF {
+                    let byte = block[2 + j];
+                    let lo = (byte & 0x0F) as i32 - 8;
+                    let hi = ((byte >> 4) & 0x0F) as i32 - 8;
+                    block_sum += lo as f32 * x[j] + hi as f32 * x[j + HALF];
                 }
                 sum += block_sum * scale;
             }
@@ -729,6 +881,37 @@ fn matvec_iq4_nl_scalar(data: &[u8], rows: usize, cols: usize, vec: &[f32]) -> V
         .collect()
 }
 
+/// Q4_1 matrix-vector multiply (scalar, rayon-parallel over rows).
+///
+/// Block layout (20 bytes per 32 elements): [f16 d] [f16 m] [qs u8×16].
+/// Unpacks each block through the shared, ggml-anchored
+/// [`super::dequantize::unpack_q4_1_block`] — the nibbles are split-plane
+/// (low nibbles are elements 0..16, high nibbles 16..32) and the values are
+/// affine (`q*d + m`), not centered like Q4_0.
+fn matvec_q4_1_scalar(data: &[u8], rows: usize, cols: usize, vec: &[f32]) -> Vec<f32> {
+    const BLOCK_SIZE: usize = 32;
+    const BLOCK_BYTES: usize = 20;
+
+    let n_blocks = cols / BLOCK_SIZE;
+    let bytes_per_row = n_blocks * BLOCK_BYTES;
+
+    par_rows(rows)
+        .map(|r| {
+            let mut acc = 0.0f32;
+            let row = &data[r * bytes_per_row..];
+            let mut buf = [0.0f32; BLOCK_SIZE];
+            for bi in 0..n_blocks {
+                super::dequantize::unpack_q4_1_block(&row[bi * BLOCK_BYTES..], &mut buf);
+                let x = &vec[bi * BLOCK_SIZE..bi * BLOCK_SIZE + BLOCK_SIZE];
+                for (w, xv) in buf.iter().zip(x) {
+                    acc += w * xv;
+                }
+            }
+            acc
+        })
+        .collect()
+}
+
 /// Q5_0 matrix-vector multiply (scalar, rayon-parallel over rows).
 ///
 /// Block layout (22 bytes per 32 elements): [f16 d] [qh u8×4] [qs u8×16].
@@ -814,6 +997,600 @@ fn matvec_fallback(
             sum
         })
         .collect()
+}
+
+// ── Batched kernels ──────────────────────────────────────────────────────────
+//
+// One weight traversal, `B` activation vectors. Each kernel mirrors its
+// single-vector twin above with two changes:
+//
+//   1. the weight block is decoded into `w` **once**, outside the sequence loop
+//      (this is where the throughput comes from — the weights are streamed from
+//      RAM once per step instead of once per sequence);
+//   2. the accumulator is per-sequence, and the sequence loop is innermost so
+//      each sequence still adds its terms in the original order.
+//
+// (2) is what makes a batched step bit-identical to running each sequence on
+// its own: the summation order per output element is untouched, so batching
+// can never change the tokens a request receives.
+//
+// `out` is `[rows, B]` interleaved: `out[row * B + s]` belongs to input `s`.
+
+fn dispatch_q8_0_batch(data: &[u8], rows: usize, cols: usize, inputs: &[&[f32]], out: &mut [f32]) {
+    #[cfg(all(target_arch = "x86_64", feature = "rayon"))]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            // SAFETY: AVX2+FMA verified above; the kernel's buffer-length
+            // contract is the single-vector one applied to every input and is
+            // upheld by the validated tensor descriptor (see `dispatch_q8_0`).
+            unsafe {
+                crate::tensor::simd::matvec_q8_0_batch_avx2(data, rows, cols, inputs, out);
+            }
+            return;
+        }
+    }
+    matvec_q8_0_batch_scalar(data, rows, cols, inputs, out)
+}
+
+fn dispatch_q4_0_batch(data: &[u8], rows: usize, cols: usize, inputs: &[&[f32]], out: &mut [f32]) {
+    #[cfg(all(target_arch = "x86_64", feature = "rayon"))]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            // SAFETY: see `dispatch_q8_0_batch`.
+            unsafe {
+                crate::tensor::simd::matvec_q4_0_batch_avx2(data, rows, cols, inputs, out);
+            }
+            return;
+        }
+    }
+    matvec_q4_0_batch_scalar(data, rows, cols, inputs, out)
+}
+
+/// Scatter one lane's `rows`-length result into the interleaved batch output.
+fn scatter_lane(col: Vec<f32>, s: usize, batch: usize, out: &mut [f32]) {
+    for (i, v) in col.into_iter().enumerate() {
+        out[i * batch + s] = v;
+    }
+}
+
+// Q4_1/Q5_0/Q5_1 have single-vector AVX2 kernels but no batched AVX2
+// counterpart replicating their exact accumulation order. Batching must be
+// invisible — bit-identical to decoding each sequence alone — so on hosts
+// where the single path takes the AVX2 kernel, delegate per lane to that same
+// kernel rather than using a scalar batch kernel with different FP ordering.
+// These are legacy formats; the lost weight-streaming amortization is the
+// correct trade until a batched kernel with matching order exists.
+
+fn dispatch_q4_1_batch(data: &[u8], rows: usize, cols: usize, inputs: &[&[f32]], out: &mut [f32]) {
+    let batch = inputs.len();
+    for (s, input) in inputs.iter().enumerate() {
+        scatter_lane(dispatch_q4_1(data, rows, cols, input), s, batch, out);
+    }
+}
+
+fn dispatch_q5_0_batch(data: &[u8], rows: usize, cols: usize, inputs: &[&[f32]], out: &mut [f32]) {
+    #[cfg(all(target_arch = "x86_64", feature = "rayon"))]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            let batch = inputs.len();
+            for (s, input) in inputs.iter().enumerate() {
+                // SAFETY: AVX2+FMA verified above; kernel length contract
+                // upheld by the validated descriptor (see `dispatch_q8_0`).
+                let col = unsafe { crate::tensor::simd::matvec_q5_0_avx2(data, rows, cols, input) };
+                scatter_lane(col, s, batch, out);
+            }
+            return;
+        }
+    }
+    matvec_q5_0_batch_scalar(data, rows, cols, inputs, out)
+}
+
+fn dispatch_q5_1_batch(data: &[u8], rows: usize, cols: usize, inputs: &[&[f32]], out: &mut [f32]) {
+    #[cfg(all(target_arch = "x86_64", feature = "rayon"))]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            let batch = inputs.len();
+            for (s, input) in inputs.iter().enumerate() {
+                // SAFETY: AVX2+FMA verified above; kernel length contract
+                // upheld by the validated descriptor (see `dispatch_q8_0`).
+                let col = unsafe { crate::tensor::simd::matvec_q5_1_avx2(data, rows, cols, input) };
+                scatter_lane(col, s, batch, out);
+            }
+            return;
+        }
+    }
+    matvec_q5_1_batch_scalar(data, rows, cols, inputs, out)
+}
+
+fn dispatch_q4_k_batch(data: &[u8], rows: usize, cols: usize, inputs: &[&[f32]], out: &mut [f32]) {
+    #[cfg(all(target_arch = "x86_64", feature = "rayon"))]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            // SAFETY: see `dispatch_q8_0_batch`.
+            unsafe {
+                crate::tensor::simd::matvec_q4_k_batch_avx2(data, rows, cols, inputs, out);
+            }
+            return;
+        }
+    }
+    matvec_q4_k_batch_scalar(data, rows, cols, inputs, out)
+}
+
+fn dispatch_q5_k_batch(data: &[u8], rows: usize, cols: usize, inputs: &[&[f32]], out: &mut [f32]) {
+    #[cfg(all(target_arch = "x86_64", feature = "rayon"))]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            // SAFETY: see `dispatch_q8_0_batch`.
+            unsafe {
+                crate::tensor::simd::matvec_q5_k_batch_avx2(data, rows, cols, inputs, out);
+            }
+            return;
+        }
+    }
+    matvec_q5_k_batch_scalar(data, rows, cols, inputs, out)
+}
+
+fn dispatch_q6_k_batch(data: &[u8], rows: usize, cols: usize, inputs: &[&[f32]], out: &mut [f32]) {
+    #[cfg(all(target_arch = "x86_64", feature = "rayon"))]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            // SAFETY: see `dispatch_q8_0_batch`.
+            unsafe {
+                crate::tensor::simd::matvec_q6_k_batch_avx2(data, rows, cols, inputs, out);
+            }
+            return;
+        }
+    }
+    matvec_q6_k_batch_scalar(data, rows, cols, inputs, out)
+}
+
+/// Batched Q8_0 matvec (scalar fallback) — see [`matvec_q8_0_scalar`].
+pub(crate) fn matvec_q8_0_batch_scalar(
+    data: &[u8],
+    rows: usize,
+    cols: usize,
+    inputs: &[&[f32]],
+    out: &mut [f32],
+) {
+    const BLOCK_ELEMS: usize = 32;
+    const BLOCK_BYTES: usize = 34;
+
+    let batch = inputs.len();
+    let n_blocks = cols / BLOCK_ELEMS;
+    let bytes_per_row = n_blocks * BLOCK_BYTES;
+
+    par_out_rows(out, rows, batch)
+        .enumerate()
+        .for_each(|(i, dst)| {
+            for acc in dst.iter_mut() {
+                *acc = 0.0;
+            }
+            let row_start = i * bytes_per_row;
+            let mut w = [0.0f32; BLOCK_ELEMS];
+            for b in 0..n_blocks {
+                let block = &data[row_start + b * BLOCK_BYTES..];
+                let scale = f16::from_le_bytes([block[0], block[1]]).to_f32();
+                for (j, wj) in w.iter_mut().enumerate() {
+                    *wj = (block[2 + j] as i8) as f32;
+                }
+                for (s, input) in inputs.iter().enumerate() {
+                    let x = &input[b * BLOCK_ELEMS..];
+                    let mut block_sum = 0.0f32;
+                    for (j, wj) in w.iter().enumerate() {
+                        block_sum += wj * x[j];
+                    }
+                    dst[s] += block_sum * scale;
+                }
+            }
+        });
+}
+
+/// Batched Q4_0 matvec (scalar fallback) — see [`matvec_q4_0_scalar`].
+pub(crate) fn matvec_q4_0_batch_scalar(
+    data: &[u8],
+    rows: usize,
+    cols: usize,
+    inputs: &[&[f32]],
+    out: &mut [f32],
+) {
+    const BLOCK_ELEMS: usize = 32;
+    const BLOCK_BYTES: usize = 18;
+
+    let batch = inputs.len();
+    let n_blocks = cols / BLOCK_ELEMS;
+    let bytes_per_row = n_blocks * BLOCK_BYTES;
+
+    par_out_rows(out, rows, batch)
+        .enumerate()
+        .for_each(|(i, dst)| {
+            for acc in dst.iter_mut() {
+                *acc = 0.0;
+            }
+            let row_start = i * bytes_per_row;
+            const HALF: usize = BLOCK_ELEMS / 2;
+            let mut lo = [0.0f32; HALF];
+            let mut hi = [0.0f32; HALF];
+            for b in 0..n_blocks {
+                let block = &data[row_start + b * BLOCK_BYTES..];
+                let scale = f16::from_le_bytes([block[0], block[1]]).to_f32();
+                // Split-plane like ggml, and accumulated in the same
+                // `lo*x[j] + hi*x[j+HALF]` order as `matvec_q4_0_scalar` so
+                // batched output stays bit-identical to the single path.
+                for j in 0..HALF {
+                    let byte = block[2 + j];
+                    lo[j] = ((byte & 0x0F) as i32 - 8) as f32;
+                    hi[j] = (((byte >> 4) & 0x0F) as i32 - 8) as f32;
+                }
+                for (s, input) in inputs.iter().enumerate() {
+                    let x = &input[b * BLOCK_ELEMS..];
+                    let mut block_sum = 0.0f32;
+                    for j in 0..HALF {
+                        block_sum += lo[j] * x[j] + hi[j] * x[j + HALF];
+                    }
+                    dst[s] += block_sum * scale;
+                }
+            }
+        });
+}
+
+/// Batched Q4_K matvec (scalar) — see [`matvec_q4_k_scalar`].
+fn matvec_q4_k_batch_scalar(
+    data: &[u8],
+    rows: usize,
+    cols: usize,
+    inputs: &[&[f32]],
+    out: &mut [f32],
+) {
+    const SUPER_BLOCK: usize = 256;
+    const BLOCK_BYTES: usize = 144;
+
+    let batch = inputs.len();
+    let n_super = cols / SUPER_BLOCK;
+    let bytes_per_row = n_super * BLOCK_BYTES;
+
+    par_out_rows(out, rows, batch)
+        .enumerate()
+        .for_each(|(r, dst)| {
+            for acc in dst.iter_mut() {
+                *acc = 0.0;
+            }
+            let row = &data[r * bytes_per_row..];
+            // Weights for one group: 32 low-nibble values then 32 high-nibble ones.
+            let mut w_lo = [0.0f32; 32];
+            let mut w_hi = [0.0f32; 32];
+            for sb in 0..n_super {
+                let b = &row[sb * BLOCK_BYTES..];
+                let d = f16::from_le_bytes([b[0], b[1]]).to_f32();
+                let dmin = f16::from_le_bytes([b[2], b[3]]).to_f32();
+                let scales = &b[4..16];
+                let qs = &b[16..144];
+                let x_base = sb * SUPER_BLOCK;
+                for group in 0..4 {
+                    let (sc0, mn0) = get_scale_min_q4k(group * 2, scales);
+                    let (sc1, mn1) = get_scale_min_q4k(group * 2 + 1, scales);
+                    let d0 = d * sc0 as f32;
+                    let m0 = dmin * mn0 as f32;
+                    let d1 = d * sc1 as f32;
+                    let m1 = dmin * mn1 as f32;
+                    let q_base = group * 32;
+                    for l in 0..32 {
+                        w_lo[l] = (qs[q_base + l] & 0x0F) as f32 * d0 - m0;
+                        w_hi[l] = (qs[q_base + l] >> 4) as f32 * d1 - m1;
+                    }
+                    let x_group = x_base + group * 64;
+                    for (s, input) in inputs.iter().enumerate() {
+                        let acc = &mut dst[s];
+                        for (l, wl) in w_lo.iter().enumerate() {
+                            *acc += wl * input[x_group + l];
+                        }
+                        for (l, wl) in w_hi.iter().enumerate() {
+                            *acc += wl * input[x_group + 32 + l];
+                        }
+                    }
+                }
+            }
+        });
+}
+
+/// Batched Q5_K matvec (scalar) — see [`matvec_q5_k_scalar`].
+fn matvec_q5_k_batch_scalar(
+    data: &[u8],
+    rows: usize,
+    cols: usize,
+    inputs: &[&[f32]],
+    out: &mut [f32],
+) {
+    const SUPER_BLOCK: usize = 256;
+    const BLOCK_BYTES: usize = 176;
+
+    let batch = inputs.len();
+    let n_super = cols / SUPER_BLOCK;
+    let bytes_per_row = n_super * BLOCK_BYTES;
+
+    par_out_rows(out, rows, batch)
+        .enumerate()
+        .for_each(|(r, dst)| {
+            for acc in dst.iter_mut() {
+                *acc = 0.0;
+            }
+            let row = &data[r * bytes_per_row..];
+            let mut w_lo = [0.0f32; 32];
+            let mut w_hi = [0.0f32; 32];
+            for sb in 0..n_super {
+                let b = &row[sb * BLOCK_BYTES..];
+                let d = f16::from_le_bytes([b[0], b[1]]).to_f32();
+                let dmin = f16::from_le_bytes([b[2], b[3]]).to_f32();
+                let scales = &b[4..16];
+                let qh = &b[16..48];
+                let qs = &b[48..176];
+                let x_base = sb * SUPER_BLOCK;
+                for group in 0..4 {
+                    let (sc0, mn0) = get_scale_min_q4k(group * 2, scales);
+                    let (sc1, mn1) = get_scale_min_q4k(group * 2 + 1, scales);
+                    let d0 = d * sc0 as f32;
+                    let m0 = dmin * mn0 as f32;
+                    let d1 = d * sc1 as f32;
+                    let m1 = dmin * mn1 as f32;
+                    let q_base = group * 32;
+                    let u1: u8 = 1 << (group * 2);
+                    let u2: u8 = 2 << (group * 2);
+                    for l in 0..32 {
+                        let lo = (qs[q_base + l] & 0x0F) as f32;
+                        let hi = if qh[l] & u1 != 0 { 16.0 } else { 0.0 };
+                        w_lo[l] = d0 * (lo + hi) - m0;
+                        let lo = (qs[q_base + l] >> 4) as f32;
+                        let hi = if qh[l] & u2 != 0 { 16.0 } else { 0.0 };
+                        w_hi[l] = d1 * (lo + hi) - m1;
+                    }
+                    let x_group = x_base + group * 64;
+                    for (s, input) in inputs.iter().enumerate() {
+                        let acc = &mut dst[s];
+                        for (l, wl) in w_lo.iter().enumerate() {
+                            *acc += wl * input[x_group + l];
+                        }
+                        for (l, wl) in w_hi.iter().enumerate() {
+                            *acc += wl * input[x_group + 32 + l];
+                        }
+                    }
+                }
+            }
+        });
+}
+
+/// Batched Q6_K matvec (scalar) — see [`matvec_q6_k_scalar`].
+///
+/// The single-vector kernel visits four non-contiguous input offsets per `l`
+/// (`l`, `l+32`, `l+64`, `l+96`), so the batched form decodes all four weights
+/// for an `l` before the sequence loop and keeps that same four-add order.
+fn matvec_q6_k_batch_scalar(
+    data: &[u8],
+    rows: usize,
+    cols: usize,
+    inputs: &[&[f32]],
+    out: &mut [f32],
+) {
+    const SUPER_BLOCK: usize = 256;
+    const BLOCK_BYTES: usize = 210;
+
+    let batch = inputs.len();
+    let n_super = cols / SUPER_BLOCK;
+    let bytes_per_row = n_super * BLOCK_BYTES;
+
+    par_out_rows(out, rows, batch)
+        .enumerate()
+        .for_each(|(r, dst)| {
+            for acc in dst.iter_mut() {
+                *acc = 0.0;
+            }
+            let row = &data[r * bytes_per_row..];
+            // [l][0..4] — the four weights element `l` of this group contributes.
+            let mut w = [[0.0f32; 4]; 32];
+            for sb in 0..n_super {
+                let b = &row[sb * BLOCK_BYTES..];
+                let ql = &b[0..128];
+                let qh = &b[128..192];
+                let sc_raw = &b[192..208];
+                let d = f16::from_le_bytes([b[208], b[209]]).to_f32();
+                let x_base = sb * SUPER_BLOCK;
+                for group in 0..2 {
+                    let ql_off = group * 64;
+                    let qh_off = group * 32;
+                    let sc_off = group * 8;
+                    let x_group = x_base + group * 128;
+                    for (l, wl) in w.iter_mut().enumerate() {
+                        let is = l / 16;
+                        let qhl = qh[qh_off + l];
+                        let v1 = (ql[ql_off + l] & 0x0F) | ((qhl & 0x03) << 4);
+                        let v2 = (ql[ql_off + l + 32] & 0x0F) | (((qhl >> 2) & 0x03) << 4);
+                        let v3 = (ql[ql_off + l] >> 4) | (((qhl >> 4) & 0x03) << 4);
+                        let v4 = (ql[ql_off + l + 32] >> 4) | (((qhl >> 6) & 0x03) << 4);
+                        let sc0 = sc_raw[sc_off + is] as i8 as f32;
+                        let sc2 = sc_raw[sc_off + is + 2] as i8 as f32;
+                        let sc4 = sc_raw[sc_off + is + 4] as i8 as f32;
+                        let sc6 = sc_raw[sc_off + is + 6] as i8 as f32;
+                        wl[0] = d * sc0 * (v1 as i32 - 32) as f32;
+                        wl[1] = d * sc2 * (v2 as i32 - 32) as f32;
+                        wl[2] = d * sc4 * (v3 as i32 - 32) as f32;
+                        wl[3] = d * sc6 * (v4 as i32 - 32) as f32;
+                    }
+                    for (s, input) in inputs.iter().enumerate() {
+                        let acc = &mut dst[s];
+                        for (l, wl) in w.iter().enumerate() {
+                            *acc += wl[0] * input[x_group + l];
+                            *acc += wl[1] * input[x_group + l + 32];
+                            *acc += wl[2] * input[x_group + l + 64];
+                            *acc += wl[3] * input[x_group + l + 96];
+                        }
+                    }
+                }
+            }
+        });
+}
+
+/// Batched matvec for the formats whose kernel unpacks a whole block into f32
+/// before the dot product (Q2_K, Q3_K, IQ4_NL, Q5_0, Q5_1).
+///
+/// `N` is the block's element count and `unpack` the shared, ggml-anchored
+/// block decoder — the same one the single-vector kernel uses, so the weights
+/// are identical and only the traversal is shared.
+fn matvec_unpack_batch_scalar<const N: usize>(
+    data: &[u8],
+    rows: usize,
+    cols: usize,
+    block_bytes: usize,
+    unpack: impl Fn(&[u8], &mut [f32; N]) + Sync,
+    inputs: &[&[f32]],
+    out: &mut [f32],
+) {
+    let batch = inputs.len();
+    let n_blocks = cols / N;
+    let bytes_per_row = n_blocks * block_bytes;
+
+    par_out_rows(out, rows, batch)
+        .enumerate()
+        .for_each(|(r, dst)| {
+            for acc in dst.iter_mut() {
+                *acc = 0.0;
+            }
+            let row = &data[r * bytes_per_row..];
+            let mut buf = [0.0f32; N];
+            for bi in 0..n_blocks {
+                unpack(&row[bi * block_bytes..], &mut buf);
+                for (s, input) in inputs.iter().enumerate() {
+                    let x = &input[bi * N..bi * N + N];
+                    let acc = &mut dst[s];
+                    for (w, xv) in buf.iter().zip(x) {
+                        *acc += w * xv;
+                    }
+                }
+            }
+        });
+}
+
+/// Batched Q2_K matvec (scalar) — see [`matvec_q2_k_scalar`].
+fn matvec_q2_k_batch_scalar(
+    data: &[u8],
+    rows: usize,
+    cols: usize,
+    inputs: &[&[f32]],
+    out: &mut [f32],
+) {
+    matvec_unpack_batch_scalar::<256>(
+        data,
+        rows,
+        cols,
+        84,
+        super::dequantize::unpack_q2_k_block,
+        inputs,
+        out,
+    )
+}
+
+/// Batched Q3_K matvec (scalar) — see [`matvec_q3_k_scalar`].
+fn matvec_q3_k_batch_scalar(
+    data: &[u8],
+    rows: usize,
+    cols: usize,
+    inputs: &[&[f32]],
+    out: &mut [f32],
+) {
+    matvec_unpack_batch_scalar::<256>(
+        data,
+        rows,
+        cols,
+        110,
+        super::dequantize::unpack_q3_k_block,
+        inputs,
+        out,
+    )
+}
+
+/// Batched IQ4_NL matvec (scalar) — see [`matvec_iq4_nl_scalar`].
+fn matvec_iq4_nl_batch_scalar(
+    data: &[u8],
+    rows: usize,
+    cols: usize,
+    inputs: &[&[f32]],
+    out: &mut [f32],
+) {
+    matvec_unpack_batch_scalar::<32>(
+        data,
+        rows,
+        cols,
+        18,
+        super::dequantize::unpack_iq4_nl_block,
+        inputs,
+        out,
+    )
+}
+
+/// Batched Q5_0 matvec (scalar) — see [`matvec_q5_0_scalar`].
+fn matvec_q5_0_batch_scalar(
+    data: &[u8],
+    rows: usize,
+    cols: usize,
+    inputs: &[&[f32]],
+    out: &mut [f32],
+) {
+    matvec_unpack_batch_scalar::<32>(
+        data,
+        rows,
+        cols,
+        22,
+        super::dequantize::unpack_q5_0_block,
+        inputs,
+        out,
+    )
+}
+
+/// Batched Q5_1 matvec (scalar) — see [`matvec_q5_1_scalar`].
+fn matvec_q5_1_batch_scalar(
+    data: &[u8],
+    rows: usize,
+    cols: usize,
+    inputs: &[&[f32]],
+    out: &mut [f32],
+) {
+    matvec_unpack_batch_scalar::<32>(
+        data,
+        rows,
+        cols,
+        24,
+        super::dequantize::unpack_q5_1_block,
+        inputs,
+        out,
+    )
+}
+
+/// Batched fallback matvec — dequantize each row once, dot it against every
+/// input. See [`matvec_fallback`].
+fn matvec_fallback_batch(
+    data: &[u8],
+    ggml_type: GgmlType,
+    rows: usize,
+    cols: usize,
+    inputs: &[&[f32]],
+    out: &mut [f32],
+) {
+    let batch = inputs.len();
+    let block_size = ggml_type.block_size();
+    let type_size = ggml_type.type_size();
+    let n_blocks = cols.div_ceil(block_size);
+    let bytes_per_row = n_blocks * type_size;
+
+    par_out_rows(out, rows, batch)
+        .enumerate()
+        .for_each(|(i, dst)| {
+            let row_bytes = &data[i * bytes_per_row..(i + 1) * bytes_per_row];
+            let row_f32 = dequantize(row_bytes, ggml_type, cols);
+            for (s, input) in inputs.iter().enumerate() {
+                let mut sum = 0.0f32;
+                for j in 0..cols {
+                    sum += row_f32[j] * input[j];
+                }
+                dst[s] = sum;
+            }
+        });
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -1372,6 +2149,169 @@ mod tests {
         );
     }
 
+    /// One 32-element block: `[f16 header…] [16 × qs_byte]`.
+    fn block_with_nibbles(header: &[[u8; 2]], qs_byte: u8) -> Vec<u8> {
+        let mut data: Vec<u8> = header.iter().flatten().copied().collect();
+        data.extend(std::iter::repeat_n(qs_byte, 16));
+        data
+    }
+
+    /// Input that differs between the two nibble planes, so a kernel that read
+    /// the nibbles interleaved instead of split-plane would score differently.
+    fn split_plane_probe() -> Vec<f32> {
+        (0..32).map(|i| if i < 16 { 1.0 } else { 2.0 }).collect()
+    }
+
+    /// Q4_1: verify scalar kernel matches dequantize-then-dot.
+    ///
+    /// d=1, m=0.5, every qs byte 0xA3 → elements 0..16 are 3*1+0.5 = 3.5 and
+    /// elements 16..32 are 10*1+0.5 = 10.5.
+    /// Expected = 16 × 3.5 × 1 + 16 × 10.5 × 2 = 56 + 336 = 392.
+    #[test]
+    fn test_q4_1_matvec_matches_dequantize() {
+        use crate::model::gguf::GgmlType;
+        use crate::tensor::dequantize::dequantize;
+
+        let block = block_with_nibbles(
+            &[
+                half::f16::from_f32(1.0).to_le_bytes(),
+                half::f16::from_f32(0.5).to_le_bytes(),
+            ],
+            0xA3,
+        );
+        let input = split_plane_probe();
+
+        let deq = dequantize(&block, GgmlType::Q4_1, 32);
+        let expected: f32 = deq.iter().zip(&input).map(|(a, b)| a * b).sum();
+
+        let result = matvec_q4_1_scalar(&block, 1, 32, &input);
+        assert!(
+            (result[0] - expected).abs() < 1e-3,
+            "Q4_1 matvec: got {}, expected {}",
+            result[0],
+            expected
+        );
+        assert!(
+            (result[0] - 392.0).abs() < 1e-3,
+            "Q4_1 expected 392.0, got {}",
+            result[0]
+        );
+    }
+
+    /// Q5_0: verify scalar kernel matches dequantize-then-dot.
+    ///
+    /// d=1, qs bytes 0xA3, qh=0x0001_0000 → only bit 16 is set, which is the
+    /// 5th bit of element 16 (the first of the high-nibble plane):
+    ///   elements 0..16:  3 − 16       = −13, × 1 → −208
+    ///   element 16:      (10|16) − 16 =  10, × 2 →   20
+    ///   elements 17..32: 10 − 16      =  −6, × 2 → −180
+    /// Expected = −368.
+    #[test]
+    fn test_q5_0_matvec_matches_dequantize() {
+        use crate::model::gguf::GgmlType;
+        use crate::tensor::dequantize::dequantize;
+
+        let qh = 0x0001_0000u32.to_le_bytes();
+        let block = block_with_nibbles(
+            &[
+                half::f16::from_f32(1.0).to_le_bytes(),
+                [qh[0], qh[1]],
+                [qh[2], qh[3]],
+            ],
+            0xA3,
+        );
+        let input = split_plane_probe();
+
+        let deq = dequantize(&block, GgmlType::Q5_0, 32);
+        let expected: f32 = deq.iter().zip(&input).map(|(a, b)| a * b).sum();
+
+        let result = matvec_q5_0_scalar(&block, 1, 32, &input);
+        assert!(
+            (result[0] - expected).abs() < 1e-3,
+            "Q5_0 matvec: got {}, expected {}",
+            result[0],
+            expected
+        );
+        assert!(
+            (result[0] - (-368.0_f32)).abs() < 1e-3,
+            "Q5_0 expected -368.0, got {}",
+            result[0]
+        );
+    }
+
+    /// Q5_1: verify scalar kernel matches dequantize-then-dot.
+    ///
+    /// Same quants as `test_q5_0_matvec_matches_dequantize` but affine with
+    /// d=1, m=0.5 and no centering:
+    ///   elements 0..16:   3 + 0.5 =  3.5, × 1 →  56
+    ///   element 16:      26 + 0.5 = 26.5, × 2 →  53
+    ///   elements 17..32: 10 + 0.5 = 10.5, × 2 → 315
+    /// Expected = 424.
+    #[test]
+    fn test_q5_1_matvec_matches_dequantize() {
+        use crate::model::gguf::GgmlType;
+        use crate::tensor::dequantize::dequantize;
+
+        let qh = 0x0001_0000u32.to_le_bytes();
+        let block = block_with_nibbles(
+            &[
+                half::f16::from_f32(1.0).to_le_bytes(),
+                half::f16::from_f32(0.5).to_le_bytes(),
+                [qh[0], qh[1]],
+                [qh[2], qh[3]],
+            ],
+            0xA3,
+        );
+        let input = split_plane_probe();
+
+        let deq = dequantize(&block, GgmlType::Q5_1, 32);
+        let expected: f32 = deq.iter().zip(&input).map(|(a, b)| a * b).sum();
+
+        let result = matvec_q5_1_scalar(&block, 1, 32, &input);
+        assert!(
+            (result[0] - expected).abs() < 1e-3,
+            "Q5_1 matvec: got {}, expected {}",
+            result[0],
+            expected
+        );
+        assert!(
+            (result[0] - 424.0).abs() < 1e-3,
+            "Q5_1 expected 424.0, got {}",
+            result[0]
+        );
+    }
+
+    /// Q4_0: verify the scalar kernel matches dequantize-then-dot.
+    ///
+    /// This ties `matvec_q4_0_scalar` to `unpack_q4_0_block`, which is itself
+    /// anchored to ggml by
+    /// `dequantize::ggml_reference_tests::q4_0_matches_ggml_reference`. A
+    /// distinct input per element means a within-block nibble permutation
+    /// (the pre-fix interleaved reading) changes the dot product.
+    #[test]
+    fn test_q4_0_matvec_matches_dequantize() {
+        use crate::model::gguf::GgmlType;
+        use crate::tensor::dequantize::dequantize;
+
+        let mut block = vec![0u8; 18];
+        block[0..2].copy_from_slice(&half::f16::from_f32(0.5).to_le_bytes());
+        for j in 0..16 {
+            block[2 + j] = ((j * 37 + 11) & 0xFF) as u8;
+        }
+
+        let input: Vec<f32> = (0..32).map(|i| 1.0 + i as f32).collect();
+        let deq = dequantize(&block, GgmlType::Q4_0, 32);
+        let expected: f32 = deq.iter().zip(&input).map(|(a, b)| a * b).sum();
+
+        let result = matvec_q4_0_scalar(&block, 1, 32, &input);
+        assert!(
+            (result[0] - expected).abs() < 1e-3,
+            "Q4_0 matvec: got {}, expected {}",
+            result[0],
+            expected
+        );
+    }
+
     /// Verify SIMD and scalar Q4_0 kernels produce the same output.
     #[test]
     fn test_q4_0_simd_matches_scalar() {
@@ -1408,6 +2348,410 @@ mod tests {
                         simd[i]
                     );
                 }
+            }
+        }
+    }
+
+    /// Assert two kernels agree row-by-row.
+    #[cfg(all(target_arch = "x86_64", feature = "rayon"))]
+    fn assert_rows_close(fmt: &str, scalar: &[f32], simd: &[f32]) {
+        for (i, (&s, &v)) in scalar.iter().zip(simd).enumerate() {
+            assert!((s - v).abs() < 1e-3, "{fmt} row {i}: scalar={s}, simd={v}");
+        }
+    }
+
+    /// Deterministic nibble bytes for one block.
+    fn nibble_bytes(seed: usize) -> Vec<u8> {
+        (0..16).map(|j| (seed + j * 7 + 5) as u8).collect()
+    }
+
+    /// Input spanning both signs so sign errors in the kernels show up.
+    fn simd_probe_input(cols: usize) -> Vec<f32> {
+        (0..cols).map(|i| (i as f32) * 0.05 - 1.6).collect()
+    }
+
+    /// Verify SIMD and scalar Q4_1 kernels produce the same output.
+    /// Two blocks per row exercises cross-block accumulation.
+    #[test]
+    fn test_q4_1_simd_matches_scalar() {
+        let rows = 3;
+        let cols = 64;
+        let mut data = Vec::new();
+        for r in 0..rows {
+            for b in 0..2usize {
+                data.extend_from_slice(&half::f16::from_f32(0.25 * (r + 1) as f32).to_le_bytes());
+                data.extend_from_slice(&half::f16::from_f32(-0.5 + 0.125 * b as f32).to_le_bytes());
+                data.extend(nibble_bytes(r * 37 + b * 13));
+            }
+        }
+
+        let input = simd_probe_input(cols);
+        let scalar = matvec_q4_1_scalar(&data, rows, cols, &input);
+
+        #[cfg(all(target_arch = "x86_64", feature = "rayon"))]
+        {
+            if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                let simd =
+                    unsafe { crate::tensor::simd::matvec_q4_1_avx2(&data, rows, cols, &input) };
+                assert_rows_close("Q4_1", &scalar, &simd);
+            }
+        }
+    }
+
+    /// Verify SIMD and scalar Q5_0 kernels produce the same output.
+    /// The `qh` words vary per block so both 5th-bit planes are exercised.
+    #[test]
+    fn test_q5_0_simd_matches_scalar() {
+        let rows = 3;
+        let cols = 64;
+        let mut data = Vec::new();
+        for r in 0..rows {
+            for b in 0..2usize {
+                data.extend_from_slice(&half::f16::from_f32(0.25 * (r + 1) as f32).to_le_bytes());
+                data.extend_from_slice(
+                    &(0x9E3F_1C05u32 ^ ((r * 2 + b) as u32 * 0x0101_1011)).to_le_bytes(),
+                );
+                data.extend(nibble_bytes(r * 37 + b * 13));
+            }
+        }
+
+        let input = simd_probe_input(cols);
+        let scalar = matvec_q5_0_scalar(&data, rows, cols, &input);
+
+        #[cfg(all(target_arch = "x86_64", feature = "rayon"))]
+        {
+            if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                let simd =
+                    unsafe { crate::tensor::simd::matvec_q5_0_avx2(&data, rows, cols, &input) };
+                assert_rows_close("Q5_0", &scalar, &simd);
+            }
+        }
+    }
+
+    /// Verify SIMD and scalar Q5_1 kernels produce the same output.
+    #[test]
+    fn test_q5_1_simd_matches_scalar() {
+        let rows = 3;
+        let cols = 64;
+        let mut data = Vec::new();
+        for r in 0..rows {
+            for b in 0..2usize {
+                data.extend_from_slice(&half::f16::from_f32(0.25 * (r + 1) as f32).to_le_bytes());
+                data.extend_from_slice(&half::f16::from_f32(-0.5 + 0.125 * b as f32).to_le_bytes());
+                data.extend_from_slice(
+                    &(0x9E3F_1C05u32 ^ ((r * 2 + b) as u32 * 0x0101_1011)).to_le_bytes(),
+                );
+                data.extend(nibble_bytes(r * 37 + b * 13));
+            }
+        }
+
+        let input = simd_probe_input(cols);
+        let scalar = matvec_q5_1_scalar(&data, rows, cols, &input);
+
+        #[cfg(all(target_arch = "x86_64", feature = "rayon"))]
+        {
+            if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                let simd =
+                    unsafe { crate::tensor::simd::matvec_q5_1_avx2(&data, rows, cols, &input) };
+                assert_rows_close("Q5_1", &scalar, &simd);
+            }
+        }
+    }
+
+    // ── Batched matvec ───────────────────────────────────────────────────
+    //
+    // Continuous batching runs `B` sequences through one weight traversal.
+    // That is only safe if it is *invisible*: a request must produce the same
+    // tokens whether it was decoded alone or alongside seven others. These
+    // tests pin bit-identity — not a tolerance — between `matvec_batch` and
+    // `matvec`, for every format and on whichever kernel the host dispatches
+    // to (AVX2 or scalar), plus scalar-vs-scalar directly.
+
+    /// Build a `rows × cols` matrix of `ty` with a deterministic byte pattern
+    /// and finite f16 scale fields (arbitrary bytes could encode NaN/Inf
+    /// scales, which would make bit-equality assertions meaningless).
+    fn patterned_matrix(rows: usize, cols: usize, ty: GgmlType) -> Vec<u8> {
+        let block_size = ty.block_size();
+        let type_size = ty.type_size();
+        let n_blocks = cols / block_size;
+        let mut data = vec![0u8; rows * n_blocks * type_size];
+        for (i, byte) in data.iter_mut().enumerate() {
+            *byte = ((i * 37 + 11) % 251) as u8;
+        }
+        let f16b = |v: f32| f16::from_f32(v).to_le_bytes();
+        for blk in 0..rows * n_blocks {
+            let off = blk * type_size;
+            let d = 0.05 + 0.01 * ((blk % 7) as f32);
+            let put = |data: &mut Vec<u8>, at: usize, v: f32| {
+                data[off + at..off + at + 2].copy_from_slice(&f16b(v));
+            };
+            match ty {
+                GgmlType::Q8_0 | GgmlType::Q4_0 | GgmlType::IQ4NL | GgmlType::Q5_0 => {
+                    put(&mut data, 0, d)
+                }
+                GgmlType::Q4_1 | GgmlType::Q5_1 => {
+                    put(&mut data, 0, d);
+                    put(&mut data, 2, -0.02);
+                }
+                GgmlType::Q4K | GgmlType::Q5K => {
+                    put(&mut data, 0, d);
+                    put(&mut data, 2, 0.01);
+                }
+                GgmlType::Q6K => put(&mut data, 208, d),
+                GgmlType::Q2K => {
+                    put(&mut data, 80, d);
+                    put(&mut data, 82, 0.01);
+                }
+                GgmlType::Q3K => put(&mut data, 108, d),
+                _ => {}
+            }
+        }
+        data
+    }
+
+    /// `B` deterministic, mutually distinct activation vectors.
+    fn batch_inputs(batch: usize, cols: usize) -> Vec<Vec<f32>> {
+        (0..batch)
+            .map(|s| {
+                (0..cols)
+                    .map(|i| (((i + s * 13) % 17) as f32) * 0.1 - 0.8)
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Assert `matvec_batch` is bit-identical to `matvec` per input, for each
+    /// requested batch size. 17 exceeds the SIMD kernels' lane cap, so it also
+    /// covers the lane-chunking path.
+    fn assert_batch_matches_single(qt: &QuantizedTensor, label: &str) {
+        for &batch in &[1usize, 2, 3, 4, 17] {
+            let inputs = batch_inputs(batch, qt.cols());
+            let refs: Vec<&[f32]> = inputs.iter().map(|v| v.as_slice()).collect();
+            let batched = qt.matvec_batch(&refs);
+            for (s, r) in refs.iter().enumerate() {
+                let single = qt.matvec(r);
+                for (i, (&a, &b)) in single.data().iter().zip(batched[s].data()).enumerate() {
+                    assert_eq!(
+                        a.to_bits(),
+                        b.to_bits(),
+                        "{label} batch={batch} seq={s} row={i}: single={a}, batched={b}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn batched_matvec_is_bit_identical_q8_0() {
+        let data = patterned_matrix(6, 64, GgmlType::Q8_0);
+        let qt = QuantizedTensor::from_raw(data, 6, 64, GgmlType::Q8_0);
+        assert_batch_matches_single(&qt, "Q8_0");
+    }
+
+    #[test]
+    fn batched_matvec_is_bit_identical_q4_0() {
+        let data = patterned_matrix(6, 64, GgmlType::Q4_0);
+        let qt = QuantizedTensor::from_raw(data, 6, 64, GgmlType::Q4_0);
+        assert_batch_matches_single(&qt, "Q4_0");
+    }
+
+    #[test]
+    fn batched_matvec_is_bit_identical_q4_k() {
+        let data = patterned_matrix(3, 512, GgmlType::Q4K);
+        let qt = QuantizedTensor::from_raw(data, 3, 512, GgmlType::Q4K);
+        assert_batch_matches_single(&qt, "Q4_K");
+    }
+
+    #[test]
+    fn batched_matvec_is_bit_identical_q5_k() {
+        let data = patterned_matrix(3, 512, GgmlType::Q5K);
+        let qt = QuantizedTensor::from_raw(data, 3, 512, GgmlType::Q5K);
+        assert_batch_matches_single(&qt, "Q5_K");
+    }
+
+    #[test]
+    fn batched_matvec_is_bit_identical_q6_k() {
+        let data = patterned_matrix(3, 512, GgmlType::Q6K);
+        let qt = QuantizedTensor::from_raw(data, 3, 512, GgmlType::Q6K);
+        assert_batch_matches_single(&qt, "Q6_K");
+    }
+
+    #[test]
+    fn batched_matvec_is_bit_identical_q2_k_q3_k() {
+        let q2 = QuantizedTensor::from_raw(
+            patterned_matrix(2, 256, GgmlType::Q2K),
+            2,
+            256,
+            GgmlType::Q2K,
+        );
+        assert_batch_matches_single(&q2, "Q2_K");
+        let q3 = QuantizedTensor::from_raw(
+            patterned_matrix(2, 256, GgmlType::Q3K),
+            2,
+            256,
+            GgmlType::Q3K,
+        );
+        assert_batch_matches_single(&q3, "Q3_K");
+    }
+
+    #[test]
+    fn batched_matvec_is_bit_identical_iq4_nl_and_q5_variants() {
+        for ty in [
+            GgmlType::IQ4NL,
+            GgmlType::Q4_1,
+            GgmlType::Q5_0,
+            GgmlType::Q5_1,
+        ] {
+            let qt = QuantizedTensor::from_raw(patterned_matrix(4, 64, ty), 4, 64, ty);
+            assert_batch_matches_single(&qt, &format!("{ty:?}"));
+        }
+    }
+
+    /// F32 weights take the dequantize-then-dot fallback, which the tiny test
+    /// model (and any un-quantized tensor) uses.
+    #[test]
+    fn batched_matvec_is_bit_identical_f32_fallback() {
+        let values: Vec<f32> = (0..40).map(|i| i as f32 * 0.07 - 1.3).collect();
+        let qt = QuantizedTensor::from_f32(&values, 5, 8);
+        assert_batch_matches_single(&qt, "F32");
+    }
+
+    /// The scalar batch kernels are the portable reference (non-x86 hosts, and
+    /// x86 hosts without AVX2 land here), so pin them against the scalar
+    /// single-vector kernels directly rather than only through dispatch.
+    #[test]
+    fn scalar_batch_kernels_match_scalar_single() {
+        let batch = 3;
+        let cases: Vec<(&str, GgmlType, usize, usize)> = vec![
+            ("Q8_0", GgmlType::Q8_0, 4, 64),
+            ("Q4_0", GgmlType::Q4_0, 4, 64),
+            ("Q4_K", GgmlType::Q4K, 2, 512),
+            ("Q5_K", GgmlType::Q5K, 2, 512),
+            ("Q6_K", GgmlType::Q6K, 2, 512),
+            ("Q2_K", GgmlType::Q2K, 2, 256),
+            ("Q3_K", GgmlType::Q3K, 2, 256),
+            ("IQ4_NL", GgmlType::IQ4NL, 3, 64),
+            ("Q5_0", GgmlType::Q5_0, 3, 64),
+            ("Q5_1", GgmlType::Q5_1, 3, 64),
+        ];
+        for (label, ty, rows, cols) in cases {
+            let data = patterned_matrix(rows, cols, ty);
+            let inputs = batch_inputs(batch, cols);
+            let refs: Vec<&[f32]> = inputs.iter().map(|v| v.as_slice()).collect();
+
+            let mut batched = vec![0.0f32; rows * batch];
+            match ty {
+                GgmlType::Q8_0 => matvec_q8_0_batch_scalar(&data, rows, cols, &refs, &mut batched),
+                GgmlType::Q4_0 => matvec_q4_0_batch_scalar(&data, rows, cols, &refs, &mut batched),
+                GgmlType::Q4K => matvec_q4_k_batch_scalar(&data, rows, cols, &refs, &mut batched),
+                GgmlType::Q5K => matvec_q5_k_batch_scalar(&data, rows, cols, &refs, &mut batched),
+                GgmlType::Q6K => matvec_q6_k_batch_scalar(&data, rows, cols, &refs, &mut batched),
+                GgmlType::Q2K => matvec_q2_k_batch_scalar(&data, rows, cols, &refs, &mut batched),
+                GgmlType::Q3K => matvec_q3_k_batch_scalar(&data, rows, cols, &refs, &mut batched),
+                GgmlType::IQ4NL => {
+                    matvec_iq4_nl_batch_scalar(&data, rows, cols, &refs, &mut batched)
+                }
+                GgmlType::Q5_0 => matvec_q5_0_batch_scalar(&data, rows, cols, &refs, &mut batched),
+                GgmlType::Q5_1 => matvec_q5_1_batch_scalar(&data, rows, cols, &refs, &mut batched),
+                _ => unreachable!(),
+            }
+
+            for (s, r) in refs.iter().enumerate() {
+                let single = match ty {
+                    GgmlType::Q8_0 => matvec_q8_0_scalar(&data, rows, cols, r),
+                    GgmlType::Q4_0 => matvec_q4_0_scalar(&data, rows, cols, r),
+                    GgmlType::Q4K => matvec_q4_k_scalar(&data, rows, cols, r),
+                    GgmlType::Q5K => matvec_q5_k_scalar(&data, rows, cols, r),
+                    GgmlType::Q6K => matvec_q6_k_scalar(&data, rows, cols, r),
+                    GgmlType::Q2K => matvec_q2_k_scalar(&data, rows, cols, r),
+                    GgmlType::Q3K => matvec_q3_k_scalar(&data, rows, cols, r),
+                    GgmlType::IQ4NL => matvec_iq4_nl_scalar(&data, rows, cols, r),
+                    GgmlType::Q5_0 => matvec_q5_0_scalar(&data, rows, cols, r),
+                    GgmlType::Q5_1 => matvec_q5_1_scalar(&data, rows, cols, r),
+                    _ => unreachable!(),
+                };
+                for (i, &expected) in single.iter().enumerate() {
+                    let got = batched[i * batch + s];
+                    assert_eq!(
+                        expected.to_bits(),
+                        got.to_bits(),
+                        "{label} seq={s} row={i}: scalar={expected}, scalar-batch={got}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// On an AVX2 host the batched SIMD kernels are what the engine actually
+    /// runs; hold them to the scalar batch reference.
+    #[test]
+    #[cfg(all(target_arch = "x86_64", feature = "rayon"))]
+    fn simd_batch_kernels_match_scalar_batch() {
+        if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
+            return;
+        }
+        let batch = 5;
+        let cases: Vec<(&str, GgmlType, usize, usize)> = vec![
+            ("Q8_0", GgmlType::Q8_0, 4, 64),
+            ("Q4_0", GgmlType::Q4_0, 4, 64),
+            ("Q4_K", GgmlType::Q4K, 2, 512),
+            ("Q5_K", GgmlType::Q5K, 2, 512),
+            ("Q6_K", GgmlType::Q6K, 2, 512),
+        ];
+        for (label, ty, rows, cols) in cases {
+            let data = patterned_matrix(rows, cols, ty);
+            let inputs = batch_inputs(batch, cols);
+            let refs: Vec<&[f32]> = inputs.iter().map(|v| v.as_slice()).collect();
+
+            let mut scalar = vec![0.0f32; rows * batch];
+            let mut simd = vec![0.0f32; rows * batch];
+            // SAFETY: AVX2+FMA detected above; `patterned_matrix` sizes the
+            // buffer to rows × (cols / block) blocks and every input is `cols`
+            // long, satisfying the kernels' length contract.
+            unsafe {
+                match ty {
+                    GgmlType::Q8_0 => {
+                        matvec_q8_0_batch_scalar(&data, rows, cols, &refs, &mut scalar);
+                        crate::tensor::simd::matvec_q8_0_batch_avx2(
+                            &data, rows, cols, &refs, &mut simd,
+                        );
+                    }
+                    GgmlType::Q4_0 => {
+                        matvec_q4_0_batch_scalar(&data, rows, cols, &refs, &mut scalar);
+                        crate::tensor::simd::matvec_q4_0_batch_avx2(
+                            &data, rows, cols, &refs, &mut simd,
+                        );
+                    }
+                    GgmlType::Q4K => {
+                        matvec_q4_k_batch_scalar(&data, rows, cols, &refs, &mut scalar);
+                        crate::tensor::simd::matvec_q4_k_batch_avx2(
+                            &data, rows, cols, &refs, &mut simd,
+                        );
+                    }
+                    GgmlType::Q5K => {
+                        matvec_q5_k_batch_scalar(&data, rows, cols, &refs, &mut scalar);
+                        crate::tensor::simd::matvec_q5_k_batch_avx2(
+                            &data, rows, cols, &refs, &mut simd,
+                        );
+                    }
+                    GgmlType::Q6K => {
+                        matvec_q6_k_batch_scalar(&data, rows, cols, &refs, &mut scalar);
+                        crate::tensor::simd::matvec_q6_k_batch_avx2(
+                            &data, rows, cols, &refs, &mut simd,
+                        );
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            // Scalar and SIMD sum in different orders (the SIMD kernels keep
+            // 8 partial lanes), so this is the usual relative tolerance the
+            // single-vector SIMD tests use — not the bit-equality the
+            // batch-vs-single tests above demand.
+            for (i, (&a, &b)) in scalar.iter().zip(&simd).enumerate() {
+                assert!(
+                    (a - b).abs() <= 1e-5 * a.abs().max(1.0),
+                    "{label} index {i}: scalar-batch={a}, simd-batch={b}"
+                );
             }
         }
     }

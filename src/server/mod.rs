@@ -19,7 +19,7 @@ mod routes;
 mod state;
 mod types;
 
-pub use engine::{EngineLimits, InferenceEngine, SubmitError};
+pub use engine::{EngineKvStats, EngineLimits, InferenceEngine, SubmitError};
 pub use metrics::Metrics;
 pub use state::AppState;
 

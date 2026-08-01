@@ -76,6 +76,28 @@ curl http://localhost:8080/v1/metrics
 }
 ```
 
+Two further objects appear **only when the corresponding feature is enabled**;
+everything above is always present.
+
+- `kv_pool` — with `--kv-cache paged`: `capacity`, `live`, `peak_live`, `pooled`
+  page counts for the shared [page pool](./kv-cache.md#pagedkvcache-paged-f32).
+- `prefix_cache` — with `--prefix-cache`: `hits`, `misses`, `evictions`,
+  `tokens_reused`, `entries`, `pages` for the
+  [prefix registry](./kv-cache.md#prefix-caching).
+
+```json
+{
+  "requests_total": 42,
+  "kv_pool":      { "capacity": 512, "live": 96, "peak_live": 140, "pooled": 44 },
+  "prefix_cache": { "hits": 812, "misses": 19, "evictions": 3,
+                    "tokens_reused": 1662976, "entries": 6, "pages": 124 }
+}
+```
+
+Both are sampled when sequences are admitted or retired, so they are exact as of
+the last such boundary rather than continuously live — neither costs anything on
+the per-token path.
+
 ---
 
 ### `POST /v1/completions`
@@ -326,10 +348,46 @@ for chunk in response:
 The server uses a background inference engine (`src/server/engine.rs`) that:
 - Runs on a dedicated OS thread (avoiding async runtime blocking)
 - Maintains a request queue
-- Processes requests sequentially (one KV cache per request)
+- Decodes all active sequences together, one batched forward pass per step
+  (one KV cache per request)
 - Sends tokens back through per-request `mpsc` channels
 
 The engine is wrapped in `Arc<InferenceEngine>` and shared across all route handlers.
+
+### Continuous batching
+
+Decoding is memory-bound: a step reads every weight matrix once and performs a
+single multiply-add per weight. Decoding N sequences with N separate forward
+passes therefore streams the whole model from RAM N times to do N multiply-adds
+per weight — the arithmetic is nearly free, the memory traffic is not.
+
+Each step the engine collects every live sequence and advances them in **one**
+`forward_batch` call. The per-layer matvecs go through
+`QuantizedTensor::matvec_batch_into`, which decodes each weight block once and
+applies it to all sequences' activation vectors before moving on, so a step's
+weight traffic is roughly independent of how many sequences share it. That is
+what turns concurrency into throughput rather than just fair interleaving.
+Attention stays per-sequence — each sequence has its own KV cache and position —
+and runs in parallel across sequences.
+
+The batch is re-formed every step, which is what makes it *continuous*:
+
+- a newly admitted request joins the next step, without waiting for the running
+  sequences to finish;
+- a sequence that hits EOS, exhausts its budget, or is evicted simply stops
+  appearing, and its slot is refilled from the queue on the next iteration;
+- `EngineLimits::max_active` bounds how many sequences may share a step (and
+  hence the engine's KV-cache memory), with the rest waiting in the queue.
+
+Batching is invisible to a request. `forward_batch` is bit-identical to
+`forward_one` per sequence — the batched kernels preserve each sequence's
+accumulation order — and sampler state, KV cache, token budget, LoRA adapter and
+finish outcome all remain per-sequence. A response cannot change because the
+server happened to be busy, and a batch of one behaves exactly as a
+single-sequence decode.
+
+`Model::decode_batch` exposes the same step to library callers, and
+`glint bench --mode concurrency` measures it.
 
 ### Backpressure and slow clients
 

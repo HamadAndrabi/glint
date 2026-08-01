@@ -6,8 +6,8 @@
   <p><strong>A high-performance LLM inference engine built from scratch in Rust.</strong></p>
 
   <p>
-    Glint loads GGUF models, runs the full transformer forward pass, and serves an
-    OpenAI-compatible HTTP API without depending on PyTorch, ONNX, or any other ML framework.
+    Glint loads GGUF and HuggingFace SafeTensors models, runs the full transformer forward pass,
+    and serves an OpenAI-compatible HTTP API without depending on PyTorch, ONNX, or any other ML framework.
   </p>
 
   <p>
@@ -20,7 +20,7 @@
 
 Glint is a focused inference engine for GGUF-based LLaMA-family models. It is designed to be small, understandable, and fast on CPU while still covering the pieces that make a local inference stack practical:
 
-- zero-copy GGUF loading with memory-mapped I/O
+- zero-copy GGUF and SafeTensors loading with memory-mapped I/O
 - quantized execution with SIMD kernels and Rayon parallelism
 - KV-cache backed autoregressive generation
 - built-in tokenizer and chat template detection
@@ -34,7 +34,7 @@ Glint is a focused inference engine for GGUF-based LLaMA-family models. It is de
 | Generation | Greedy, sampling (temperature/top-k/top-p/min-p/repetition-penalty/seed), streaming, speculative decoding, JSON object mode |
 | Quantization | Q8_0, Q4_0, Q4_K, Q5_K, Q6_K, Q2_K, Q3_K, IQ4_NL — weights stay compressed in memory |
 | Performance | AVX2+FMA kernels, scalar fallback, Rayon row-parallel matvec, optional GPU backend (wgpu/Vulkan/Metal/DX12) |
-| KV Cache | f32 and Q8_0-quantized cache variants; `KvStore` trait abstraction |
+| KV Cache | f32, Q8_0-quantized, and PagedAttention-style paged variants (`--kv-cache paged`, refcounted page sharing); prefix caching across requests (`--prefix-cache`); `KvStore` trait abstraction |
 | Sessions | First-class `Session` API, deterministic RNG state, snapshot export/import, cache-format-aware resume |
 | LoRA | Load and apply LoRA adapters at inference time via `--lora` |
 | Server | OpenAI-compatible `/v1/completions`, `/v1/chat/completions`, `/v1/embeddings`, `GET /v1/metrics`, SSE streaming, queued concurrent serving |
@@ -81,6 +81,10 @@ CI validates these build surfaces on every push and pull request:
 
 - Zero-copy GGUF parser using `memmap2`
 - Tokenizer loaded directly from GGUF vocabulary
+- HuggingFace SafeTensors models load without conversion: point any command at a
+  directory holding `config.json` + `tokenizer.json` + `*.safetensors` (sharded or
+  not), or at one of its `.safetensors` files. F32/F16/BF16 weights and byte-level
+  BPE tokenizers, LLaMA-family architectures; GGUF remains the default path
 - Chat template detection for ChatML, Llama 3, Mistral, Zephyr, Gemma, and a generic fallback
 
 ### LoRA Adapters
@@ -143,6 +147,12 @@ cargo build --release
 
 ```bash
 glint run -f model.Q4_K_M.gguf -p "The future of AI is" -m 100
+```
+
+From a HuggingFace SafeTensors directory (no conversion step):
+
+```bash
+glint run -f ./SmolLM2-135M-Instruct -p "The future of AI is" -m 100
 ```
 
 Sampling example:
@@ -323,8 +333,9 @@ src/
   wasm.rs              wasm-bindgen bindings (feature: wasm)
   model/
     gguf.rs            GGUF binary parser (mmap + in-memory)
-    config.rs          Model hyperparameters from metadata
-    tokenizer.rs       BPE tokenizer
+    safetensors.rs     SafeTensors parser + HuggingFace directory loader
+    config.rs          Model hyperparameters from metadata or config.json
+    tokenizer.rs       BPE tokenizer (GGUF vocab or tokenizer.json)
     chat_template.rs   Chat template detection and rendering
     lora.rs            LoRA adapter loading and application
     pull.rs            HuggingFace Hub download (feature: server)
@@ -336,7 +347,7 @@ src/
     simd.rs            AVX2+FMA kernels (x86_64 + rayon)
     dequantize.rs      Scalar dequantization helpers
   transformer/
-    weights.rs         Weight loading from GGUF
+    weights.rs         Weight loading from GGUF or SafeTensors
     forward.rs         Forward pass and generation loops
     speculative.rs     Speculative decoding (draft/target verification)
   cache/               KvCache (f32), KvCacheQ8, KvStore trait
@@ -361,19 +372,20 @@ demo/
 
 ## Testing
 
-The library test suite currently covers tokenizer behavior, GGUF parsing (including
-adversarial/malformed headers), quantization paths, tensor ops, sampling, KV-cache
-handling, transformer forward logic, snapshot resume, and C FFI edge cases.
+The library test suite currently covers tokenizer behavior, GGUF and SafeTensors
+parsing (including adversarial/malformed headers), quantization paths, tensor ops,
+sampling, KV-cache handling, transformer forward logic, snapshot resume, and C FFI
+edge cases.
 
 ```bash
 cargo test --lib                   # default surface
 cargo test --lib --features cffi   # + C FFI edge cases
 ```
 
-It also fuzzes the two untrusted-byte surfaces — the GGUF parser and the KV-snapshot
-importer — under `fuzz/` (`cargo fuzz run gguf_parse` / `snapshot_import`), which CI
-smoke-runs on every push, and runs the unsafe-heavy `tensor::`/`cache::` modules
-under Miri.
+It also fuzzes the untrusted-byte surfaces — the GGUF parser, the SafeTensors
+parser, and the KV-snapshot importer — under `fuzz/` (`cargo fuzz run gguf_parse` /
+`safetensors_parse` / `snapshot_import`), and runs the unsafe-heavy
+`tensor::`/`cache::` modules under Miri.
 
 Two external anchors keep the numerics honest:
 

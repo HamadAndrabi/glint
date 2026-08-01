@@ -1189,6 +1189,57 @@ mod tests {
         assert!((result[1] - 15.0).abs() < 1e-5, "row1: {}", result[1]);
     }
 
+    /// The Q4_0 shader must agree with the CPU scalar kernel, which is
+    /// anchored to ggml via
+    /// `tensor::dequantize::ggml_reference_tests::q4_0_matches_ggml_reference`.
+    /// Skipped (not failed) on machines without a GPU adapter, like the other
+    /// tests here — on those it still gives the shader a compile check through
+    /// `GpuBackend::new`.
+    #[test]
+    fn test_gpu_matvec_q4_0() {
+        use crate::tensor::quantized::matvec_q4_0_scalar;
+
+        let mut gpu = match GpuBackend::new() {
+            Ok(g) => g,
+            Err(GlintError::GpuAdapterNotFound) => {
+                eprintln!("no GPU — skipping");
+                return;
+            }
+            Err(e) => panic!("{e}"),
+        };
+
+        // 2 rows × 64 cols → 2 blocks of 18 bytes per row.
+        let rows = 2usize;
+        let cols = 64usize;
+        let mut data = Vec::new();
+        for r in 0..rows {
+            for b in 0..2 {
+                data.extend_from_slice(&half::f16::from_f32(0.5 * (r + 1) as f32).to_le_bytes());
+                for j in 0..16 {
+                    data.push((((r * 2 + b) * 16 + j) * 37 + 11) as u8);
+                }
+            }
+        }
+        // Distinct per-element inputs, so a within-block nibble permutation
+        // would change the result.
+        let input: Vec<f32> = (0..cols).map(|i| 1.0 + i as f32 * 0.25).collect();
+
+        let expected = matvec_q4_0_scalar(&data, rows, cols, &input);
+
+        gpu.upload_buffer("test-q4-0", &data);
+        let result = gpu
+            .matvec_q4_0("test-q4-0", &input, rows as u32, cols as u32)
+            .unwrap();
+
+        assert_eq!(result.len(), rows);
+        for (i, (&got, &exp)) in result.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (got - exp).abs() < 1e-2,
+                "matvec_q4_0[{i}]: gpu={got}, cpu={exp}"
+            );
+        }
+    }
+
     #[test]
     fn test_gpu_rms_norm() {
         let gpu = match GpuBackend::new() {

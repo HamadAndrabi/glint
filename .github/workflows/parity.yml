@@ -93,12 +93,12 @@ jobs:
         uses: actions/cache@v4
         with:
           path: models
-          key: parity-models-smollm2-135m-v1
+          key: parity-models-smollm2-135m-v2
 
       - name: Download models (cache miss only)
         run: |
           mkdir -p models
-          for q in Q8_0 Q4_K_M Q2_K Q3_K_M; do
+          for q in Q8_0 Q4_0 Q4_K_M Q2_K Q3_K_M; do
             f="models/SmolLM2-135M-Instruct-$q.gguf"
             [ -f "$f" ] || curl -sL --retry 3 -o "$f" \
               "https://huggingface.co/bartowski/SmolLM2-135M-Instruct-GGUF/resolve/main/SmolLM2-135M-Instruct-$q.gguf"
@@ -108,7 +108,7 @@ jobs:
       - name: Parity check (all quant formats)
         run: |
           fail=0
-          for q in Q8_0 Q4_K_M Q2_K Q3_K_M; do
+          for q in Q8_0 Q4_0 Q4_K_M Q2_K Q3_K_M; do
             scripts/golden_parity.sh "models/SmolLM2-135M-Instruct-$q.gguf" || fail=1
           done
           exit $fail

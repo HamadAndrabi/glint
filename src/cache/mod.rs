@@ -4,16 +4,23 @@
 //! all N positions at every layer. With a cache, we compute K/V once per
 //! position and reuse them, reducing per-token work from O(N) matvecs to O(1).
 
+mod paged;
+mod prefix;
+
 use half::f16;
+
+pub use paged::{PagePool, PagedKvCache, PoolStats, PAGE_SIZE};
+pub use prefix::{PrefixCache, PrefixCacheConfig, PrefixCacheStats, MIN_SHARED_PAGES};
 
 use crate::error::GlintError;
 
 // ── KvStore trait ────────────────────────────────────────────────────────────
 
-/// Abstraction over KV-cache storage formats (f32 or quantised INT8).
+/// Abstraction over KV-cache storage formats (f32, quantised INT8, or paged).
 ///
-/// Both `KvCache` (f32) and `KvCacheQ8` (Q8_0 compressed) implement this
-/// trait so that `flash_attn_1d` and the forward pass are format-agnostic.
+/// `KvCache` (f32), `KvCacheQ8` (Q8_0 compressed) and `PagedKvCache` (f32 in
+/// pooled pages) all implement this trait so that `flash_attn_1d` and the
+/// forward pass are storage-agnostic.
 pub trait KvStore: Send + Sync {
     /// Fill `buf` (length `head_dim`) with the K vector for `kv_h`-th head.
     fn read_k_head(&self, layer: usize, pos: usize, kv_h: usize, head_dim: usize, buf: &mut [f32]);
@@ -23,6 +30,21 @@ pub trait KvStore: Send + Sync {
 
     /// Write K and V for one position (all KV heads concatenated) in one layer.
     fn write(&mut self, layer: usize, pos: usize, k: &[f32], v: &[f32]);
+
+    /// Ensure the cache can hold positions `0..total_positions`.
+    ///
+    /// Pre-allocated caches (`KvCache`, `KvCacheQ8`) already own every slot, so
+    /// the default implementation does nothing. `PagedKvCache` acquires the
+    /// pages it will need here and reports [`GlintError::KvPagePoolExhausted`]
+    /// when the pool has none left.
+    ///
+    /// Callers that must *handle* running out of KV memory — the inference
+    /// engine, which ends the sequence cleanly — call this before a forward
+    /// pass rather than discovering the shortfall inside `write`.
+    fn reserve(&mut self, total_positions: usize) -> Result<(), GlintError> {
+        let _ = total_positions;
+        Ok(())
+    }
 
     /// Increment the cached length by one. Call after writing all layers for a position.
     fn advance(&mut self);
@@ -71,6 +93,17 @@ pub trait KvStore: Send + Sync {
     /// CPU to GPU on every decode step — the resident path uploads only the new
     /// token's K/V vectors (`O(head_dim)`) instead.
     fn gpu_buffer(&self) -> Option<&crate::backend::GpuKvBuffer> {
+        None
+    }
+
+    /// Return this cache as a [`PagedKvCache`], if that is what it is.
+    ///
+    /// Returns `None` for the contiguous caches (`KvCache`, `KvCacheQ8`), which
+    /// have no pages to share. Page sharing — `fork_from`, and the prefix cache
+    /// built on it — is only expressible on the concrete paged type, so a
+    /// caller holding a `dyn KvStore` (the engine's `Session`) asks for the
+    /// paged view here rather than downcasting.
+    fn as_paged(&self) -> Option<&PagedKvCache> {
         None
     }
 }

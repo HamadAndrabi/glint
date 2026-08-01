@@ -16,7 +16,7 @@ pub mod snapshot;
 
 use std::sync::Arc;
 
-use crate::cache::{KvCache, KvCacheQ8, KvStore};
+use crate::cache::{KvCache, KvCacheQ8, KvStore, PagePool, PagedKvCache};
 use crate::constrained::{TokenConstraint, VocabIndex};
 use crate::model::lora::LoraWeights;
 use crate::sampling::{Sampler, SamplerConfig};
@@ -50,6 +50,15 @@ pub struct SessionOptions {
     /// Optional LoRA adapter to apply for this session.  Overrides the base
     /// model's built-in adapter (if any) when `Some`.
     pub lora_adapter: Option<Arc<LoraWeights>>,
+    /// Optional shared page pool.  When `Some`, an `F32` session stores its KV
+    /// in [`PagedKvCache`] pages taken from the pool on demand instead of
+    /// pre-allocating `context_length` rows — several sessions sharing one pool
+    /// then share one memory budget.  `None` (the default) keeps the
+    /// contiguous [`KvCache`].
+    ///
+    /// Paged storage is f32-only for now: a `Q8` session ignores the pool and
+    /// allocates a `KvCacheQ8` as usual.
+    pub page_pool: Option<PagePool>,
 }
 
 // ── Session ───────────────────────────────────────────────────────────────────
@@ -94,14 +103,23 @@ pub struct Session {
 impl Session {
     /// Allocate a new, empty session (no prefill yet).
     pub fn new(opts: SessionOptions) -> Self {
-        let cache: Box<dyn KvStore> = match opts.cache_format {
-            CacheFormat::F32 => Box::new(KvCache::new(
+        let cache: Box<dyn KvStore> = match (opts.cache_format, opts.page_pool.as_ref()) {
+            (CacheFormat::F32, Some(pool)) => {
+                assert_eq!(
+                    pool.kv_dim(),
+                    opts.n_kv_heads * opts.head_dim,
+                    "page pool was built for a different model shape"
+                );
+                Box::new(PagedKvCache::new(pool, opts.n_layers))
+            }
+            (CacheFormat::F32, None) => Box::new(KvCache::new(
                 opts.n_layers,
                 opts.context_length,
                 opts.n_kv_heads,
                 opts.head_dim,
             )),
-            CacheFormat::Q8 => Box::new(KvCacheQ8::new(
+            // Paged Q8 storage is not implemented; the pool is ignored here.
+            (CacheFormat::Q8, _) => Box::new(KvCacheQ8::new(
                 opts.n_layers,
                 opts.context_length,
                 opts.n_kv_heads,
@@ -151,6 +169,7 @@ mod tests {
             n_kv_heads: 2,
             head_dim: 8,
             lora_adapter: None,
+            page_pool: None,
         }
     }
 
@@ -168,6 +187,34 @@ mod tests {
         let s = Session::new(opts(CacheFormat::Q8));
         assert!(s.tokens.is_empty());
         assert!(!s.is_finished());
+    }
+
+    /// A pool turns the session's cache into a paged one without changing any
+    /// other session behaviour — and no pages are taken until tokens arrive.
+    #[test]
+    fn test_session_with_page_pool_is_paged() {
+        let pool = PagePool::new(64, 2, 8);
+        let s = Session::new(SessionOptions {
+            page_pool: Some(pool.clone()),
+            ..opts(CacheFormat::F32)
+        });
+        assert_eq!(pool.live_pages(), 0);
+        assert!(s.cache.is_empty());
+        assert_eq!(s.cache_format, CacheFormat::F32);
+    }
+
+    /// Q8 sessions keep the contiguous quantised cache; the pool is ignored
+    /// rather than silently changing the storage format.
+    #[test]
+    fn test_session_q8_ignores_page_pool() {
+        let pool = PagePool::new(64, 2, 8);
+        let mut s = Session::new(SessionOptions {
+            page_pool: Some(pool.clone()),
+            ..opts(CacheFormat::Q8)
+        });
+        s.cache.write(0, 0, &[1.0; 16], &[2.0; 16]);
+        s.cache.advance();
+        assert_eq!(pool.live_pages(), 0, "Q8 must not draw from the pool");
     }
 
     #[test]

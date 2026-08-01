@@ -873,6 +873,9 @@ mod tests {
     fn test_ggml_type_from_u32() {
         assert_eq!(GgmlType::from_u32(0).unwrap(), GgmlType::F32);
         assert_eq!(GgmlType::from_u32(1).unwrap(), GgmlType::F16);
+        assert_eq!(GgmlType::from_u32(3).unwrap(), GgmlType::Q4_1);
+        assert_eq!(GgmlType::from_u32(6).unwrap(), GgmlType::Q5_0);
+        assert_eq!(GgmlType::from_u32(7).unwrap(), GgmlType::Q5_1);
         assert_eq!(GgmlType::from_u32(8).unwrap(), GgmlType::Q8_0);
         assert!(GgmlType::from_u32(999).is_err());
     }
@@ -890,6 +893,18 @@ mod tests {
         assert_eq!(GgmlType::Q4_0.block_size(), 32);
         assert_eq!(GgmlType::Q4_0.type_size(), 18);
         assert!(GgmlType::Q4_0.is_quantized());
+
+        // 32-element blocks with an f16 min (Q4_1/Q5_1) and/or a u32 qh
+        // (Q5_0/Q5_1) on top of the Q4_0 header.
+        for (ty, type_size) in [
+            (GgmlType::Q4_1, 20),
+            (GgmlType::Q5_0, 22),
+            (GgmlType::Q5_1, 24),
+        ] {
+            assert_eq!(ty.block_size(), 32, "{ty} block_size");
+            assert_eq!(ty.type_size(), type_size, "{ty} type_size");
+            assert!(ty.is_quantized(), "{ty} is_quantized");
+        }
     }
 
     #[test]

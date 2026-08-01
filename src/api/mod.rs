@@ -1,8 +1,9 @@
 //! High-level Rust library API for Glint.
 //!
-//! [`Model`] is the main entry point: load a GGUF file, create [`Session`]s,
-//! and drive generation via the methods below.  This API is the authoritative
-//! surface that Python, WASM, and C FFI bindings will layer on top of.
+//! [`Model`] is the main entry point: load a GGUF file (or a HuggingFace
+//! SafeTensors directory), create [`Session`]s, and drive generation via the
+//! methods below.  This API is the authoritative surface that Python, WASM,
+//! and C FFI bindings will layer on top of.
 //!
 //! # Example
 //! ```no_run
@@ -19,12 +20,14 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::backend::GpuBackend;
+use crate::cache::KvStore;
 use crate::constrained::{build_constraint, ConstraintSpec, VocabIndex};
 use crate::error::GlintError;
 use crate::model::config::ModelConfig;
 use crate::model::gguf::GgufModel;
 use crate::model::lora::LoraWeights;
 use crate::model::lora_registry::AdapterRegistry;
+use crate::model::safetensors::{is_safetensors_path, HfModelDir};
 use crate::model::tokenizer::Tokenizer;
 use crate::sampling::SamplerConfig;
 use crate::session::snapshot::{
@@ -32,7 +35,10 @@ use crate::session::snapshot::{
     restore_session, KvSnapshot, SnapshotMetadata,
 };
 use crate::session::{CacheFormat, Session, SessionOptions};
-use crate::transformer::{forward_one_lora, forward_prefill_lora, TransformerWeights};
+use crate::tensor::Tensor;
+use crate::transformer::{
+    forward_batch_lora, forward_one_lora, forward_prefill_lora, TransformerWeights,
+};
 
 // ── GenerationOptions ─────────────────────────────────────────────────────────
 
@@ -68,6 +74,36 @@ impl Default for GenerationOptions {
     }
 }
 
+/// Sample the next token for `session` (honouring an active constraint) and
+/// append it to the session's history.
+///
+/// Shared by [`Model::decode_one`] and [`Model::decode_batch`] so a session
+/// samples identically whether or not it is decoded alongside others.
+fn sample_and_push(session: &mut Session) -> u32 {
+    let next = if let Some(constraint) = session.constraint.as_mut() {
+        // VocabIndex is stored alongside the constraint; build a minimal
+        // empty one as a fallback if somehow missing.
+        static EMPTY_VI: std::sync::OnceLock<std::sync::Arc<crate::constrained::VocabIndex>> =
+            std::sync::OnceLock::new();
+        let vi = session.vocab_index.as_ref().unwrap_or_else(|| {
+            EMPTY_VI.get_or_init(|| crate::constrained::VocabIndex::from_vocab(&[]))
+        });
+        let mask = constraint.allowed_tokens(&session.tokens, vi);
+        let tok =
+            session
+                .sampler
+                .sample_constrained(session.last_logits.data(), &session.tokens, &mask);
+        constraint.advance(tok);
+        tok
+    } else {
+        session
+            .sampler
+            .sample(session.last_logits.data(), &session.tokens)
+    };
+    session.tokens.push(next);
+    next
+}
+
 // ── Model ─────────────────────────────────────────────────────────────────────
 
 /// A loaded GGUF model, ready for synchronous or session-based inference.
@@ -86,8 +122,41 @@ pub struct Model {
 }
 
 impl Model {
-    /// Load a GGUF model from `path`.
+    /// Load a model from `path`.
+    ///
+    /// GGUF is the default. A directory that looks like a HuggingFace
+    /// checkpoint — or a `.safetensors` file inside one — is routed to
+    /// [`Model::load_safetensors`] instead.
     pub fn load(path: &Path) -> Result<Self, GlintError> {
+        if is_safetensors_path(path) {
+            return Self::load_safetensors(path);
+        }
+        Self::load_gguf(path)
+    }
+
+    /// Load a HuggingFace SafeTensors checkpoint.
+    ///
+    /// `path` is the model directory (holding `config.json`, `tokenizer.json`,
+    /// and one or more `.safetensors` files) or any of its weight files.
+    pub fn load_safetensors(path: &Path) -> Result<Self, GlintError> {
+        let hf = HfModelDir::open(path)?;
+        let weights =
+            TransformerWeights::from_safetensors(&hf.weights, &hf.config, hf.tie_word_embeddings)?;
+        // Hash over the checkpoint's total size rather than a single file's,
+        // so a snapshot is still rejected if the weights are swapped out.
+        let hash = model_hash(&hf.root.to_string_lossy(), hf.weights.byte_len() as u64);
+
+        Ok(Self {
+            weights: Arc::new(weights),
+            config: Arc::new(hf.config),
+            tokenizer: Arc::new(hf.tokenizer),
+            model_hash: hash,
+            adapter_registry: AdapterRegistry::new(),
+        })
+    }
+
+    /// Load a GGUF model from `path`.
+    pub fn load_gguf(path: &Path) -> Result<Self, GlintError> {
         let path_str = path.to_string_lossy().into_owned();
         let gguf = GgufModel::load(path).map_err(|e| GlintError::TensorReadError {
             name: "model".into(),
@@ -138,6 +207,7 @@ impl Model {
             n_kv_heads: self.config.head_count_kv as usize,
             head_dim: self.config.head_dim() as usize,
             lora_adapter: opts.lora_adapter.clone(),
+            page_pool: None,
         });
         if let Some(spec) = &opts.constraint {
             // Build a vocab index from the tokenizer's raw vocabulary strings.
@@ -198,28 +268,7 @@ impl Model {
             return None;
         }
         session.max_remaining = session.max_remaining.saturating_sub(1);
-        let next = if let Some(constraint) = session.constraint.as_mut() {
-            // VocabIndex is stored alongside the constraint; build a minimal
-            // empty one as a fallback if somehow missing.
-            static EMPTY_VI: std::sync::OnceLock<std::sync::Arc<crate::constrained::VocabIndex>> =
-                std::sync::OnceLock::new();
-            let vi = session.vocab_index.as_ref().unwrap_or_else(|| {
-                EMPTY_VI.get_or_init(|| crate::constrained::VocabIndex::from_vocab(&[]))
-            });
-            let mask = constraint.allowed_tokens(&session.tokens, vi);
-            let tok = session.sampler.sample_constrained(
-                session.last_logits.data(),
-                &session.tokens,
-                &mask,
-            );
-            constraint.advance(tok);
-            tok
-        } else {
-            session
-                .sampler
-                .sample(session.last_logits.data(), &session.tokens)
-        };
-        session.tokens.push(next);
+        let next = sample_and_push(session);
         if next == session.eos_token {
             return Some(next);
         }
@@ -236,6 +285,77 @@ impl Model {
         );
         session.pos = pos;
         Some(next)
+    }
+
+    /// Sample and decode one token for every session, in a **single** forward
+    /// pass.
+    ///
+    /// The batched counterpart of [`decode_one`], and the library-level form of
+    /// what the server engine does: the model's weights are streamed from
+    /// memory once for the whole group instead of once per session, which is
+    /// what makes decoding many sessions at once cheaper than decoding them one
+    /// after another. Sampling, KV cache, budget and LoRA adapter all stay
+    /// per-session.
+    ///
+    /// Returns one entry per session, in order: the token it produced, or
+    /// `None` if it was already finished. The tokens are exactly what
+    /// [`decode_one`] would have produced for each session on its own.
+    ///
+    /// [`decode_one`]: Self::decode_one
+    pub fn decode_batch(
+        &self,
+        sessions: &mut [Session],
+        gpu: &mut Option<&mut GpuBackend>,
+    ) -> Vec<Option<u32>> {
+        // Sample first — every session draws from the logits its own previous
+        // step produced.
+        let mut produced: Vec<Option<u32>> = Vec::with_capacity(sessions.len());
+        for session in sessions.iter_mut() {
+            if session.is_finished() || session.tokens.is_empty() {
+                produced.push(None);
+                continue;
+            }
+            session.max_remaining = session.max_remaining.saturating_sub(1);
+            produced.push(Some(sample_and_push(session)));
+        }
+
+        // Then advance, in one pass, the sessions that have a next step to
+        // take. A session that just emitted EOS is done and gets no forward
+        // pass, exactly as in `decode_one`.
+        let mut tokens: Vec<u32> = Vec::new();
+        let mut positions: Vec<usize> = Vec::new();
+        let mut caches: Vec<&mut dyn KvStore> = Vec::new();
+        let mut loras: Vec<Option<&LoraWeights>> = Vec::new();
+        let mut logit_slots: Vec<&mut Tensor> = Vec::new();
+        for (session, token) in sessions.iter_mut().zip(&produced) {
+            let Some(token) = *token else { continue };
+            if token == session.eos_token {
+                continue;
+            }
+            let pos = session.tokens.len() - 1;
+            session.pos = pos;
+            tokens.push(token);
+            positions.push(pos);
+            loras.push(session.lora_adapter.as_deref());
+            caches.push(session.cache.as_mut());
+            logit_slots.push(&mut session.last_logits);
+        }
+
+        if !tokens.is_empty() {
+            let logits = forward_batch_lora(
+                &self.weights,
+                &self.config,
+                &tokens,
+                &positions,
+                &mut caches,
+                gpu,
+                &loras,
+            );
+            for (slot, produced) in logit_slots.into_iter().zip(logits) {
+                *slot = produced;
+            }
+        }
+        produced
     }
 
     // ── High-level generation ────────────────────────────────────────────────
@@ -316,6 +436,7 @@ impl Model {
             n_kv_heads: self.config.head_count_kv as usize,
             head_dim: self.config.head_dim() as usize,
             lora_adapter: opts.lora_adapter.clone(),
+            page_pool: None,
         };
         let mut session = restore_session(snap, session_opts)?;
         if let Some(spec) = &opts.constraint {
@@ -492,6 +613,87 @@ mod tests {
         assert!(tok.is_some());
         assert_eq!(s.tokens.len(), 2);
         assert_eq!(s.max_remaining, 4);
+    }
+
+    /// `decode_batch` exists to make many sessions cheaper, not different:
+    /// every session must get the tokens `decode_one` would have given it.
+    #[test]
+    fn decode_batch_matches_decode_one() {
+        let model = make_tiny_model();
+        let opts = GenerationOptions {
+            max_new_tokens: 6,
+            sampler_cfg: SamplerConfig {
+                temperature: 0.0,
+                seed: Some(3),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let prompts: [&[u32]; 3] = [&[1, 3, 5], &[2], &[4, 6]];
+        let steps = 6;
+
+        let solo: Vec<Vec<u32>> = prompts
+            .iter()
+            .map(|prompt| {
+                let mut s = model.new_session(&opts);
+                model.prefill_tokens(&mut s, prompt, &mut None).unwrap();
+                (0..steps)
+                    .filter_map(|_| model.decode_one(&mut s, &mut None))
+                    .collect()
+            })
+            .collect();
+
+        let mut sessions: Vec<Session> = prompts
+            .iter()
+            .map(|prompt| {
+                let mut s = model.new_session(&opts);
+                model.prefill_tokens(&mut s, prompt, &mut None).unwrap();
+                s
+            })
+            .collect();
+        let mut batched: Vec<Vec<u32>> = vec![Vec::new(); prompts.len()];
+        for _ in 0..steps {
+            for (slot, tok) in batched
+                .iter_mut()
+                .zip(model.decode_batch(&mut sessions, &mut None))
+            {
+                if let Some(tok) = tok {
+                    slot.push(tok);
+                }
+            }
+        }
+
+        assert_eq!(batched, solo, "batched decoding diverged from decode_one");
+        assert!(!solo[0].is_empty(), "fixture should produce tokens");
+    }
+
+    /// A finished session must sit out the batch rather than being decoded
+    /// past its budget while its neighbours keep going.
+    #[test]
+    fn decode_batch_skips_finished_sessions() {
+        let model = make_tiny_model();
+        let short = GenerationOptions {
+            max_new_tokens: 1,
+            ..Default::default()
+        };
+        let long = GenerationOptions {
+            max_new_tokens: 5,
+            ..Default::default()
+        };
+        let mut sessions = vec![model.new_session(&short), model.new_session(&long)];
+        model
+            .prefill_tokens(&mut sessions[0], &[1, 3], &mut None)
+            .unwrap();
+        model
+            .prefill_tokens(&mut sessions[1], &[5], &mut None)
+            .unwrap();
+
+        let first = model.decode_batch(&mut sessions, &mut None);
+        assert!(first.iter().all(|t| t.is_some()));
+        let second = model.decode_batch(&mut sessions, &mut None);
+        assert_eq!(second[0], None, "spent session must not decode again");
+        assert!(second[1].is_some(), "its neighbour keeps going");
+        assert_eq!(sessions[0].tokens.len(), 3, "prompt + its single token");
     }
 
     #[test]
