@@ -32,12 +32,12 @@ Glint is a focused inference engine for GGUF-based LLaMA-family models. It is de
 | --- | --- |
 | Inference | Full LLaMA-family transformer: RMSNorm, RoPE, SwiGLU, grouped-query attention, flash attention, batched prefill |
 | Generation | Greedy, sampling (temperature/top-k/top-p/min-p/repetition-penalty/seed), streaming, speculative decoding, JSON object mode |
-| Quantization | Q8_0, Q4_0, Q4_K, Q5_K, Q6_K, Q2_K, Q3_K, IQ4_NL — weights stay compressed in memory |
+| Quantization | Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q4_K, Q5_K, Q6_K, Q2_K, Q3_K, IQ4_NL — weights stay compressed in memory |
 | Performance | AVX2+FMA kernels, scalar fallback, Rayon row-parallel matvec, optional GPU backend (wgpu/Vulkan/Metal/DX12) |
 | KV Cache | f32, Q8_0-quantized, and PagedAttention-style paged variants (`--kv-cache paged`, refcounted page sharing); prefix caching across requests (`--prefix-cache`); `KvStore` trait abstraction |
 | Sessions | First-class `Session` API, deterministic RNG state, snapshot export/import, cache-format-aware resume |
 | LoRA | Load and apply LoRA adapters at inference time via `--lora` |
-| Server | OpenAI-compatible `/v1/completions`, `/v1/chat/completions`, `/v1/embeddings`, `GET /v1/metrics`, SSE streaming, queued concurrent serving |
+| Server | OpenAI-compatible `/v1/completions`, `/v1/chat/completions`, `/v1/embeddings`, `GET /v1/metrics`, SSE streaming, continuously batched concurrent serving |
 | CLI | `run`, `chat`, `serve`, `inspect`, `generate`, `pull`, `bench` |
 | Bindings | Python (`pyo3`), browser WASM (`wasm-bindgen`), C FFI (`include/glint.h`), native CLI |
 
@@ -63,8 +63,9 @@ CI validates these build surfaces on every push and pull request:
 
 ### Quantization
 
-- Eight GGUF quantization formats: `Q8_0`, `Q4_0`, `Q4_K`, `Q5_K`, `Q6_K`, `Q2_K`, `Q3_K`, `IQ4_NL`
-- AVX2+FMA SIMD kernels for the five hottest formats (`Q8_0`, `Q4_0`, `Q4_K`, `Q5_K`, `Q6_K`); the rest use the scalar path
+- Eleven GGUF quantization formats: `Q8_0`, `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, `Q4_K`, `Q5_K`, `Q6_K`, `Q2_K`, `Q3_K`, `IQ4_NL`
+- AVX2+FMA SIMD kernels for eight formats (`Q8_0`, `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, `Q4_K`, `Q5_K`, `Q6_K`); `Q2_K`, `Q3_K`, and `IQ4_NL` use the scalar path
+- Nibble layouts anchored to ggml golden vectors, so real llama.cpp-produced files decode identically
 - Compressed weights stay compressed in memory
 - Example footprint: a 135M-parameter `Q8_0` model is about 140 MB in memory versus about 540 MB dequantized
 
@@ -73,7 +74,7 @@ CI validates these build surfaces on every push and pull request:
 - OpenAI-style completions and chat completions APIs
 - `response_format: { "type": "json_object" }` for constrained JSON object output
 - Streaming responses via Server-Sent Events
-- Request-queue concurrency with interleaved decode steps
+- Continuous batching: all active requests decode in one shared forward pass per step, so each weight matrix streams from memory once per step instead of once per sequence
 - CORS enabled for browser clients
 - `/health` endpoint for readiness checks and simple orchestration
 
@@ -196,6 +197,13 @@ glint chat -f model.gguf --temperature 0.8 --top-k 40 --top-p 0.95 -m 512
 
 ```bash
 glint serve -f model.Q4_K_M.gguf -p 8080
+```
+
+With the paged KV cache and prefix caching (reuses KV pages across requests
+that share a prompt prefix, e.g. a common system prompt):
+
+```bash
+glint serve -f model.Q4_K_M.gguf -p 8080 --kv-cache paged --prefix-cache
 ```
 
 You can also bind to another host:

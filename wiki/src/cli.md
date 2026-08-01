@@ -131,10 +131,12 @@ glint serve -f <MODEL> [OPTIONS]
 | `-p, --port <N>` | 8080 | TCP port |
 | `--host <ADDR>` | `127.0.0.1` | Bind address |
 | `--gpu` | false | GPU backend |
+| `--kv-cache <FMT>` | `f32` | KV storage: `f32`, `q8` (~3.8× smaller), or `paged` (f32 in on-demand 16-token pages shared by all requests) |
+| `--prefix-cache` | false | Reuse KV pages of a shared prompt prefix instead of re-prefilling it per request; requires `--kv-cache paged` |
 
 The model name is derived from the file stem (e.g. `smollm-135m-instruct.Q8_0` → `smollm-135m-instruct.Q8_0`). Use this name in API requests.
 
-Runs a background inference engine with a request queue. Active requests are interleaved one decode step at a time, which improves concurrent serving without yet doing a shared batched forward pass.
+Runs a background inference engine with a request queue and continuous batching: every active request advances in a single shared forward pass per step, so each weight matrix streams from memory once per step instead of once per sequence, and new requests join mid-generation as slots free up. Batching is bit-identical to decoding each request alone — see [Continuous batching](./server-api.md#continuous-batching).
 
 **Example:**
 ```bash

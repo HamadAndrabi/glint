@@ -109,6 +109,8 @@ SafeTensors (HuggingFace) loading is the second, optional entry point — a dire
 | `src/tensor/dequantize.rs` | Reference dequantization for all formats |
 | `src/tensor/simd.rs` | AVX2 + FMA kernels and unsafe SIMD helpers |
 | `src/cache/` | KV-cache implementations |
+| `src/cache/paged.rs` | PagedAttention-style paged KV cache (`PagePool`, `PagedKvCache`, CoW `fork_from`) |
+| `src/cache/prefix.rs` | Prefix-cache registry reusing KV pages across requests sharing a prompt prefix |
 | `src/transformer/weights.rs` | Weight loading from GGUF into Glint structs |
 | `src/transformer/forward.rs` | Forward pass and generation loops |
 | `src/transformer/speculative.rs` | Speculative decoding — draft generates k tokens, target verifies |

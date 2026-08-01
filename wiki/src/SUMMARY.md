@@ -15,6 +15,7 @@
 # Core Concepts
 
 - [GGUF Format](./gguf-format.md)
+- [SafeTensors & HF Models](./safetensors.md)
 - [Quantization](./quantization.md)
 - [Tensors & Ops](./tensors.md)
 - [Forward Pass](./forward-pass.md)

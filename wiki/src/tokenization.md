@@ -2,6 +2,13 @@
 
 Glint implements BPE (Byte Pair Encoding) tokenization from scratch, reading vocabulary and merge rules directly from GGUF metadata. No external tokenizer library is needed.
 
+When a model is loaded from a HuggingFace SafeTensors directory instead, the
+same BPE structures are built from its `tokenizer.json` (byte-level BPE, the
+LLaMA-3/SmolLM/Qwen style). SentencePiece-derived `tokenizer.json` files
+(Metaspace `▁` pretokenizers, e.g. LLaMA-2 / Mistral-v0.1 HF repos) are
+rejected with a clear error rather than mis-encoded — see
+[SafeTensors & HF Models](./safetensors.md).
+
 Source: `src/model/tokenizer.rs`
 
 ---
