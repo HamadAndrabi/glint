@@ -2,6 +2,9 @@
 
 GGUF (GGML Universal Format) is a binary file format for storing quantized transformer model weights along with all associated metadata. Glint parses GGUF natively without any external parser library.
 
+GGUF is Glint's default model format. HuggingFace SafeTensors directories load
+too, without conversion — see [SafeTensors & HF Models](./safetensors.md).
+
 Source: `src/model/gguf.rs`
 
 ---

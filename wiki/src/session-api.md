@@ -10,11 +10,15 @@ Source: `src/api/mod.rs`, `src/session/mod.rs`, `src/session/snapshot.rs`
 
 | Type | Purpose |
 |------|---------|
-| `Model` | Loaded GGUF weights, tokenizer, and config |
+| `Model` | Loaded weights (GGUF or SafeTensors), tokenizer, and config |
 | `GenerationOptions` | Sampling, cache format, constraint, and LoRA options |
 | `Session` | Tokens, KV cache, RNG state, last logits, and generation budget |
 | `CacheFormat` | `F32` or `Q8` KV cache |
 | `KvSnapshot` | Serialized session state ready for restore |
+
+The `F32` format can additionally be backed by on-demand pages instead of one
+contiguous allocation by supplying `SessionOptions::page_pool` — see
+[KV Cache](./kv-cache.md) for the paged variant and its sharing semantics.
 
 ---
 

@@ -45,7 +45,10 @@ Glint can pull models from the Hugging Face Hub:
 
 Models are cached in `~/.cache/ferrite/models/` by default.
 
-You can also point Glint directly at any `.gguf` file on disk.
+You can also point Glint directly at any `.gguf` file on disk — or at a
+HuggingFace SafeTensors model directory (`config.json` + `tokenizer.json` +
+`*.safetensors`), which loads without a conversion step; see
+[SafeTensors & HF Models](./safetensors.md).
 
 ---
 

@@ -2,7 +2,7 @@
 
 Quantization compresses model weights from 32-bit floats into smaller integer representations. For LLM inference this is essential: a 7B parameter model in f32 requires 28 GB, but in Q4_K fits in ~4 GB.
 
-Glint supports 8 quantization formats across two families: simple block quants (Q8_0, Q4_0, IQ4_NL) and K-quants (Q2_K through Q6_K).
+Glint supports 11 quantization formats across two families: simple block quants (Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, IQ4_NL) and K-quants (Q2_K through Q6_K).
 
 Source: `src/tensor/quantized.rs`, `src/tensor/dequantize.rs`
 
@@ -48,6 +48,43 @@ Values range from -8 to +7 (4-bit signed, offset by -8 in storage).
 **Decoding:** `x[j] = ((qs[j] & 0x0F) - 8) * d` and `x[j + 16] = ((qs[j] >> 4) - 8) * d`, for `j` in `0..16` — the nibbles are *split-plane*, not interleaved. See the nibble-packing gotcha below.
 
 Compression ratio: 128 bytes → 18 bytes = **7.1×**
+
+### Q4_1
+
+Q4_0 plus a per-block minimum, so the 4-bit codes are unsigned offsets from `m`
+instead of signed values around zero — better for weight blocks whose values
+don't straddle zero.
+
+```
+Block (20 bytes, 32 elements):
+┌────────────┬────────────┬────────────────────────────────┐
+│  d (f16)   │  m (f16)   │  16 bytes (32 × 4-bit nibbles) │
+│  2 bytes   │  2 bytes   │  split-plane packed            │
+└────────────┴────────────┴────────────────────────────────┘
+```
+
+**Decoding:** `x[j] = (qs[j] & 0x0F) * d + m` and `x[j + 16] = (qs[j] >> 4) * d + m`.
+
+Compression ratio: 128 bytes → 20 bytes = **6.4×**
+
+### Q5_0 / Q5_1
+
+The 5-bit analogues of Q4_0/Q4_1: each element's fifth (high) bit lives in a
+shared 32-bit `qh` word, one bit per element, on top of the packed nibbles.
+
+```
+Q5_0 block (22 bytes): d (f16) · qh (u32) · 16 nibble bytes
+Q5_1 block (24 bytes): d (f16) · m (f16) · qh (u32) · 16 nibble bytes
+```
+
+**Decoding (Q5_0):** `q = nibble | (qh bit << 4)`, then `x = (q - 16) * d`.
+**Decoding (Q5_1):** same 5-bit assembly, then `x = q * d + m`.
+
+Compression ratios: **5.8×** (Q5_0) and **5.3×** (Q5_1).
+
+All three formats share ggml's split-plane nibble order and are anchored to
+generated golden vectors (`*_matches_ggml_reference` in
+`src/tensor/dequantize.rs`), with scalar and AVX2 matvec kernels.
 
 ### IQ4_NL
 

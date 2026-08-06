@@ -11,7 +11,7 @@ Glint is organized as a stack of layers with clean separation between loading, c
 │        src/server/: mod.rs, routes.rs, engine.rs     │
 ├─────────────────────────────────────────────────────┤
 │              Scheduling & Serving                    │
-│   (request queue, interleaved concurrent decode)    │
+│  (request queue, continuously batched decode)       │
 │         src/server/engine.rs                         │
 ├─────────────────────────────────────────────────────┤
 │                Inference Runtime                     │

@@ -98,6 +98,23 @@ The extra bookkeeping makes K-quant kernels about 20–30% slower than Q8_0 per 
 
 ---
 
+## Coverage
+
+AVX2+FMA kernels exist for eight formats: `Q8_0`, `Q4_0`, `Q4_1`, `Q5_0`,
+`Q5_1`, `Q4_K`, `Q5_K`, `Q6_K`. The 5-bit formats assemble their fifth bit
+from the shared `qh` word with a broadcast + `shuffle_epi8` bit-spread
+(`qh_fifth_bits`), and all the simple 4/5-bit formats share the split-plane
+nibble expansion (`split_plane_nibbles`). `Q2_K`, `Q3_K`, and `IQ4_NL` use the
+scalar path.
+
+Continuous batching adds *batched* AVX2 kernels (`matvec_*_batch_avx2`) for
+`Q8_0`, `Q4_0`, `Q4_K`, `Q5_K`, `Q6_K` that walk each weight row once for up
+to 16 input vectors. Formats whose only AVX2 kernel is single-vector
+(`Q4_1`/`Q5_0`/`Q5_1`) are batched by delegating per lane to that same kernel,
+keeping batched output bit-identical to the single path.
+
+---
+
 ## Unsafe Code Discipline
 
 All SIMD functions are `unsafe`. Every unsafe block must have a `// SAFETY:` comment explaining the invariants maintained:

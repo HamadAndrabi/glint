@@ -45,7 +45,7 @@ Glint makes three bets:
 
 2. **Zero external ML framework.** No PyTorch, Candle, or ONNX Runtime. Every operation — matmul, attention, normalization — is implemented directly in Rust. This makes the code auditable and the binary portable.
 
-3. **Real serving semantics.** The HTTP server is not a demo wrapper. It runs a background inference engine with a proper request queue, interleaves decode work across active requests, and exposes the OpenAI wire format production systems expect.
+3. **Real serving semantics.** The HTTP server is not a demo wrapper. It runs a background inference engine with a proper request queue, decodes all active requests in one continuously batched forward pass per step, and exposes the OpenAI wire format production systems expect.
 
 ---
 

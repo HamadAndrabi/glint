@@ -91,6 +91,23 @@ pub fn generate_cached(
 
 ---
 
+## Batched Decode
+
+`forward_batch` (and `forward_batch_lora`) runs one decode step for several
+sequences in a single pass: per layer, each weight matrix is traversed once and
+applied to every sequence's activation vector (`matvec_batch` in
+`src/tensor/quantized.rs`), while attention stays per-sequence — each sequence
+reads its own KV cache at its own position. Because decode is
+memory-bandwidth-bound, streaming the weights once per step instead of once per
+sequence is what makes concurrent serving scale; the HTTP engine uses this for
+[continuous batching](./server-api.md#continuous-batching).
+
+Per-sequence outputs are bit-identical to `forward_one` — the batched kernels
+keep each dot product's accumulation order unchanged — so batching is
+observationally invisible. A batch of one takes the single-sequence path.
+
+---
+
 ## Multi-Head Attention
 
 Attention is the most complex part of the forward pass.
