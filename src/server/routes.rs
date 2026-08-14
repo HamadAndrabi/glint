@@ -1330,6 +1330,18 @@ pub async fn web_ui() -> Response {
     axum::response::Html(include_str!("web/index.html")).into_response()
 }
 
+// ── GET /assets/logo.svg ──────────────────────────────────────────────────────
+
+/// Serves the official Glint logo SVG.
+pub async fn logo_svg() -> Response {
+    let svg = include_str!("../../assets/logo.svg");
+    axum::response::Response::builder()
+        .header("Content-Type", "image/svg+xml")
+        .header("Cache-Control", "public, max-age=86400")
+        .body(axum::body::Body::from(svg))
+        .unwrap_or_else(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "failed to load logo"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1337,6 +1349,12 @@ mod tests {
     #[tokio::test]
     async fn test_web_ui_returns_html() {
         let resp = web_ui().await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_logo_svg_returns_svg() {
+        let resp = logo_svg().await;
         assert_eq!(resp.status(), StatusCode::OK);
     }
 

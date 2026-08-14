@@ -47,6 +47,7 @@ pub async fn run_server(state: AppState, host: &str, port: u16) {
     let app = Router::new()
         .route("/", get(routes::web_ui))
         .route("/ui", get(routes::web_ui))
+        .route("/assets/logo.svg", get(routes::logo_svg))
         .route("/health", get(routes::health))
         .route("/v1/models", get(routes::list_models))
         .route("/v1/metrics", get(routes::server_metrics))

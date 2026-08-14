@@ -45,16 +45,16 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
     let header_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Length(20), // Brand
-            Constraint::Min(30),   // Tabs
-            Constraint::Length(32), // Model Badges
+            Constraint::Length(28), // Brand
+            Constraint::Min(35),   // Tabs
+            Constraint::Length(35), // Model Badges
         ])
         .split(area);
 
     // 1. Brand / Logo
     let brand = Paragraph::new(Line::from(vec![
-        Span::styled("⚡ GLINT ", Style::default().fg(Color::Cyan).bold()),
-        Span::styled("v0.1.0", Style::default().fg(Color::DarkGray)),
+        Span::styled("🐺 GLINT ", Style::default().fg(Color::Cyan).bold()),
+        Span::styled("// CORE v0.2.0", Style::default().fg(Color::DarkGray)),
     ]))
     .block(
         Block::default()
@@ -66,9 +66,9 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
 
     // 2. Tabs
     let tab_titles = vec![
-        Line::from(" [1] 💬 Chat "),
-        Line::from(" [2] 🧬 Schema Lab "),
-        Line::from(" [3] 📊 KV & Telemetry "),
+        Line::from(" [1] 💬 DIALOGUE "),
+        Line::from(" [2] 🧬 SCHEMA MATRIX "),
+        Line::from(" [3] 📊 TELEMETRY "),
     ];
     let selected_tab = match app.active_tab {
         ActiveTab::Chat => 0,
@@ -98,7 +98,7 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
         app.model_name, app.context_length
     );
     let badges = Paragraph::new(Line::from(vec![
-        Span::styled("● ", Style::default().fg(if app.is_generating { Color::Yellow } else { Color::Green })),
+        Span::styled("● ", Style::default().fg(if app.is_generating { Color::Yellow } else { Color::Cyan })),
         Span::styled(status_text, Style::default().fg(Color::Gray)),
     ]))
     .alignment(Alignment::Right)
@@ -124,10 +124,10 @@ fn render_chat_view(f: &mut Frame, app: &mut App, area: Rect) {
 
     for m in &app.messages {
         let (role_label, border_color, text_color) = match m.role.as_str() {
-            "user" => (" 👤 You ", Color::Cyan, Color::White),
-            "assistant" => (" ⚡ Glint ", Color::Green, Color::White),
-            "system" => (" ⚙ System ", Color::DarkGray, Color::Gray),
-            _ => (" 💬 ", Color::Gray, Color::White),
+            "user" => (" [DIRECTIVE // USER] ", Color::Blue, Color::White),
+            "assistant" => (" [GLINT // OPTIC-CORE] ", Color::Cyan, Color::White),
+            "system" => (" [SYSTEM DIRECTIVE] ", Color::DarkGray, Color::Gray),
+            _ => (" [PROMPT] ", Color::Gray, Color::White),
         };
 
         let mut lines = vec![
@@ -135,7 +135,7 @@ fn render_chat_view(f: &mut Frame, app: &mut App, area: Rect) {
                 Span::styled(role_label, Style::default().fg(border_color).bold()),
                 if let (Some(tok_s), Some(ttft)) = (m.tok_per_sec, m.ttft_ms) {
                     Span::styled(
-                        format!(" [{tok_s:.1} tok/s | TTFT: {ttft}ms]"),
+                        format!(" [⚡ {tok_s:.1} tok/s · ⏱ {ttft}ms TTFT]"),
                         Style::default().fg(Color::DarkGray),
                     )
                 } else {
@@ -164,8 +164,8 @@ fn render_chat_view(f: &mut Frame, app: &mut App, area: Rect) {
     if app.is_generating || !app.streaming_response.is_empty() {
         let mut lines = vec![
             Line::from(vec![
-                Span::styled(" ⚡ Glint ", Style::default().fg(Color::Green).bold()),
-                Span::styled(" [streaming...]", Style::default().fg(Color::Yellow)),
+                Span::styled(" [GLINT // OPTIC-CORE] ", Style::default().fg(Color::Cyan).bold()),
+                Span::styled(" [vector stream active...]", Style::default().fg(Color::Yellow)),
             ]),
             Line::from(""),
         ];
@@ -179,7 +179,7 @@ fn render_chat_view(f: &mut Frame, app: &mut App, area: Rect) {
     let list = List::new(items)
         .block(
             Block::default()
-                .title(" Conversation ")
+                .title(" Target Acquisition & Dialogue ")
                 .title_style(Style::default().fg(Color::Cyan).bold())
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
