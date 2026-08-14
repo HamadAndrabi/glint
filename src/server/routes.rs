@@ -89,7 +89,12 @@ fn api_error(status: StatusCode, msg: impl Into<String>) -> Response {
 
 /// Validate that the requested model matches the loaded model.
 fn validate_model(requested: &str, loaded: &str) -> Result<(), Response> {
-    if requested != loaded {
+    if requested != loaded
+        && requested != "default"
+        && requested != "auto"
+        && requested != "glint"
+        && !requested.is_empty()
+    {
         Err(api_error(
             StatusCode::NOT_FOUND,
             format!("model '{requested}' not found; available: {loaded}"),

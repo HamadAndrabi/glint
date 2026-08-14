@@ -1,9 +1,9 @@
 <!DOCTYPE html>
-<html lang="en" class="dark">
+<html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Glint - High-Performance LLM Inference Engine</title>
+  <title>Glint - Local Inference Engine</title>
   <link rel="icon" type="image/svg+xml" href="/assets/logo.svg">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -12,31 +12,29 @@
     :root {
       --bg-canvas: #090a0c;
       --bg-subtle: #111317;
-      --bg-surface: #16181d;
-      --bg-surface-hover: #1e2127;
-      --bg-surface-active: #252930;
+      --bg-surface: #17191f;
+      --bg-surface-hover: #1e222a;
+      --bg-surface-active: #262a34;
       
-      --border-subtle: #22252b;
-      --border-muted: #2d3139;
+      --border-subtle: #20232a;
+      --border-muted: #2c303a;
       --border-focus: #3b82f6;
 
-      --text-primary: #f1f5f9;
+      --text-primary: #f8fafc;
       --text-secondary: #94a3b8;
       --text-muted: #64748b;
-      --text-disabled: #475569;
-
-      --accent-primary: #3b82f6;
-      --accent-primary-hover: #2563eb;
-      --accent-subtle: rgba(59, 130, 246, 0.1);
       
+      --accent: #3b82f6;
+      --accent-hover: #2563eb;
+      --accent-dim: rgba(59, 130, 246, 0.12);
+
       --status-success: #10b981;
       --status-warning: #f59e0b;
-      --status-error: #ef4444;
+      --status-danger: #ef4444;
 
       --radius-sm: 6px;
       --radius-md: 8px;
       --radius-lg: 12px;
-      --radius-full: 9999px;
     }
 
     * {
@@ -68,6 +66,7 @@
       justify-content: space-between;
       padding: 0 20px;
       flex-shrink: 0;
+      z-index: 20;
     }
 
     .brand {
@@ -100,24 +99,26 @@
       font-size: 15px;
       font-weight: 600;
       letter-spacing: -0.01em;
-      color: var(--text-primary);
       display: flex;
       align-items: center;
       gap: 8px;
     }
 
-    .brand-version {
+    .brand-model-pill {
       font-family: 'JetBrains Mono', monospace;
       font-size: 11px;
       font-weight: 400;
-      color: var(--text-muted);
-      background: var(--bg-surface);
-      padding: 2px 6px;
+      color: var(--text-secondary);
+      background: var(--bg-subtle);
+      padding: 2px 8px;
       border-radius: var(--radius-sm);
       border: 1px solid var(--border-subtle);
+      max-width: 220px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
     }
 
-    /* Navigation */
     .nav-group {
       display: flex;
       align-items: center;
@@ -151,7 +152,7 @@
     .nav-item.active {
       background: var(--bg-surface);
       color: var(--text-primary);
-      box-shadow: 0 1px 2px rgba(0, 0, 0, 0.2);
+      box-shadow: 0 1px 2px rgba(0, 0, 0, 0.3);
     }
 
     .header-meta {
@@ -169,7 +170,7 @@
       color: var(--text-secondary);
       background: var(--bg-subtle);
       padding: 4px 10px;
-      border-radius: var(--radius-full);
+      border-radius: 9999px;
       border: 1px solid var(--border-subtle);
     }
 
@@ -180,7 +181,7 @@
       background: var(--status-success);
     }
 
-    /* ── Main Container ──────────────────────────────────────────────────────── */
+    /* ── Main Layout ─────────────────────────────────────────────────────────── */
     main {
       flex: 1;
       display: flex;
@@ -198,7 +199,7 @@
       display: flex;
     }
 
-    /* ── Chat Studio ─────────────────────────────────────────────────────────── */
+    /* ── Sidebar ─────────────────────────────────────────────────────────────── */
     .sidebar {
       width: 280px;
       background: var(--bg-subtle);
@@ -211,7 +212,7 @@
       flex-shrink: 0;
     }
 
-    .sidebar-section-title {
+    .sidebar-title {
       font-size: 11px;
       font-weight: 600;
       text-transform: uppercase;
@@ -226,7 +227,7 @@
       gap: 6px;
     }
 
-    .control-label-row {
+    .control-row {
       display: flex;
       justify-content: space-between;
       align-items: center;
@@ -234,7 +235,7 @@
       color: var(--text-secondary);
     }
 
-    .control-value {
+    .control-val {
       font-family: 'JetBrains Mono', monospace;
       font-size: 11px;
       color: var(--text-primary);
@@ -250,7 +251,7 @@
       width: 100%;
       height: 4px;
       background: var(--border-muted);
-      border-radius: var(--radius-full);
+      border-radius: 9999px;
       outline: none;
     }
 
@@ -264,7 +265,7 @@
       box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
     }
 
-    input[type="number"], textarea, input[type="text"] {
+    input[type="number"], input[type="text"], textarea {
       width: 100%;
       background: var(--bg-surface);
       border: 1px solid var(--border-subtle);
@@ -277,13 +278,8 @@
       transition: border-color 0.15s ease;
     }
 
-    input[type="number"]:focus, textarea:focus, input[type="text"]:focus {
+    input[type="number"]:focus, input[type="text"]:focus, textarea:focus {
       border-color: var(--border-focus);
-    }
-
-    textarea {
-      resize: vertical;
-      line-height: 1.5;
     }
 
     .btn-secondary {
@@ -308,7 +304,7 @@
       border-color: var(--border-muted);
     }
 
-    /* ── Chat Feed ───────────────────────────────────────────────────────────── */
+    /* ── Chat Container ──────────────────────────────────────────────────────── */
     .chat-container {
       flex: 1;
       display: flex;
@@ -503,23 +499,24 @@
       50% { opacity: 0; }
     }
 
-    /* Input area */
+    /* ── Refined Input Area ─────────────────────────────────────────────────── */
     .input-wrapper {
-      padding: 16px 24px;
+      padding: 16px 24px 20px 24px;
       background: var(--bg-canvas);
       border-top: 1px solid var(--border-subtle);
+      position: relative;
     }
 
     .input-box {
       max-width: 800px;
       margin: 0 auto;
       background: var(--bg-subtle);
-      border: 1px solid var(--border-subtle);
+      border: 1px solid var(--border-muted);
       border-radius: var(--radius-lg);
       padding: 10px 14px;
       display: flex;
       flex-direction: column;
-      gap: 8px;
+      gap: 10px;
       transition: border-color 0.15s ease, box-shadow 0.15s ease;
     }
 
@@ -537,7 +534,7 @@
       font-size: 14px;
       font-family: inherit;
       resize: none;
-      min-height: 48px;
+      min-height: 38px;
       max-height: 180px;
       line-height: 1.5;
     }
@@ -559,15 +556,15 @@
     kbd {
       background: var(--bg-surface);
       border: 1px solid var(--border-subtle);
-      padding: 1px 4px;
+      padding: 1px 5px;
       border-radius: var(--radius-sm);
       font-family: inherit;
       font-size: 10px;
       color: var(--text-secondary);
     }
 
-    .btn-primary {
-      background: var(--accent-primary);
+    .btn-action {
+      background: var(--accent);
       color: #ffffff;
       font-size: 13px;
       font-weight: 500;
@@ -581,8 +578,12 @@
       gap: 6px;
     }
 
-    .btn-primary:hover {
-      background: var(--accent-primary-hover);
+    .btn-action:hover {
+      background: var(--accent-hover);
+    }
+
+    .btn-action.stop {
+      background: var(--status-danger);
     }
 
     /* ── Split Studios (Structured & Tools) ─────────────────────────────────── */
@@ -703,7 +704,7 @@
     }
 
     .kv-block.active {
-      background: var(--accent-primary);
+      background: var(--accent);
     }
 
     .kv-block.cached {
@@ -721,7 +722,7 @@
       </div>
       <div class="brand-title">
         Glint
-        <span class="brand-version">v0.1.0</span>
+        <span class="brand-model-pill" id="headerModelTag">Loading...</span>
       </div>
     </a>
 
@@ -757,34 +758,34 @@
     <div class="workspace-pane active" id="chatPane">
       <aside class="sidebar">
         <div>
-          <div class="sidebar-section-title">Parameters</div>
+          <div class="sidebar-title">Parameters</div>
           <div class="control-group" style="margin-bottom: 14px;">
-            <div class="control-label-row">
+            <div class="control-row">
               <span>Temperature</span>
-              <span class="control-value" id="tempValue">0.70</span>
+              <span class="control-val" id="tempValue">0.70</span>
             </div>
             <input type="range" id="tempRange" min="0" max="2" step="0.05" value="0.7">
           </div>
 
           <div class="control-group" style="margin-bottom: 14px;">
-            <div class="control-label-row">
+            <div class="control-row">
               <span>Top P</span>
-              <span class="control-value" id="topPValue">0.90</span>
+              <span class="control-val" id="topPValue">0.90</span>
             </div>
             <input type="range" id="topPRange" min="0" max="1" step="0.05" value="0.9">
           </div>
 
           <div class="control-group" style="margin-bottom: 14px;">
-            <div class="control-label-row">
+            <div class="control-row">
               <span>Max Tokens</span>
-              <span class="control-value" id="maxTokensValue">512</span>
+              <span class="control-val" id="maxTokensValue">512</span>
             </div>
             <input type="number" id="maxTokensInput" min="16" max="4096" value="512">
           </div>
         </div>
 
         <div class="control-group">
-          <div class="sidebar-section-title">System Prompt</div>
+          <div class="sidebar-title">System Prompt</div>
           <textarea id="systemPrompt" rows="4" placeholder="Optional system instructions...">You are Glint, an efficient and helpful AI assistant.</textarea>
         </div>
 
@@ -812,14 +813,14 @@
 
         <div class="input-wrapper">
           <div class="input-box">
-            <textarea class="chat-textarea" id="chatInput" placeholder="Send a message..."></textarea>
+            <textarea class="chat-textarea" id="chatInput" placeholder="Send a message..." rows="1"></textarea>
             <div class="input-actions">
               <div class="keyboard-hint">
                 <kbd>Return</kbd> to send, <kbd>Shift + Return</kbd> for new line
               </div>
-              <button class="btn-primary" id="sendBtn">
-                Send
-                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+              <button class="btn-action" id="actionBtn">
+                <span id="btnText">Send</span>
+                <svg id="btnIcon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
               </button>
             </div>
           </div>
@@ -852,7 +853,7 @@
 }</textarea>
           <div class="panel-footer">
             <input type="text" id="schemaPrompt" value="Create a profile for a senior systems software engineer specializing in Rust" style="flex: 1;">
-            <button class="btn-primary" id="executeSchemaBtn">Generate</button>
+            <button class="btn-action" id="executeSchemaBtn">Generate</button>
           </div>
         </div>
 
@@ -892,7 +893,7 @@
 ]</textarea>
           <div class="panel-footer">
             <input type="text" id="toolPrompt" value="What is the weather like in Tokyo right now?" style="flex: 1;">
-            <button class="btn-primary" id="executeToolBtn">Invoke</button>
+            <button class="btn-action" id="executeToolBtn">Invoke</button>
           </div>
         </div>
 
@@ -926,7 +927,7 @@
             <!-- 64 blocks -->
           </div>
           <div style="display: flex; justify-content: space-between; font-size: 12px; color: var(--text-secondary); margin-top: 6px;">
-            <span>Pool Utilization: <span id="kvAllocated" style="font-family: 'JetBrains Mono', monospace; color: var(--text-primary);">8 / 512 pages</span></span>
+            <span>Pool Utilization: <span id="kvAllocated" style="font-family: 'JetBrains Mono', monospace; color: var(--text-primary);">0 / 512 pages</span></span>
             <span>Prefix Caching: Active</span>
           </div>
         </div>
@@ -947,6 +948,27 @@
   </main>
 
   <script>
+    let activeModelName = 'default';
+    let isGenerating = false;
+    let currentAbortController = null;
+
+    // Fetch loaded model name
+    async function loadModelInfo() {
+      try {
+        const res = await fetch('/v1/models');
+        if (res.ok) {
+          const data = await res.json();
+          if (data.data && data.data.length > 0) {
+            activeModelName = data.data[0].id;
+            document.getElementById('headerModelTag').textContent = activeModelName;
+          }
+        }
+      } catch (e) {
+        document.getElementById('headerModelTag').textContent = 'glint-core';
+      }
+    }
+    loadModelInfo();
+
     // ── Tab Management ────────────────────────────────────────────────────────
     document.querySelectorAll('.nav-item').forEach(btn => {
       btn.addEventListener('click', () => {
@@ -971,6 +993,14 @@
     const maxTokensValue = document.getElementById('maxTokensValue');
     maxTokensInput.addEventListener('input', () => maxTokensValue.textContent = maxTokensInput.value);
 
+    // ── Auto-resizing Textarea ────────────────────────────────────────────────
+    const chatInput = document.getElementById('chatInput');
+    function autoResizeTextarea() {
+      chatInput.style.height = 'auto';
+      chatInput.style.height = Math.min(chatInput.scrollHeight, 180) + 'px';
+    }
+    chatInput.addEventListener('input', autoResizeTextarea);
+
     // ── KV Grid Init ──────────────────────────────────────────────────────────
     const kvGrid = document.getElementById('kvGrid');
     if (kvGrid) {
@@ -984,19 +1014,33 @@
     // ── Prompt Suggestions ────────────────────────────────────────────────────
     document.querySelectorAll('.suggestion-item').forEach(item => {
       item.addEventListener('click', () => {
-        const input = document.getElementById('chatInput');
-        input.value = item.dataset.prompt;
-        input.focus();
+        chatInput.value = item.dataset.prompt;
+        autoResizeTextarea();
+        chatInput.focus();
       });
     });
 
     // ── Chat Logic ────────────────────────────────────────────────────────────
     let conversation = [];
     const chatFeed = document.getElementById('chatFeed');
-    const chatInput = document.getElementById('chatInput');
-    const sendBtn = document.getElementById('sendBtn');
+    const actionBtn = document.getElementById('actionBtn');
+    const btnText = document.getElementById('btnText');
+    const btnIcon = document.getElementById('btnIcon');
     const emptyState = document.getElementById('emptyState');
     const clearChatBtn = document.getElementById('clearChatBtn');
+
+    function setGeneratingState(generating) {
+      isGenerating = generating;
+      if (generating) {
+        actionBtn.classList.add('stop');
+        btnText.textContent = 'Stop';
+        btnIcon.innerHTML = '<rect x="3" y="3" width="18" height="18" rx="2" ry="2"/>';
+      } else {
+        actionBtn.classList.remove('stop');
+        btnText.textContent = 'Send';
+        btnIcon.innerHTML = '<line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/>';
+      }
+    }
 
     clearChatBtn.addEventListener('click', () => {
       conversation = [];
@@ -1005,13 +1049,26 @@
       emptyState.style.display = 'flex';
     });
 
+    async function handleActionClick() {
+      if (isGenerating) {
+        if (currentAbortController) {
+          currentAbortController.abort();
+          currentAbortController = null;
+        }
+        setGeneratingState(false);
+        return;
+      }
+      await sendMessage();
+    }
+
     async function sendMessage() {
       const text = chatInput.value.trim();
-      if (!text) return;
+      if (!text || isGenerating) return;
 
       if (emptyState) emptyState.style.display = 'none';
 
       chatInput.value = '';
+      chatInput.style.height = '38px';
       appendMessageRow('user', text);
 
       const sys = document.getElementById('systemPrompt').value.trim();
@@ -1024,6 +1081,9 @@
       const bodyEl = assistantRow.querySelector('.message-body');
       const telemetryEl = assistantRow.querySelector('.message-telemetry');
 
+      setGeneratingState(true);
+      currentAbortController = new AbortController();
+
       const t0 = performance.now();
       let ttft = null;
       let tokenCount = 0;
@@ -1033,8 +1093,9 @@
         const res = await fetch('/v1/chat/completions', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
+          signal: currentAbortController.signal,
           body: JSON.stringify({
-            model: 'default',
+            model: activeModelName || 'default',
             messages: messages,
             stream: true,
             temperature: parseFloat(tempRange.value),
@@ -1042,6 +1103,11 @@
             max_tokens: parseInt(maxTokensInput.value)
           })
         });
+
+        if (!res.ok) {
+          const errText = await res.text();
+          throw new Error(`HTTP ${res.status}: ${errText}`);
+        }
 
         const reader = res.body.getReader();
         const decoder = new TextDecoder();
@@ -1063,7 +1129,7 @@
 
             try {
               const parsed = JSON.parse(dataStr);
-              const delta = parsed.choices[0]?.delta?.content || '';
+              const delta = parsed.choices?.[0]?.delta?.content || '';
               if (delta) {
                 if (ttft === null) {
                   ttft = performance.now() - t0;
@@ -1092,7 +1158,15 @@
         conversation.push({ role: 'assistant', content: fullText });
 
       } catch (err) {
-        bodyEl.innerHTML = `<span style="color: var(--status-error);">Error: ${err.message}</span>`;
+        if (err.name === 'AbortError') {
+          bodyEl.innerHTML = formatMarkdown(fullText) + ' <span style="color: var(--text-muted);">[Stopped]</span>';
+        } else {
+          bodyEl.innerHTML = `<span style="color: var(--status-danger);">Error: ${err.message}</span>`;
+        }
+      } finally {
+        setGeneratingState(false);
+        currentAbortController = null;
+        chatFeed.scrollTop = chatFeed.scrollHeight;
       }
     }
 
@@ -1131,7 +1205,7 @@
       return row;
     }
 
-    sendBtn.addEventListener('click', sendMessage);
+    actionBtn.addEventListener('click', handleActionClick);
     chatInput.addEventListener('keydown', (e) => {
       if (e.key === 'Enter' && !e.shiftKey) {
         e.preventDefault();
@@ -1180,7 +1254,7 @@
     });
 
     executeSchemaBtn.addEventListener('click', async () => {
-      schemaOutput.value = '// Enforcing JSON Schema constraint...\n// Generating constrained tokens...';
+      schemaOutput.value = '// Generating constrained tokens...';
       schemaStatus.textContent = 'Generating...';
       try {
         const schema = JSON.parse(schemaInput.value);
@@ -1188,16 +1262,16 @@
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            model: 'default',
+            model: activeModelName || 'default',
             messages: [{ role: 'user', content: schemaPrompt.value }],
             response_format: { type: 'json_schema', json_schema: { schema: schema, strict: true } },
             max_tokens: 512
           })
         });
         const data = await res.json();
-        const content = data.choices[0]?.message?.content || JSON.stringify(data, null, 2);
+        const content = data.choices?.[0]?.message?.content || JSON.stringify(data, null, 2);
         schemaOutput.value = content;
-        schemaStatus.textContent = 'Success (Valid JSON)';
+        schemaStatus.textContent = 'Valid JSON';
       } catch (e) {
         schemaOutput.value = `// Error: ${e.message}`;
         schemaStatus.textContent = 'Error';
@@ -1218,14 +1292,14 @@
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            model: 'default',
+            model: activeModelName || 'default',
             messages: [{ role: 'user', content: toolPrompt.value }],
             tools: tools,
             tool_choice: 'auto'
           })
         });
         const data = await res.json();
-        const msg = data.choices[0]?.message;
+        const msg = data.choices?.[0]?.message;
         if (msg?.tool_calls) {
           toolsOutput.value = JSON.stringify(msg.tool_calls, null, 2);
         } else {
