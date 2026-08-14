@@ -80,11 +80,17 @@ pub enum GlintError {
         available: usize,
         capacity: usize,
     },
+    // ── Constrained generation errors ──────────────────────────────────────────
+    /// A token constraint specification (JSON schema, GBNF grammar) is invalid.
+    ConstraintError(String),
 }
 
 impl fmt::Display for GlintError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ConstraintError(detail) => {
+                write!(f, "invalid token constraint: {detail}")
+            }
             Self::TensorNotFound(name) => {
                 write!(f, "tensor '{name}' not found in model")
             }

@@ -308,16 +308,28 @@ pub unsafe extern "C" fn glint_session_new_constrained(
 
         let constraint_spec = match type_str {
             "json_object" => Some(crate::constrained::ConstraintSpec::JsonObject),
-            "json_schema" => match serde_json::from_str::<serde_json::Value>(payload_str) {
-                Ok(val) => Some(crate::constrained::ConstraintSpec::JsonSchema(val)),
-                Err(e) => {
-                    set_error(format!("invalid JSON schema: {e}"));
+            "json_schema" => {
+                if constraint_payload.is_null() {
+                    set_error("JSON schema constraint requires non-null payload");
                     return std::ptr::null_mut();
                 }
-            },
-            "grammar" => Some(crate::constrained::ConstraintSpec::Grammar(
-                payload_str.to_string(),
-            )),
+                match serde_json::from_str::<serde_json::Value>(payload_str) {
+                    Ok(val) => Some(crate::constrained::ConstraintSpec::JsonSchema(val)),
+                    Err(e) => {
+                        set_error(format!("invalid JSON schema: {e}"));
+                        return std::ptr::null_mut();
+                    }
+                }
+            }
+            "grammar" => {
+                if constraint_payload.is_null() || payload_str.trim().is_empty() {
+                    set_error("GBNF grammar constraint requires non-null/non-empty payload");
+                    return std::ptr::null_mut();
+                }
+                Some(crate::constrained::ConstraintSpec::Grammar(
+                    payload_str.to_string(),
+                ))
+            }
             other => {
                 set_error(format!("unknown constraint type: {other}"));
                 return std::ptr::null_mut();
@@ -330,6 +342,11 @@ pub unsafe extern "C" fn glint_session_new_constrained(
 
         let m = unsafe { &(*model).0 };
         let session = m.new_session(&opts);
+
+        if opts.constraint.is_some() && session.constraint.is_none() {
+            set_error("failed to build specified token constraint");
+            return std::ptr::null_mut();
+        }
 
         Box::into_raw(Box::new(GlintSessionHandle { session, opts }))
     })

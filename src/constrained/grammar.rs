@@ -28,8 +28,8 @@ impl GrammarConstraint {
 }
 
 impl TokenConstraint for GrammarConstraint {
-    fn allowed_tokens(&mut self, _token_history: &[u32], _vocab: &VocabIndex) -> Vec<bool> {
-        self.matcher.allowed_mask(&self.vocab, None)
+    fn allowed_tokens(&mut self, _token_history: &[u32], vocab: &VocabIndex) -> Vec<bool> {
+        self.matcher.allowed_mask(vocab, None)
     }
 
     fn advance(&mut self, token_id: u32) {
@@ -86,6 +86,7 @@ mod tests {
             "false".into(),
             " ".into(),
             "\n".into(),
+            "</s>".into(),
         ];
         VocabIndex::from_vocab(&tokens)
     }
@@ -105,5 +106,24 @@ mod tests {
         let mut constraint = JsonSchemaConstraint::from_json_schema(&schema, Arc::clone(&vocab)).unwrap();
         let mask = constraint.allowed_tokens(&[], &vocab);
         assert!(!mask.is_empty());
+    }
+
+    #[test]
+    fn test_grammar_constraint_eos_allowed_on_completion() {
+        let tokens: Vec<String> = vec![
+            "hello".into(),
+            "</s>".into(),
+        ];
+        let vocab = VocabIndex::from_vocab(&tokens);
+        let gbnf = r#"root ::= "hello""#;
+        let mut constraint = GrammarConstraint::from_gbnf_str(gbnf, Arc::clone(&vocab)).unwrap();
+
+        let mask1 = constraint.allowed_tokens(&[], &vocab);
+        assert!(mask1[0], "hello allowed");
+        assert!(!mask1[1], "eos not allowed before completion");
+
+        constraint.advance(0); // advance "hello"
+        let mask2 = constraint.allowed_tokens(&[0], &vocab);
+        assert!(mask2[1], "eos must be allowed after completing grammar");
     }
 }

@@ -67,6 +67,8 @@ pub struct VocabIndex {
     pub strings: Vec<String>,
     /// `char_to_ids[ch]` lists all token ids whose first decoded char is `ch`.
     pub char_to_ids: HashMap<char, Vec<u32>>,
+    /// Token IDs representing end of sequence (EOS).
+    pub eos_token_ids: Vec<u32>,
 }
 
 impl VocabIndex {
@@ -76,15 +78,53 @@ impl VocabIndex {
     /// same order as the tokenizer's internal vocab table.
     pub fn from_vocab(vocab: &[String]) -> Arc<Self> {
         let mut char_to_ids: HashMap<char, Vec<u32>> = HashMap::new();
+        let mut eos_token_ids: Vec<u32> = Vec::new();
+        let eos_candidates = [
+            "</s>",
+            "<|endoftext|>",
+            "<|eot_id|>",
+            "<|im_end|>",
+            "<eos>",
+            "[EOS]",
+            "<end_of_turn>",
+        ];
         for (id, s) in vocab.iter().enumerate() {
             if let Some(ch) = s.chars().next() {
                 char_to_ids.entry(ch).or_default().push(id as u32);
+            }
+            if eos_candidates.contains(&s.as_str()) || s.is_empty() {
+                eos_token_ids.push(id as u32);
             }
         }
         Arc::new(Self {
             strings: vocab.to_vec(),
             char_to_ids,
+            eos_token_ids,
         })
+    }
+
+    /// Add an explicit EOS token ID.
+    pub fn with_eos_token(mut self: Arc<Self>, eos_id: u32) -> Arc<Self> {
+        if let Some(s) = Arc::get_mut(&mut self) {
+            if !s.eos_token_ids.contains(&eos_id) {
+                s.eos_token_ids.push(eos_id);
+            }
+            self
+        } else {
+            let mut cloned = (*self).clone_data();
+            if !cloned.eos_token_ids.contains(&eos_id) {
+                cloned.eos_token_ids.push(eos_id);
+            }
+            Arc::new(cloned)
+        }
+    }
+
+    fn clone_data(&self) -> Self {
+        Self {
+            strings: self.strings.clone(),
+            char_to_ids: self.char_to_ids.clone(),
+            eos_token_ids: self.eos_token_ids.clone(),
+        }
     }
 }
 
@@ -243,8 +283,7 @@ impl JsonState {
     }
 
     /// True if this state represents a complete, well-formed JSON object.
-    #[cfg(test)]
-    fn is_terminal(&self) -> bool {
+    pub fn is_terminal(&self) -> bool {
         matches!(self, Self::Done)
     }
 }
@@ -279,8 +318,10 @@ impl JsonObjectConstraint {
     fn build_mask(&mut self) -> &Vec<bool> {
         let state = self.state.clone();
         let strings = &self.vocab.strings;
+        let is_term = state.is_terminal();
+        let eos_ids = self.vocab.eos_token_ids.clone();
         self.mask_cache.entry(state.clone()).or_insert_with(|| {
-            strings
+            let mut mask: Vec<bool> = strings
                 .iter()
                 .map(|s| {
                     if s.is_empty() {
@@ -292,7 +333,15 @@ impl JsonObjectConstraint {
                     let next = state.clone().step_str(s);
                     next != JsonState::Error
                 })
-                .collect()
+                .collect();
+            if is_term {
+                for eos in &eos_ids {
+                    if (*eos as usize) < mask.len() {
+                        mask[*eos as usize] = true;
+                    }
+                }
+            }
+            mask
         })
     }
 }
@@ -364,27 +413,20 @@ impl TokenConstraint for JsonEnumConstraint {
 }
 
 /// Build a [`Box<dyn TokenConstraint>`] from a [`ConstraintSpec`].
-pub fn build_constraint(spec: &ConstraintSpec, vocab: Arc<VocabIndex>) -> Box<dyn TokenConstraint> {
+pub fn build_constraint(
+    spec: &ConstraintSpec,
+    vocab: Arc<VocabIndex>,
+) -> Result<Box<dyn TokenConstraint>, String> {
     match spec {
-        ConstraintSpec::JsonObject => Box::new(JsonObjectConstraint::new(vocab)),
-        ConstraintSpec::JsonEnum(opts) => Box::new(JsonEnumConstraint::new(opts.clone(), vocab)),
+        ConstraintSpec::JsonObject => Ok(Box::new(JsonObjectConstraint::new(vocab))),
+        ConstraintSpec::JsonEnum(opts) => Ok(Box::new(JsonEnumConstraint::new(opts.clone(), vocab))),
         ConstraintSpec::JsonSchema(schema) => {
-            match JsonSchemaConstraint::from_json_schema(schema, Arc::clone(&vocab)) {
-                Ok(c) => Box::new(c),
-                Err(e) => {
-                    eprintln!("Warning: failed to compile JSON schema to GBNF ({e}), falling back to JsonObject");
-                    Box::new(JsonObjectConstraint::new(vocab))
-                }
-            }
+            let c = JsonSchemaConstraint::from_json_schema(schema, vocab)?;
+            Ok(Box::new(c))
         }
         ConstraintSpec::Grammar(grammar_str) => {
-            match GrammarConstraint::from_gbnf_str(grammar_str, Arc::clone(&vocab)) {
-                Ok(c) => Box::new(c),
-                Err(e) => {
-                    eprintln!("Warning: failed to parse GBNF grammar ({e}), falling back to JsonObject");
-                    Box::new(JsonObjectConstraint::new(vocab))
-                }
-            }
+            let c = GrammarConstraint::from_gbnf_str(grammar_str, vocab)?;
+            Ok(Box::new(c))
         }
     }
 }

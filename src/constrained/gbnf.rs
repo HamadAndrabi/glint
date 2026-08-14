@@ -53,6 +53,7 @@ impl std::str::FromStr for GbnfGrammar {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let mut rules = HashMap::new();
+        let mut first_rule_name = None;
         let mut current_rule_name = None;
         let mut current_rule_lines = Vec::new();
 
@@ -63,13 +64,17 @@ impl std::str::FromStr for GbnfGrammar {
             }
 
             if let Some((name, expr_part)) = line.split_once("::=") {
+                let trimmed_name = name.trim().to_string();
+                if first_rule_name.is_none() {
+                    first_rule_name = Some(trimmed_name.clone());
+                }
                 if let Some(prev_name) = current_rule_name.take() {
                     let combined = current_rule_lines.join(" ");
                     let expr = parse_expression(&combined)?;
                     rules.insert(prev_name, expr);
                     current_rule_lines.clear();
                 }
-                current_rule_name = Some(name.trim().to_string());
+                current_rule_name = Some(trimmed_name);
                 current_rule_lines.push(expr_part.trim().to_string());
             } else if current_rule_name.is_some() {
                 current_rule_lines.push(line.to_string());
@@ -91,8 +96,7 @@ impl std::str::FromStr for GbnfGrammar {
         let root_rule = if rules.contains_key("root") {
             "root".to_string()
         } else {
-            // Pick first rule in input order if root isn't explicitly named
-            rules.keys().next().unwrap().clone()
+            first_rule_name.unwrap()
         };
 
         Ok(Self { rules, root_rule })
@@ -119,23 +123,34 @@ impl GbnfGrammar {
 
 fn strip_comments(line: &str) -> &str {
     let mut in_quote = false;
+    let mut in_bracket = false;
     let mut quote_char = ' ';
     let mut escaped = false;
 
     let chars: Vec<(usize, char)> = line.char_indices().collect();
     for i in 0..chars.len() {
         let (idx, ch) = chars[i];
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
         if in_quote {
-            if escaped {
-                escaped = false;
-            } else if ch == '\\' {
-                escaped = true;
-            } else if ch == quote_char {
+            if ch == quote_char {
                 in_quote = false;
+            }
+        } else if in_bracket {
+            if ch == ']' {
+                in_bracket = false;
             }
         } else if ch == '"' || ch == '\'' {
             in_quote = true;
             quote_char = ch;
+        } else if ch == '[' {
+            in_bracket = true;
         } else if ch == '#' || (ch == '/' && i + 1 < chars.len() && chars[i + 1].1 == '/') {
             return &line[..idx];
         }
@@ -542,10 +557,12 @@ impl GbnfExpr {
                 if !visited.insert(name.clone()) {
                     return false; // recursion guard
                 }
-                grammar
+                let res = grammar
                     .get(name)
                     .map(|e| e.nullable_inner(grammar, visited))
-                    .unwrap_or(false)
+                    .unwrap_or(false);
+                visited.remove(name);
+                res
             }
             Self::Sequence(elements) => elements.iter().all(|e| e.nullable_inner(grammar, visited)),
             Self::Choice(branches) => branches.iter().any(|b| b.nullable_inner(grammar, visited)),
@@ -598,11 +615,13 @@ impl GbnfExpr {
                 if !visited.insert(name.clone()) {
                     return Self::Reject; // recursion loop
                 }
-                if let Some(target) = grammar.get(name) {
+                let res = if let Some(target) = grammar.get(name) {
                     target.derivative_inner(ch, grammar, visited)
                 } else {
                     Self::Reject
-                }
+                };
+                visited.remove(name);
+                res
             }
             Self::Sequence(elements) => {
                 if elements.is_empty() {
@@ -710,31 +729,30 @@ impl GbnfMatcher {
         let grammar_rules = &self.grammar.rules;
         let is_term = self.is_terminal();
 
-        if let Some(mask) = self.mask_cache.get(&state) {
-            let mut result = mask.clone();
-            if let Some(eos) = eos_token_id {
-                if (eos as usize) < result.len() {
-                    result[eos as usize] = is_term;
+        let mut mask = if let Some(cached) = self.mask_cache.get(&state) {
+            cached.clone()
+        } else {
+            let mut mask = Vec::with_capacity(vocab.strings.len());
+            for s in &vocab.strings {
+                if s.is_empty() {
+                    mask.push(false);
+                    continue;
                 }
+                let next_state = state.clone().step_str(s, grammar_rules);
+                mask.push(next_state != GbnfExpr::Reject);
             }
-            return result;
-        }
-
-        let mut mask = Vec::with_capacity(vocab.strings.len());
-        for s in &vocab.strings {
-            if s.is_empty() {
-                mask.push(false);
-                continue;
-            }
-            let next_state = state.clone().step_str(s, grammar_rules);
-            mask.push(next_state != GbnfExpr::Reject);
-        }
-
-        self.mask_cache.insert(state, mask.clone());
+            self.mask_cache.insert(state, mask.clone());
+            mask
+        };
 
         if let Some(eos) = eos_token_id {
             if (eos as usize) < mask.len() {
                 mask[eos as usize] = is_term;
+            }
+        }
+        for eos in &vocab.eos_token_ids {
+            if (*eos as usize) < mask.len() {
+                mask[*eos as usize] = is_term;
             }
         }
 
@@ -848,4 +866,53 @@ mod tests {
         assert!(!mask2[0]); // "t" invalid
         assert!(!mask2[3]); // "f" invalid
     }
+
+    #[test]
+    fn test_gbnf_derivative_choice_branches_independent() {
+        let gbnf = r#"
+            root ::= foo "a" | foo "b"
+            foo  ::= "x"
+        "#;
+        let grammar = Arc::new(GbnfGrammar::from_str(gbnf).unwrap());
+
+        let mut m1 = GbnfMatcher::new(Arc::clone(&grammar));
+        m1.advance_str("xa");
+        assert!(m1.is_terminal(), "xa should be accepted");
+
+        let mut m2 = GbnfMatcher::new(Arc::clone(&grammar));
+        m2.advance_str("xb");
+        assert!(m2.is_terminal(), "xb should be accepted");
+    }
+
+    #[test]
+    fn test_gbnf_nullable_sequence_branches_independent() {
+        let gbnf = r#"
+            root ::= opt opt
+            opt  ::= "a"?
+        "#;
+        let grammar = Arc::new(GbnfGrammar::from_str(gbnf).unwrap());
+        let mut m = GbnfMatcher::new(Arc::clone(&grammar));
+        assert!(m.is_terminal(), "root should be nullable initially");
+        m.advance_str("a");
+        assert!(m.is_terminal(), "root should be nullable after 1 'a'");
+        m.advance_str("a");
+        assert!(m.is_terminal(), "root should be nullable after 2 'a's");
+    }
+
+    #[test]
+    fn test_strip_comments_with_bracketed_quotes() {
+        let line = r#"chars ::= [^"\\]+ # comment"#;
+        assert_eq!(strip_comments(line).trim(), r#"chars ::= [^"\\]+"#);
+    }
+
+    #[test]
+    fn test_root_rule_input_order() {
+        let gbnf = r#"
+            entry ::= "hello"
+            other ::= "world"
+        "#;
+        let grammar = GbnfGrammar::from_str(gbnf).unwrap();
+        assert_eq!(grammar.root_rule, "entry");
+    }
 }
+

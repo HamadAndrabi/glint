@@ -761,7 +761,12 @@ async fn streaming_completion(state: Arc<AppState>, prepared: PreparedGeneration
         .into_response()
 }
 
-async fn streaming_chat_completion(state: Arc<AppState>, prepared: PreparedGeneration) -> Response {
+async fn streaming_chat_completion(
+    state: Arc<AppState>,
+    prepared: PreparedGeneration,
+    is_tool_call_mode: bool,
+    specific_tool_name: Option<String>,
+) -> Response {
     let started = match start_generation(&state, prepared) {
         Ok(started) => started,
         Err(err) => return err,
@@ -773,13 +778,14 @@ async fn streaming_chat_completion(state: Arc<AppState>, prepared: PreparedGener
     let ttft_instant = t0;
     let id = gen_id();
     let created = now_secs();
+    let call_id = gen_id_with_prefix("call");
 
     // Clone for the finish chunk (originals are moved into the content closure)
     let finish_id = id.clone();
     let stream_model = started.model_name.clone();
     let finish_model = started.model_name.clone();
 
-    // First chunk: send the role
+    // First chunk: send the role (+ initial tool call delta if in tool call mode)
     let role_chunk = ChatChunk {
         id: id.clone(),
         object: "chat.completion.chunk",
@@ -787,10 +793,26 @@ async fn streaming_chat_completion(state: Arc<AppState>, prepared: PreparedGener
         model: stream_model.clone(),
         choices: vec![ChatChunkChoice {
             index: 0,
-            delta: ChatDelta {
-                role: Some("assistant"),
-                content: None,
-                tool_calls: None,
+            delta: if is_tool_call_mode {
+                ChatDelta {
+                    role: Some("assistant"),
+                    content: None,
+                    tool_calls: Some(vec![ToolCallDelta {
+                        index: 0,
+                        id: Some(call_id.clone()),
+                        tool_type: Some("function".to_string()),
+                        function: Some(FunctionCallDelta {
+                            name: specific_tool_name.clone(),
+                            arguments: Some(String::new()),
+                        }),
+                    }]),
+                }
+            } else {
+                ChatDelta {
+                    role: Some("assistant"),
+                    content: None,
+                    tool_calls: None,
+                }
             },
             finish_reason: None,
         }],
@@ -819,10 +841,26 @@ async fn streaming_chat_completion(state: Arc<AppState>, prepared: PreparedGener
             model: stream_model.clone(),
             choices: vec![ChatChunkChoice {
                 index: 0,
-                delta: ChatDelta {
-                    role: None,
-                    content: Some(text),
-                    tool_calls: None,
+                delta: if is_tool_call_mode {
+                    ChatDelta {
+                        role: None,
+                        content: None,
+                        tool_calls: Some(vec![ToolCallDelta {
+                            index: 0,
+                            id: None,
+                            tool_type: None,
+                            function: Some(FunctionCallDelta {
+                                name: None,
+                                arguments: Some(text),
+                            }),
+                        }]),
+                    }
+                } else {
+                    ChatDelta {
+                        role: None,
+                        content: Some(text),
+                        tool_calls: None,
+                    }
                 },
                 finish_reason: None,
             }],
@@ -837,7 +875,12 @@ async fn streaming_chat_completion(state: Arc<AppState>, prepared: PreparedGener
     let tc = Arc::clone(&token_count);
     let finish_signal = started.finish;
     let finish_stream = tokio_stream::iter(vec![0u8, 1u8]).filter_map(move |i| {
-        let reason = finish_reason_for(finish_signal.get());
+        let raw_reason = finish_reason_for(finish_signal.get());
+        let reason = if is_tool_call_mode && raw_reason == Some("stop") {
+            Some("tool_calls")
+        } else {
+            raw_reason
+        };
         if i == 0 {
             let event = match reason {
                 Some(reason) => {
@@ -887,6 +930,11 @@ pub async fn chat_completions(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Response {
+    let tools = match req.tool_choice.as_ref() {
+        Some(ToolChoice::Mode(mode)) if mode == "none" => None,
+        _ => req.tools.as_deref(),
+    };
+
     let mut prepared = match prepare_chat_generation(
         &state,
         &req.model,
@@ -897,22 +945,31 @@ pub async fn chat_completions(
         req.top_k,
         req.repeat_penalty,
         req.seed,
-        req.tools.as_deref(),
+        tools,
     ) {
         Ok(prepared) => prepared,
         Err(err) => return err,
     };
 
+    let mut is_tool_call_mode = false;
+    let mut specific_tool_name = None;
+
     if let Some(spec) = resolve_constraint(req.response_format.as_ref()) {
         prepared.constraint = Some(spec);
-    } else if let Some(tools) = req.tools.as_deref() {
-        if let Some(tool_constraint) = resolve_tool_constraint(tools, req.tool_choice.as_ref()) {
+    } else if let Some(t) = tools {
+        if let Some(tool_constraint) = resolve_tool_constraint(t, req.tool_choice.as_ref()) {
             prepared.constraint = Some(tool_constraint);
+            is_tool_call_mode = true;
+            if let Some(ToolChoice::Function { function, .. }) = req.tool_choice.as_ref() {
+                specific_tool_name = Some(function.name.clone());
+            } else if t.len() == 1 {
+                specific_tool_name = Some(t[0].function.name.clone());
+            }
         }
     }
 
     if req.stream.unwrap_or(false) {
-        streaming_chat_completion(state, prepared).await
+        streaming_chat_completion(state, prepared, is_tool_call_mode, specific_tool_name).await
     } else {
         let started = match start_generation(&state, prepared) {
             Ok(started) => started,
@@ -929,7 +986,7 @@ pub async fn chat_completions(
             );
         };
 
-        let tool_calls = maybe_parse_tool_call(&completed.text, req.tools.as_deref());
+        let tool_calls = maybe_parse_tool_call(&completed.text, tools);
         let finish_reason = if tool_calls.is_some() {
             "tool_calls"
         } else {

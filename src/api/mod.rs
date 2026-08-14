@@ -215,8 +215,10 @@ impl Model {
                 .map(|i| self.tokenizer.decode_token(i as u32).to_owned())
                 .collect();
             let vi = VocabIndex::from_vocab(&vocab_strings);
-            session.constraint = Some(build_constraint(spec, Arc::clone(&vi)));
-            session.vocab_index = Some(vi);
+            if let Ok(c) = build_constraint(spec, Arc::clone(&vi)) {
+                session.constraint = Some(c);
+                session.vocab_index = Some(vi);
+            }
         }
         session
     }
@@ -444,7 +446,7 @@ impl Model {
                 .map(|i| self.tokenizer.decode_token(i as u32).to_owned())
                 .collect();
             let vi = VocabIndex::from_vocab(&vocab_strings);
-            let mut constraint = build_constraint(spec, Arc::clone(&vi));
+            let mut constraint = build_constraint(spec, Arc::clone(&vi)).map_err(GlintError::ConstraintError)?;
             for &tok in session.tokens.iter().skip(session.prefill_len) {
                 constraint.advance(tok);
             }
