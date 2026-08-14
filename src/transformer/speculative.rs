@@ -337,7 +337,7 @@ mod tests {
         let mut rng = Xorshift64::new(12345);
         for _ in 0..10_000 {
             let v = rng.next_f32();
-            assert!(v >= 0.0 && v < 1.0, "v={v} out of [0,1)");
+            assert!((0.0..1.0).contains(&v), "v={v} out of [0,1)");
         }
     }
 

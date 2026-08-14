@@ -18,6 +18,10 @@ pub struct LayerWeights {
     pub attn_norm: Tensor,
     /// Pre-FFN RMSNorm scale — F32 in GGUF, tiny.
     pub ffn_norm: Tensor,
+    /// Optional post-attention RMSNorm scale (Gemma 2).
+    pub post_attn_norm: Option<Tensor>,
+    /// Optional post-FFN RMSNorm scale (Gemma 2).
+    pub post_ffn_norm: Option<Tensor>,
 
     /// Query projection [n_heads*head_dim, embed_dim] — quantized.
     pub attn_q: QuantizedTensor,
@@ -27,6 +31,13 @@ pub struct LayerWeights {
     pub attn_v: QuantizedTensor,
     /// Attention output projection [embed_dim, embed_dim] — quantized.
     pub attn_output: QuantizedTensor,
+
+    /// Optional Q projection bias (Qwen 2 / Qwen 2.5).
+    pub attn_q_bias: Option<Tensor>,
+    /// Optional K projection bias (Qwen 2 / Qwen 2.5).
+    pub attn_k_bias: Option<Tensor>,
+    /// Optional V projection bias (Qwen 2 / Qwen 2.5).
+    pub attn_v_bias: Option<Tensor>,
 
     /// FFN gate projection [ffn_hidden, embed_dim] — quantized.
     pub ffn_gate: QuantizedTensor,
@@ -70,6 +81,13 @@ impl TransformerWeights {
         mode: WeightLoadMode,
     ) -> Result<Self, GlintError> {
         let load = |name: &str| QuantizedTensor::load_with_mode(model, name, mode);
+        let load_opt_f32 = |name: &str| -> Option<Tensor> {
+            if model.get_tensor_info(name).is_some() {
+                load_tensor_f32(model, name).ok()
+            } else {
+                None
+            }
+        };
 
         eprintln!("Loading token embedding...");
         let token_embedding = load("token_embd.weight")?;
@@ -80,10 +98,16 @@ impl TransformerWeights {
             layers.push(LayerWeights {
                 attn_norm: load_tensor_f32(model, &format!("blk.{i}.attn_norm.weight"))?,
                 ffn_norm: load_tensor_f32(model, &format!("blk.{i}.ffn_norm.weight"))?,
+                post_attn_norm: load_opt_f32(&format!("blk.{i}.post_attention_norm.weight"))
+                    .or_else(|| load_opt_f32(&format!("blk.{i}.post_attn_norm.weight"))),
+                post_ffn_norm: load_opt_f32(&format!("blk.{i}.post_ffn_norm.weight")),
                 attn_q: load(&format!("blk.{i}.attn_q.weight"))?,
                 attn_k: load(&format!("blk.{i}.attn_k.weight"))?,
                 attn_v: load(&format!("blk.{i}.attn_v.weight"))?,
                 attn_output: load(&format!("blk.{i}.attn_output.weight"))?,
+                attn_q_bias: load_opt_f32(&format!("blk.{i}.attn_q.bias")),
+                attn_k_bias: load_opt_f32(&format!("blk.{i}.attn_k.bias")),
+                attn_v_bias: load_opt_f32(&format!("blk.{i}.attn_v.bias")),
                 ffn_gate: load(&format!("blk.{i}.ffn_gate.weight"))?,
                 ffn_up: load(&format!("blk.{i}.ffn_up.weight"))?,
                 ffn_down: load(&format!("blk.{i}.ffn_down.weight"))?,
@@ -159,6 +183,30 @@ impl TransformerWeights {
             eprint!("\rLoading layer {}/{}...", i + 1, n_layers);
             let p = format!("model.layers.{i}");
 
+            // Norms (handling Gemma 2 pre/post layernorms vs LLaMA)
+            let (attn_norm, ffn_norm, post_attn_norm, post_ffn_norm) =
+                if st.contains(&format!("{p}.pre_feedforward_layernorm.weight")) {
+                    // Gemma 2 layout
+                    (
+                        hf_vector(st, &format!("{p}.input_layernorm.weight"), embed_dim)?,
+                        hf_vector(st, &format!("{p}.pre_feedforward_layernorm.weight"), embed_dim)?,
+                        Some(hf_vector(st, &format!("{p}.post_attention_layernorm.weight"), embed_dim)?),
+                        if st.contains(&format!("{p}.post_feedforward_layernorm.weight")) {
+                            Some(hf_vector(st, &format!("{p}.post_feedforward_layernorm.weight"), embed_dim)?)
+                        } else {
+                            None
+                        },
+                    )
+                } else {
+                    // Standard LLaMA / Mistral / Qwen layout
+                    (
+                        hf_vector(st, &format!("{p}.input_layernorm.weight"), embed_dim)?,
+                        hf_vector(st, &format!("{p}.post_attention_layernorm.weight"), embed_dim)?,
+                        None,
+                        None,
+                    )
+                };
+
             let attn_q = hf_matrix(
                 st,
                 &format!("{p}.self_attn.q_proj.weight"),
@@ -172,16 +220,33 @@ impl TransformerWeights {
                 embed_dim,
             )?;
 
+            // Optional Qwen2 attention biases
+            let attn_q_bias = if st.contains(&format!("{p}.self_attn.q_proj.bias")) {
+                let b = hf_vector(st, &format!("{p}.self_attn.q_proj.bias"), n_heads * head_dim)?;
+                Some(permute_bias(b, n_heads, head_dim, rot_dim))
+            } else {
+                None
+            };
+            let attn_k_bias = if st.contains(&format!("{p}.self_attn.k_proj.bias")) {
+                let b = hf_vector(st, &format!("{p}.self_attn.k_proj.bias"), n_kv_heads * head_dim)?;
+                Some(permute_bias(b, n_kv_heads, head_dim, rot_dim))
+            } else {
+                None
+            };
+            let attn_v_bias = if st.contains(&format!("{p}.self_attn.v_proj.bias")) {
+                Some(hf_vector(st, &format!("{p}.self_attn.v_proj.bias"), n_kv_heads * head_dim)?)
+            } else {
+                None
+            };
+
             let ffn_gate = hf_matrix(st, &format!("{p}.mlp.gate_proj.weight"), None, embed_dim)?;
             let ffn_hidden = ffn_gate.rows();
 
             layers.push(LayerWeights {
-                attn_norm: hf_vector(st, &format!("{p}.input_layernorm.weight"), embed_dim)?,
-                ffn_norm: hf_vector(
-                    st,
-                    &format!("{p}.post_attention_layernorm.weight"),
-                    embed_dim,
-                )?,
+                attn_norm,
+                ffn_norm,
+                post_attn_norm,
+                post_ffn_norm,
                 attn_q: permute_qk(attn_q, n_heads, head_dim, rot_dim),
                 attn_k: permute_qk(attn_k, n_kv_heads, head_dim, rot_dim),
                 attn_v: hf_matrix(
@@ -196,6 +261,9 @@ impl TransformerWeights {
                     Some(embed_dim),
                     n_heads * head_dim,
                 )?,
+                attn_q_bias,
+                attn_k_bias,
+                attn_v_bias,
                 ffn_gate,
                 ffn_up: hf_matrix(
                     st,
@@ -363,6 +431,17 @@ fn permute_qk(
     QuantizedTensor::from_raw(permuted, rows, cols, ggml_type)
 }
 
+/// Apply [`permute_qk_rows`] to a loaded 1D Q/K bias vector.
+fn permute_bias(bias: Tensor, n_heads: usize, head_dim: usize, rot_dim: usize) -> Tensor {
+    let bytes: Vec<u8> = bias.data().iter().flat_map(|v| v.to_le_bytes()).collect();
+    let permuted_bytes = permute_qk_rows(&bytes, n_heads, head_dim, rot_dim, 4);
+    let mut out = Vec::with_capacity(bias.data().len());
+    for chunk in permuted_bytes.chunks_exact(4) {
+        out.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    }
+    Tensor::from_vec(out, bias.shape())
+}
+
 /// Reorder the rows of an HF Q/K projection into the RoPE layout Glint expects.
 ///
 /// HF's `apply_rotary_pos_emb` uses `rotate_half`: inside a head, dimension `j`
@@ -442,15 +521,12 @@ fn reject_unsupported_layouts(st: &SafeTensorsModel, n_layers: usize) -> Result<
                     .to_string(),
             ));
         }
-        // Qwen2-style attention biases: the forward pass has no bias term, so
-        // loading these weights would silently drop them.
-        for proj in ["q_proj", "k_proj", "v_proj", "o_proj"] {
-            if st.contains(&format!("{p}.self_attn.{proj}.bias")) {
-                return Err(GlintError::HfUnsupported(format!(
-                    "attention bias '{p}.self_attn.{proj}.bias' — Glint's attention \
-                     is bias-free"
-                )));
-            }
+        // Attention output projection bias: Glint's o_proj is bias-free (Qwen2 only biases q, k, v)
+        if st.contains(&format!("{p}.self_attn.o_proj.bias")) {
+            return Err(GlintError::HfUnsupported(format!(
+                "attention bias '{p}.self_attn.o_proj.bias' — Glint's attention output \
+                 is bias-free"
+            )));
         }
         // Qwen3-style per-head query/key norms.
         for norm in ["q_norm", "k_norm"] {
@@ -607,6 +683,11 @@ mod tests {
             sliding_window: None,
             rope_scaling_factor: None,
             partial_rotary_factor: None,
+            head_dim_override: None,
+            attn_logit_softcapping: None,
+            final_logit_softcapping: None,
+            query_pre_attn_scalar: None,
+            sliding_window_alternating: false,
         }
     }
 
@@ -1038,7 +1119,7 @@ mod tests {
             })
             .collect();
         specs.push(spec(
-            "model.layers.0.self_attn.q_proj.bias",
+            "model.layers.0.self_attn.o_proj.bias",
             &[EMBED],
             vec![0.1; EMBED],
         ));
@@ -1050,6 +1131,45 @@ mod tests {
             .err()
             .unwrap();
         assert!(err.to_string().contains("bias-free"), "got: {err}");
+    }
+
+    #[test]
+    fn test_qwen2_attention_biases_are_loaded() {
+        let mut specs: Vec<TensorSpec> = micro_weights()
+            .into_iter()
+            .map(|(hf, _, rows, cols, data)| {
+                let shape: Vec<usize> = if cols == 1 {
+                    vec![rows]
+                } else {
+                    vec![rows, cols]
+                };
+                spec(&hf, &shape, data)
+            })
+            .collect();
+        specs.push(spec(
+            "model.layers.0.self_attn.q_proj.bias",
+            &[EMBED],
+            vec![0.1; EMBED],
+        ));
+        specs.push(spec(
+            "model.layers.0.self_attn.k_proj.bias",
+            &[KV_HEADS * HEAD_DIM],
+            vec![0.2; KV_HEADS * HEAD_DIM],
+        ));
+        specs.push(spec(
+            "model.layers.0.self_attn.v_proj.bias",
+            &[KV_HEADS * HEAD_DIM],
+            vec![0.3; KV_HEADS * HEAD_DIM],
+        ));
+        let st = SafeTensorsModel::from_files(vec![
+            SafeTensorsFile::from_bytes(build_f32(&specs)).unwrap()
+        ])
+        .unwrap();
+        let weights = TransformerWeights::from_safetensors(&st, &micro_config(), false).unwrap();
+        assert!(weights.layers[0].attn_q_bias.is_some());
+        assert!(weights.layers[0].attn_k_bias.is_some());
+        assert!(weights.layers[0].attn_v_bias.is_some());
+        assert_eq!(weights.layers[0].attn_q_bias.as_ref().unwrap().data().len(), EMBED);
     }
 
     // ── Full directory load ──────────────────────────────────────────────────

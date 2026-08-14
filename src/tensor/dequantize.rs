@@ -692,7 +692,7 @@ mod tests {
 
     #[test]
     fn test_dequantize_f32() {
-        let values: Vec<f32> = vec![1.0, -2.5, 3.14];
+        let values: Vec<f32> = vec![1.0, -2.5, 3.5];
         let mut data = Vec::new();
         for v in &values {
             data.extend_from_slice(&v.to_le_bytes());
@@ -755,9 +755,7 @@ mod tests {
         data.extend_from_slice(&scale.to_le_bytes());
 
         // 16 bytes, each 0x88 → low nibble=8, high nibble=8 → both center to 0
-        for _ in 0..16 {
-            data.push(0x88);
-        }
+        data.extend(std::iter::repeat_n(0x88, 16));
 
         let result = dequantize_q4_0(&data, 32);
         assert_eq!(result.len(), 32);

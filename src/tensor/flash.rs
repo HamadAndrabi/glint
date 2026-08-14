@@ -37,6 +37,24 @@ pub fn flash_attn_1d(
     scale: f32,
     out: &mut [f32],
 ) {
+    flash_attn_1d_ext(
+        q, cache, layer, kv_h, start_pos, seq_len, head_dim, scale, None, out,
+    );
+}
+
+/// Compute single-query attention with optional logit soft-capping (Gemma 2).
+pub fn flash_attn_1d_ext(
+    q: &[f32],
+    cache: &dyn KvStore,
+    layer: usize,
+    kv_h: usize,
+    start_pos: usize,
+    seq_len: usize,
+    head_dim: usize,
+    scale: f32,
+    softcap: Option<f32>,
+    out: &mut [f32],
+) {
     debug_assert_eq!(q.len(), head_dim);
     debug_assert_eq!(out.len(), head_dim);
 
@@ -61,7 +79,11 @@ pub fn flash_attn_1d(
             for d in 0..head_dim {
                 dot += q[d] * k_buf[d];
             }
-            scores[i] = dot * scale;
+            let mut s = dot * scale;
+            if let Some(cap) = softcap {
+                s = cap * (s / cap).tanh();
+            }
+            scores[i] = s;
         }
 
         // Phase 2 — update running maximum

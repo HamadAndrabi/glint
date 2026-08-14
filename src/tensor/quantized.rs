@@ -1843,6 +1843,20 @@ mod tests {
                 }
             }
         }
+
+        #[cfg(all(target_arch = "aarch64", feature = "rayon"))]
+        {
+            let simd =
+                unsafe { crate::tensor::simd_neon::matvec_q8_0_neon(&data, rows, cols, &input) };
+            for i in 0..rows {
+                assert!(
+                    (scalar[i] - simd[i]).abs() < 1e-3,
+                    "Row {i}: scalar={}, neon={}",
+                    scalar[i],
+                    simd[i]
+                );
+            }
+        }
     }
 
     /// Q4_K: verify the direct scalar kernel matches dequantize-then-dot.
@@ -2021,6 +2035,20 @@ mod tests {
                 }
             }
         }
+
+        #[cfg(all(target_arch = "aarch64", feature = "rayon"))]
+        {
+            let simd =
+                unsafe { crate::tensor::simd_neon::matvec_q4_k_neon(&data, rows, cols, &input) };
+            for i in 0..rows {
+                assert!(
+                    (scalar[i] - simd[i]).abs() < 1e-3,
+                    "Row {i}: scalar={}, neon={}",
+                    scalar[i],
+                    simd[i]
+                );
+            }
+        }
         let _ = &GgmlType::Q4K; // suppress unused import warning
     }
 
@@ -2079,6 +2107,20 @@ mod tests {
                 }
             }
         }
+
+        #[cfg(all(target_arch = "aarch64", feature = "rayon"))]
+        {
+            let simd =
+                unsafe { crate::tensor::simd_neon::matvec_q5_k_neon(&data, rows, cols, &input) };
+            for i in 0..rows {
+                assert!(
+                    (scalar[i] - simd[i]).abs() < 1e-3,
+                    "Row {i}: scalar={}, neon={}",
+                    scalar[i],
+                    simd[i]
+                );
+            }
+        }
     }
 
     /// Verify Q6_K SIMD and scalar kernels produce the same output.
@@ -2126,6 +2168,20 @@ mod tests {
                         simd[i]
                     );
                 }
+            }
+        }
+
+        #[cfg(all(target_arch = "aarch64", feature = "rayon"))]
+        {
+            let simd =
+                unsafe { crate::tensor::simd_neon::matvec_q6_k_neon(&data, rows, cols, &input) };
+            for i in 0..rows {
+                assert!(
+                    (scalar[i] - simd[i]).abs() < 1e-3,
+                    "Row {i}: scalar={}, neon={}",
+                    scalar[i],
+                    simd[i]
+                );
             }
         }
     }
@@ -2454,10 +2510,24 @@ mod tests {
                 }
             }
         }
+
+        #[cfg(all(target_arch = "aarch64", feature = "rayon"))]
+        {
+            let simd =
+                unsafe { crate::tensor::simd_neon::matvec_q4_0_neon(&data, rows, cols, &input) };
+            for i in 0..rows {
+                assert!(
+                    (scalar[i] - simd[i]).abs() < 1e-3,
+                    "Row {i}: scalar={}, neon={}",
+                    scalar[i],
+                    simd[i]
+                );
+            }
+        }
     }
 
     /// Assert two kernels agree row-by-row.
-    #[cfg(all(target_arch = "x86_64", feature = "rayon"))]
+    #[cfg(any(all(target_arch = "x86_64", feature = "rayon"), target_arch = "aarch64"))]
     fn assert_rows_close(fmt: &str, scalar: &[f32], simd: &[f32]) {
         for (i, (&s, &v)) in scalar.iter().zip(simd).enumerate() {
             assert!((s - v).abs() < 1e-3, "{fmt} row {i}: scalar={s}, simd={v}");
@@ -2500,6 +2570,13 @@ mod tests {
                 assert_rows_close("Q4_1", &scalar, &simd);
             }
         }
+
+        #[cfg(all(target_arch = "aarch64", feature = "rayon"))]
+        {
+            let simd =
+                unsafe { crate::tensor::simd_neon::matvec_q4_1_neon(&data, rows, cols, &input) };
+            assert_rows_close("Q4_1", &scalar, &simd);
+        }
     }
 
     /// Verify SIMD and scalar Q5_0 kernels produce the same output.
@@ -2530,6 +2607,13 @@ mod tests {
                 assert_rows_close("Q5_0", &scalar, &simd);
             }
         }
+
+        #[cfg(all(target_arch = "aarch64", feature = "rayon"))]
+        {
+            let simd =
+                unsafe { crate::tensor::simd_neon::matvec_q5_0_neon(&data, rows, cols, &input) };
+            assert_rows_close("Q5_0", &scalar, &simd);
+        }
     }
 
     /// Verify SIMD and scalar Q5_1 kernels produce the same output.
@@ -2559,6 +2643,13 @@ mod tests {
                     unsafe { crate::tensor::simd::matvec_q5_1_avx2(&data, rows, cols, &input) };
                 assert_rows_close("Q5_1", &scalar, &simd);
             }
+        }
+
+        #[cfg(all(target_arch = "aarch64", feature = "rayon"))]
+        {
+            let simd =
+                unsafe { crate::tensor::simd_neon::matvec_q5_1_neon(&data, rows, cols, &input) };
+            assert_rows_close("Q5_1", &scalar, &simd);
         }
     }
 

@@ -66,11 +66,40 @@ pub fn add(a: &Tensor, b: &Tensor) -> Tensor {
     Tensor::from_vec(data, a.shape())
 }
 
+/// Element-wise addition in place: `a[i] += b[i]`.
+pub fn add_in_place(a: &mut [f32], b: &[f32]) {
+    assert_eq!(a.len(), b.len(), "Lengths must match for add_in_place");
+    for (dst, &src) in a.iter_mut().zip(b) {
+        *dst += src;
+    }
+}
+
 /// Element-wise multiplication. Shapes must match.
 pub fn mul(a: &Tensor, b: &Tensor) -> Tensor {
     assert_eq!(a.shape(), b.shape(), "Shapes must match for mul");
     let data: Vec<f32> = a.data().iter().zip(b.data()).map(|(x, y)| x * y).collect();
     Tensor::from_vec(data, a.shape())
+}
+
+/// Logit soft-capping: `cap * tanh(x / cap)`.
+///
+/// Used in Gemma 2 for attention logits and final logits to bound logit dynamics.
+pub fn logit_softcap(x: &Tensor, cap: f32) -> Tensor {
+    let inv_cap = 1.0 / cap;
+    let data: Vec<f32> = x
+        .data()
+        .iter()
+        .map(|&v| cap * (v * inv_cap).tanh())
+        .collect();
+    Tensor::from_vec(data, x.shape())
+}
+
+/// Logit soft-capping in-place: `x[i] = cap * tanh(x[i] / cap)`.
+pub fn logit_softcap_in_place(x: &mut [f32], cap: f32) {
+    let inv_cap = 1.0 / cap;
+    for v in x.iter_mut() {
+        *v = cap * (*v * inv_cap).tanh();
+    }
 }
 
 /// RMSNorm: `x / sqrt(mean(x²) + eps) * weight`.
@@ -376,5 +405,29 @@ mod tests {
         assert_eq!(result.shape(), &[2, 3]);
         approx_eq(&result.data()[0..3], &[0.7, 0.8, 0.9], 1e-6);
         approx_eq(&result.data()[3..6], &[0.1, 0.2, 0.3], 1e-6);
+    }
+
+    #[test]
+    fn test_add_in_place() {
+        let mut a = vec![1.0, 2.0, 3.0];
+        let b = vec![4.0, 5.0, 6.0];
+        add_in_place(&mut a, &b);
+        approx_eq(&a, &[5.0, 7.0, 9.0], 1e-6);
+    }
+
+    #[test]
+    fn test_logit_softcap() {
+        let x = Tensor::from_vec(vec![0.0, 50.0, -50.0, 1000.0, -1000.0], &[5]);
+        let capped = logit_softcap(&x, 50.0);
+        // 50 * tanh(0) = 0
+        // 50 * tanh(1) ≈ 50 * 0.761594156 = 38.0797
+        // 50 * tanh(-1) ≈ -38.0797
+        // 50 * tanh(20) ≈ 50.0
+        // 50 * tanh(-20) ≈ -50.0
+        approx_eq(&[capped.data()[0]], &[0.0], 1e-6);
+        approx_eq(&[capped.data()[1]], &[50.0 * 1.0f32.tanh()], 1e-6);
+        approx_eq(&[capped.data()[2]], &[-50.0 * 1.0f32.tanh()], 1e-6);
+        assert!((capped.data()[3] - 50.0).abs() < 1e-5);
+        assert!((capped.data()[4] + 50.0).abs() < 1e-5);
     }
 }
