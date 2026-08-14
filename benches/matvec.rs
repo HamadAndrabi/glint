@@ -163,7 +163,11 @@ fn bench_format(c: &mut Criterion, name: &str, ggml_type: GgmlType) {
     let mut group = c.benchmark_group(name);
 
     for &(rows, cols) in SIZES {
-        if matches!(ggml_type, GgmlType::Q4K | GgmlType::Q5K | GgmlType::Q6K | GgmlType::Q2K | GgmlType::Q3K) && cols % 256 != 0 {
+        if matches!(
+            ggml_type,
+            GgmlType::Q4K | GgmlType::Q5K | GgmlType::Q6K | GgmlType::Q2K | GgmlType::Q3K
+        ) && cols % 256 != 0
+        {
             continue;
         }
         let qt = make_matrix(rows, cols, ggml_type);

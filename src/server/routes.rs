@@ -196,6 +196,118 @@ fn prepare_generation_from_prompt(
     })
 }
 
+fn format_tools_system_prompt(tools: &[Tool]) -> String {
+    let mut s = String::from("\nYou have access to the following tools/functions:\n```json\n[\n");
+    for (i, tool) in tools.iter().enumerate() {
+        if i > 0 {
+            s.push_str(",\n");
+        }
+        let serialized = serde_json::to_string_pretty(tool).unwrap_or_default();
+        s.push_str(&serialized);
+    }
+    s.push_str("\n]\n```\nTo call a tool, respond with a JSON object format: `{\"name\": \"function_name\", \"arguments\": {\"param\": \"value\"}}`.\n");
+    s
+}
+
+fn resolve_constraint(response_format: Option<&ResponseFormat>) -> Option<ConstraintSpec> {
+    let rf = response_format?;
+    if rf.is_json_object() {
+        Some(ConstraintSpec::JsonObject)
+    } else if rf.is_json_schema() {
+        rf.json_schema
+            .as_ref()
+            .and_then(|js| js.schema.clone())
+            .map(ConstraintSpec::JsonSchema)
+    } else if rf.is_grammar() {
+        rf.grammar.clone().map(ConstraintSpec::Grammar)
+    } else {
+        None
+    }
+}
+
+fn resolve_tool_constraint(
+    tools: &[Tool],
+    tool_choice: Option<&ToolChoice>,
+) -> Option<ConstraintSpec> {
+    match tool_choice {
+        Some(ToolChoice::Mode(mode)) if mode == "none" => None,
+        Some(ToolChoice::Function { function, .. }) => {
+            let tool = tools.iter().find(|t| t.function.name == function.name)?;
+            let params = tool
+                .function
+                .parameters
+                .clone()
+                .unwrap_or_else(|| serde_json::json!({"type": "object"}));
+            let schema = serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "enum": [function.name] },
+                    "arguments": params
+                },
+                "required": ["name", "arguments"]
+            });
+            Some(ConstraintSpec::JsonSchema(schema))
+        }
+        Some(ToolChoice::Mode(mode)) if mode == "required" => {
+            let mut variants = Vec::new();
+            for t in tools {
+                let params = t
+                    .function
+                    .parameters
+                    .clone()
+                    .unwrap_or_else(|| serde_json::json!({"type": "object"}));
+                variants.push(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string", "enum": [t.function.name] },
+                        "arguments": params
+                    },
+                    "required": ["name", "arguments"]
+                }));
+            }
+            if !variants.is_empty() {
+                Some(ConstraintSpec::JsonSchema(
+                    serde_json::json!({ "anyOf": variants }),
+                ))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn maybe_parse_tool_call(text: &str, tools: Option<&[Tool]>) -> Option<Vec<ToolCall>> {
+    let tools = tools?;
+    if tools.is_empty() {
+        return None;
+    }
+    let trimmed = text.trim();
+    if !trimmed.starts_with('{') {
+        return None;
+    }
+    let val: serde_json::Value = serde_json::from_str(trimmed).ok()?;
+    let obj = val.as_object()?;
+    let name = obj.get("name")?.as_str()?;
+    if !tools.iter().any(|t| t.function.name == name) {
+        return None;
+    }
+    let args_val = obj.get("arguments")?;
+    let arguments = match args_val {
+        serde_json::Value::String(s) => s.clone(),
+        other => serde_json::to_string(other).unwrap_or_default(),
+    };
+    Some(vec![ToolCall {
+        id: gen_id_with_prefix("call"),
+        tool_type: "function".to_string(),
+        function: FunctionCall {
+            name: name.to_string(),
+            arguments,
+        },
+    }])
+}
+
+#[allow(clippy::too_many_arguments)]
 fn prepare_chat_generation(
     state: &Arc<AppState>,
     requested_model: &str,
@@ -206,6 +318,7 @@ fn prepare_chat_generation(
     top_k: Option<usize>,
     repeat_penalty: Option<f32>,
     seed: Option<u64>,
+    tools: Option<&[Tool]>,
 ) -> Result<PreparedGeneration, Response> {
     if messages.is_empty() {
         return Err(api_error(
@@ -214,11 +327,39 @@ fn prepare_chat_generation(
         ));
     }
 
-    let msgs: Vec<Message<'_>> = messages
+    let mut owned_messages: Vec<(String, String)> = Vec::new();
+    let mut has_system = false;
+
+    for m in messages {
+        let content_str = m.content_str();
+        if m.role == "system" {
+            has_system = true;
+            if let Some(t) = tools {
+                if !t.is_empty() {
+                    let tool_prompt = format_tools_system_prompt(t);
+                    owned_messages
+                        .push((m.role.clone(), format!("{}{}", content_str, tool_prompt)));
+                    continue;
+                }
+            }
+        }
+        owned_messages.push((m.role.clone(), content_str.to_string()));
+    }
+
+    if !has_system {
+        if let Some(t) = tools {
+            if !t.is_empty() {
+                let tool_prompt = format_tools_system_prompt(t);
+                owned_messages.insert(0, ("system".to_string(), tool_prompt));
+            }
+        }
+    }
+
+    let msgs: Vec<Message<'_>> = owned_messages
         .iter()
-        .map(|m| Message {
-            role: &m.role,
-            content: &m.content,
+        .map(|(role, content)| Message {
+            role: role.as_str(),
+            content: content.as_str(),
         })
         .collect();
     let prompt = state.chat_template.apply(&msgs);
@@ -255,6 +396,7 @@ fn prepare_responses_generation(
         req.top_k,
         req.repeat_penalty,
         req.seed,
+        None,
     )
 }
 
@@ -479,12 +621,14 @@ pub async fn completions(
         Err(err) => return err,
     };
 
-    if req
-        .response_format
-        .as_ref()
-        .is_some_and(|f| f.is_json_object())
-    {
-        prepared.constraint = Some(ConstraintSpec::JsonObject);
+    if let Some(spec) = resolve_constraint(req.response_format.as_ref()) {
+        if let Err(msg) = spec.validate() {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                format!("invalid response_format: {msg}"),
+            );
+        }
+        prepared.constraint = Some(spec);
     }
 
     if req.stream.unwrap_or(false) {
@@ -626,7 +770,12 @@ async fn streaming_completion(state: Arc<AppState>, prepared: PreparedGeneration
         .into_response()
 }
 
-async fn streaming_chat_completion(state: Arc<AppState>, prepared: PreparedGeneration) -> Response {
+async fn streaming_chat_completion(
+    state: Arc<AppState>,
+    prepared: PreparedGeneration,
+    is_tool_call_mode: bool,
+    specific_tool_name: Option<String>,
+) -> Response {
     let started = match start_generation(&state, prepared) {
         Ok(started) => started,
         Err(err) => return err,
@@ -638,13 +787,14 @@ async fn streaming_chat_completion(state: Arc<AppState>, prepared: PreparedGener
     let ttft_instant = t0;
     let id = gen_id();
     let created = now_secs();
+    let call_id = gen_id_with_prefix("call");
 
     // Clone for the finish chunk (originals are moved into the content closure)
     let finish_id = id.clone();
     let stream_model = started.model_name.clone();
     let finish_model = started.model_name.clone();
 
-    // First chunk: send the role
+    // First chunk: send the role (+ initial tool call delta if in tool call mode)
     let role_chunk = ChatChunk {
         id: id.clone(),
         object: "chat.completion.chunk",
@@ -652,9 +802,26 @@ async fn streaming_chat_completion(state: Arc<AppState>, prepared: PreparedGener
         model: stream_model.clone(),
         choices: vec![ChatChunkChoice {
             index: 0,
-            delta: ChatDelta {
-                role: Some("assistant"),
-                content: None,
+            delta: if is_tool_call_mode {
+                ChatDelta {
+                    role: Some("assistant"),
+                    content: None,
+                    tool_calls: Some(vec![ToolCallDelta {
+                        index: 0,
+                        id: Some(call_id.clone()),
+                        tool_type: Some("function".to_string()),
+                        function: Some(FunctionCallDelta {
+                            name: specific_tool_name.clone(),
+                            arguments: Some(String::new()),
+                        }),
+                    }]),
+                }
+            } else {
+                ChatDelta {
+                    role: Some("assistant"),
+                    content: None,
+                    tool_calls: None,
+                }
             },
             finish_reason: None,
         }],
@@ -683,9 +850,26 @@ async fn streaming_chat_completion(state: Arc<AppState>, prepared: PreparedGener
             model: stream_model.clone(),
             choices: vec![ChatChunkChoice {
                 index: 0,
-                delta: ChatDelta {
-                    role: None,
-                    content: Some(text),
+                delta: if is_tool_call_mode {
+                    ChatDelta {
+                        role: None,
+                        content: None,
+                        tool_calls: Some(vec![ToolCallDelta {
+                            index: 0,
+                            id: None,
+                            tool_type: None,
+                            function: Some(FunctionCallDelta {
+                                name: None,
+                                arguments: Some(text),
+                            }),
+                        }]),
+                    }
+                } else {
+                    ChatDelta {
+                        role: None,
+                        content: Some(text),
+                        tool_calls: None,
+                    }
                 },
                 finish_reason: None,
             }],
@@ -700,7 +884,12 @@ async fn streaming_chat_completion(state: Arc<AppState>, prepared: PreparedGener
     let tc = Arc::clone(&token_count);
     let finish_signal = started.finish;
     let finish_stream = tokio_stream::iter(vec![0u8, 1u8]).filter_map(move |i| {
-        let reason = finish_reason_for(finish_signal.get());
+        let raw_reason = finish_reason_for(finish_signal.get());
+        let reason = if is_tool_call_mode && raw_reason == Some("stop") {
+            Some("tool_calls")
+        } else {
+            raw_reason
+        };
         if i == 0 {
             let event = match reason {
                 Some(reason) => {
@@ -714,6 +903,7 @@ async fn streaming_chat_completion(state: Arc<AppState>, prepared: PreparedGener
                             delta: ChatDelta {
                                 role: None,
                                 content: None,
+                                tool_calls: None,
                             },
                             finish_reason: Some(reason),
                         }],
@@ -749,6 +939,11 @@ pub async fn chat_completions(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Response {
+    let tools = match req.tool_choice.as_ref() {
+        Some(ToolChoice::Mode(mode)) if mode == "none" => None,
+        _ => req.tools.as_deref(),
+    };
+
     let mut prepared = match prepare_chat_generation(
         &state,
         &req.model,
@@ -759,21 +954,43 @@ pub async fn chat_completions(
         req.top_k,
         req.repeat_penalty,
         req.seed,
+        tools,
     ) {
         Ok(prepared) => prepared,
         Err(err) => return err,
     };
 
-    if req
-        .response_format
-        .as_ref()
-        .is_some_and(|f| f.is_json_object())
-    {
-        prepared.constraint = Some(ConstraintSpec::JsonObject);
+    let mut is_tool_call_mode = false;
+    let mut specific_tool_name = None;
+
+    if let Some(spec) = resolve_constraint(req.response_format.as_ref()) {
+        if let Err(msg) = spec.validate() {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                format!("invalid response_format: {msg}"),
+            );
+        }
+        prepared.constraint = Some(spec);
+    } else if let Some(t) = tools {
+        if let Some(tool_constraint) = resolve_tool_constraint(t, req.tool_choice.as_ref()) {
+            if let Err(msg) = tool_constraint.validate() {
+                return api_error(
+                    StatusCode::BAD_REQUEST,
+                    format!("invalid tools schema: {msg}"),
+                );
+            }
+            prepared.constraint = Some(tool_constraint);
+            is_tool_call_mode = true;
+            if let Some(ToolChoice::Function { function, .. }) = req.tool_choice.as_ref() {
+                specific_tool_name = Some(function.name.clone());
+            } else if t.len() == 1 {
+                specific_tool_name = Some(t[0].function.name.clone());
+            }
+        }
     }
 
     if req.stream.unwrap_or(false) {
-        streaming_chat_completion(state, prepared).await
+        streaming_chat_completion(state, prepared, is_tool_call_mode, specific_tool_name).await
     } else {
         let started = match start_generation(&state, prepared) {
             Ok(started) => started,
@@ -790,6 +1007,27 @@ pub async fn chat_completions(
             );
         };
 
+        let tool_calls = maybe_parse_tool_call(&completed.text, tools);
+        let finish_reason = if tool_calls.is_some() {
+            "tool_calls"
+        } else {
+            finish_reason
+        };
+
+        let message = if let Some(tc) = tool_calls {
+            ChatMessageOut {
+                role: "assistant",
+                content: None,
+                tool_calls: Some(tc),
+            }
+        } else {
+            ChatMessageOut {
+                role: "assistant",
+                content: Some(completed.text),
+                tool_calls: None,
+            }
+        };
+
         Json(ChatCompletionResponse {
             id: gen_id(),
             object: "chat.completion",
@@ -797,10 +1035,7 @@ pub async fn chat_completions(
             model: started.model_name,
             choices: vec![ChatChoice {
                 index: 0,
-                message: ChatMessageOut {
-                    role: "assistant",
-                    content: completed.text,
-                },
+                message,
                 finish_reason,
             }],
             usage: UsageInfo {

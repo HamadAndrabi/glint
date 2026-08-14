@@ -561,9 +561,12 @@ unsafe fn dot_row_q5_k(data: &[u8], row_start: usize, n_super: usize, vec: &[f32
             for l in (0..32).step_by(4) {
                 let lo_arr = [
                     ((qs[q_base + l] & 0x0F) | (if qh[l] & u1 != 0 { 16 } else { 0 })) as f32,
-                    ((qs[q_base + l + 1] & 0x0F) | (if qh[l + 1] & u1 != 0 { 16 } else { 0 })) as f32,
-                    ((qs[q_base + l + 2] & 0x0F) | (if qh[l + 2] & u1 != 0 { 16 } else { 0 })) as f32,
-                    ((qs[q_base + l + 3] & 0x0F) | (if qh[l + 3] & u1 != 0 { 16 } else { 0 })) as f32,
+                    ((qs[q_base + l + 1] & 0x0F) | (if qh[l + 1] & u1 != 0 { 16 } else { 0 }))
+                        as f32,
+                    ((qs[q_base + l + 2] & 0x0F) | (if qh[l + 2] & u1 != 0 { 16 } else { 0 }))
+                        as f32,
+                    ((qs[q_base + l + 3] & 0x0F) | (if qh[l + 3] & u1 != 0 { 16 } else { 0 }))
+                        as f32,
                 ];
                 let hi_arr = [
                     ((qs[q_base + l] >> 4) | (if qh[l] & u2 != 0 { 16 } else { 0 })) as f32,
@@ -987,9 +990,12 @@ unsafe fn dot_row_q5_k_batch(
             for l in (0..32).step_by(4) {
                 let lo_arr = [
                     ((qs[q_base + l] & 0x0F) | (if qh[l] & u1 != 0 { 16 } else { 0 })) as f32,
-                    ((qs[q_base + l + 1] & 0x0F) | (if qh[l + 1] & u1 != 0 { 16 } else { 0 })) as f32,
-                    ((qs[q_base + l + 2] & 0x0F) | (if qh[l + 2] & u1 != 0 { 16 } else { 0 })) as f32,
-                    ((qs[q_base + l + 3] & 0x0F) | (if qh[l + 3] & u1 != 0 { 16 } else { 0 })) as f32,
+                    ((qs[q_base + l + 1] & 0x0F) | (if qh[l + 1] & u1 != 0 { 16 } else { 0 }))
+                        as f32,
+                    ((qs[q_base + l + 2] & 0x0F) | (if qh[l + 2] & u1 != 0 { 16 } else { 0 }))
+                        as f32,
+                    ((qs[q_base + l + 3] & 0x0F) | (if qh[l + 3] & u1 != 0 { 16 } else { 0 }))
+                        as f32,
                 ];
                 let hi_arr = [
                     ((qs[q_base + l] >> 4) | (if qh[l] & u2 != 0 { 16 } else { 0 })) as f32,

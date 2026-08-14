@@ -1235,7 +1235,7 @@ async fn serve_model(
     let vocab_strings: Vec<String> = (0..tokenizer.vocab_size())
         .map(|i| tokenizer.decode_token(i as u32).to_owned())
         .collect();
-    let vocab_index = VocabIndex::from_vocab(&vocab_strings);
+    let vocab_index = VocabIndex::from_vocab_with_eos(&vocab_strings, &[tokenizer.eos_token_id]);
 
     // Build an empty adapter registry (adapters can be pre-loaded here in future
     // via a --lora-adapter flag; for now the registry starts empty).

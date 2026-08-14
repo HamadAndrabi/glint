@@ -214,9 +214,21 @@ impl Model {
             let vocab_strings: Vec<String> = (0..self.tokenizer.vocab_size())
                 .map(|i| self.tokenizer.decode_token(i as u32).to_owned())
                 .collect();
-            let vi = VocabIndex::from_vocab(&vocab_strings);
-            session.constraint = Some(build_constraint(spec, Arc::clone(&vi)));
-            session.vocab_index = Some(vi);
+            let vi =
+                VocabIndex::from_vocab_with_eos(&vocab_strings, &[self.tokenizer.eos_token_id]);
+            match build_constraint(spec, Arc::clone(&vi)) {
+                Ok(c) => {
+                    session.constraint = Some(c);
+                    session.vocab_index = Some(vi);
+                }
+                Err(e) => {
+                    // `new_session` cannot return an error, so record the reason
+                    // and leave `constraint` unset. Callers must check
+                    // `constraint_error` before generating — silently dropping
+                    // the constraint would produce unconstrained output.
+                    session.constraint_error = Some(e);
+                }
+            }
         }
         session
     }
@@ -239,6 +251,12 @@ impl Model {
         token_ids: &[u32],
         gpu: &mut Option<&mut GpuBackend>,
     ) -> Result<(), GlintError> {
+        // A constraint that failed to compile in `new_session` must not be
+        // silently ignored: generating anyway would return unconstrained text
+        // to a caller that asked for structured output.
+        if let Some(e) = &session.constraint_error {
+            return Err(GlintError::ConstraintError(e.clone()));
+        }
         session.tokens = token_ids.to_vec();
         session.prefill_len = token_ids.len();
         let lora = session.lora_adapter.as_deref();
@@ -443,8 +461,10 @@ impl Model {
             let vocab_strings: Vec<String> = (0..self.tokenizer.vocab_size())
                 .map(|i| self.tokenizer.decode_token(i as u32).to_owned())
                 .collect();
-            let vi = VocabIndex::from_vocab(&vocab_strings);
-            let mut constraint = build_constraint(spec, Arc::clone(&vi));
+            let vi =
+                VocabIndex::from_vocab_with_eos(&vocab_strings, &[self.tokenizer.eos_token_id]);
+            let mut constraint =
+                build_constraint(spec, Arc::clone(&vi)).map_err(GlintError::ConstraintError)?;
             for &tok in session.tokens.iter().skip(session.prefill_len) {
                 constraint.advance(tok);
             }

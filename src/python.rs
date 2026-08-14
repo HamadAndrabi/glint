@@ -11,6 +11,8 @@
 //! print(llm.model_info())
 //! ```
 
+#![allow(clippy::useless_conversion)]
+
 use std::path::Path;
 
 use pyo3::exceptions::PyValueError;
@@ -56,6 +58,9 @@ impl GlintLLM {
     /// top_p : float        1.0 = disabled (default)
     /// repeat_penalty : float  1.0 = disabled (default)
     /// seed : int | None    RNG seed; None = random (default)
+    /// json_schema : str | None  JSON Schema string to constrain output (default None)
+    /// grammar : str | None      GBNF grammar string to constrain output (default None)
+    /// json_object : bool        Force valid JSON object output (default False)
     #[pyo3(signature = (
         prompt,
         max_tokens = 256,
@@ -63,7 +68,10 @@ impl GlintLLM {
         top_k = 0,
         top_p = 1.0,
         repeat_penalty = 1.0,
-        seed = None
+        seed = None,
+        json_schema = None,
+        grammar = None,
+        json_object = false
     ))]
     fn generate(
         &self,
@@ -74,7 +82,22 @@ impl GlintLLM {
         top_p: f32,
         repeat_penalty: f32,
         seed: Option<u64>,
+        json_schema: Option<&str>,
+        grammar: Option<&str>,
+        json_object: bool,
     ) -> PyResult<String> {
+        let constraint = if let Some(schema_str) = json_schema {
+            let val: serde_json::Value = serde_json::from_str(schema_str)
+                .map_err(|e| PyValueError::new_err(format!("invalid JSON schema: {e}")))?;
+            Some(crate::constrained::ConstraintSpec::JsonSchema(val))
+        } else if let Some(g) = grammar {
+            Some(crate::constrained::ConstraintSpec::Grammar(g.to_string()))
+        } else if json_object {
+            Some(crate::constrained::ConstraintSpec::JsonObject)
+        } else {
+            None
+        };
+
         let opts = GenerationOptions {
             max_new_tokens: max_tokens,
             sampler_cfg: SamplerConfig {
@@ -86,7 +109,7 @@ impl GlintLLM {
                 ..Default::default()
             },
             cache_format: CacheFormat::F32,
-            constraint: None,
+            constraint,
             lora_adapter: None,
         };
 

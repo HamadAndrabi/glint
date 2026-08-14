@@ -172,9 +172,7 @@ pub fn gelu(x: &Tensor) -> Tensor {
     let data: Vec<f32> = x
         .data()
         .iter()
-        .map(|&v| {
-            0.5 * v * (1.0 + (SQRT_2_OVER_PI * (v + COEF * v * v * v)).tanh())
-        })
+        .map(|&v| 0.5 * v * (1.0 + (SQRT_2_OVER_PI * (v + COEF * v * v * v)).tanh()))
         .collect();
     Tensor::from_vec(data, x.shape())
 }

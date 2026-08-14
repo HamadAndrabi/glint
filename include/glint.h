@@ -105,6 +105,24 @@ GlintSession* glint_session_new(
     const char*                cache_format
 );
 
+/**
+ * Create a new generation session with a structured output constraint.
+ *
+ * @param model               Model to generate from (borrowed).
+ * @param sampler_opts        Sampler configuration (borrowed).
+ * @param cache_format        "f32" (default) or "q8". NULL means "f32".
+ * @param constraint_type     "json_object", "json_schema", or "grammar".
+ * @param constraint_payload  JSON Schema string (for "json_schema") or GBNF grammar string (for "grammar"), or NULL.
+ * @return  Heap-allocated session, or NULL on failure.
+ */
+GlintSession* glint_session_new_constrained(
+    const GlintModel*          model,
+    const GlintSamplerOptions* sampler_opts,
+    const char*                cache_format,
+    const char*                constraint_type,
+    const char*                constraint_payload
+);
+
 /** Free a session handle.  No-op if @p session is NULL. */
 void glint_session_free(GlintSession* session);
 

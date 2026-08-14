@@ -799,8 +799,17 @@ fn prefill_and_add(
     }
     // Attach constraint if requested.
     if let Some(spec) = req.constraint {
-        session.constraint = Some(build_constraint(&spec, Arc::clone(vocab_index)));
-        session.vocab_index = Some(Arc::clone(vocab_index));
+        match build_constraint(&spec, Arc::clone(vocab_index)) {
+            Ok(c) => {
+                session.constraint = Some(c);
+                session.vocab_index = Some(Arc::clone(vocab_index));
+            }
+            Err(e) => {
+                eprintln!("Error building constraint: {e}");
+                req.finish.set(Finish::Truncated);
+                return;
+            }
+        }
     }
     session.tokens = req.prompt_tokens.clone();
     session.prefill_len = req.prompt_tokens.len();

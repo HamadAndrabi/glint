@@ -97,8 +97,12 @@ pub fn forward(weights: &TransformerWeights, config: &ModelConfig, token_ids: &[
         eprint!("\r  Layer {}/{}...", layer_idx + 1, config.block_count);
         let mut new_hidden_states = Vec::with_capacity(n_tokens);
         for pos in 0..n_tokens {
-            let normed =
-                norm(&hidden_states[pos], &layer.attn_norm, config.rms_norm_eps, is_gemma);
+            let normed = norm(
+                &hidden_states[pos],
+                &layer.attn_norm,
+                config.rms_norm_eps,
+                is_gemma,
+            );
             let mut attn_out = attention(&normed, &hidden_states, layer, config, pos);
             if let Some(post_norm) = &layer.post_attn_norm {
                 attn_out = norm(&attn_out, post_norm, config.rms_norm_eps, is_gemma);
@@ -116,7 +120,12 @@ pub fn forward(weights: &TransformerWeights, config: &ModelConfig, token_ids: &[
     eprintln!();
 
     let last_hidden = &hidden_states[n_tokens - 1];
-    let normed = norm(last_hidden, &weights.output_norm, config.rms_norm_eps, is_gemma);
+    let normed = norm(
+        last_hidden,
+        &weights.output_norm,
+        config.rms_norm_eps,
+        is_gemma,
+    );
     let mut logits = weights.output.matvec(normed.data());
     if let Some(cap) = config.final_logit_softcapping {
         tensor::logit_softcap_in_place(logits.data_mut(), cap);
@@ -185,7 +194,9 @@ fn attention(
     v_cache.push(v_cur);
 
     let seq_len = k_cache.len();
-    let scale = config.query_pre_attn_scalar.unwrap_or(1.0 / (head_dim as f32).sqrt());
+    let scale = config
+        .query_pre_attn_scalar
+        .unwrap_or(1.0 / (head_dim as f32).sqrt());
     let q_dim = n_heads * head_dim;
     let mut attn_output = vec![0.0f32; q_dim];
 
@@ -351,8 +362,12 @@ pub fn embed(weights: &TransformerWeights, config: &ModelConfig, token_ids: &[u3
     for layer in weights.layers.iter() {
         let mut new_hs = Vec::with_capacity(n_tokens);
         for pos in 0..n_tokens {
-            let normed =
-                norm(&hidden_states[pos], &layer.attn_norm, config.rms_norm_eps, is_gemma);
+            let normed = norm(
+                &hidden_states[pos],
+                &layer.attn_norm,
+                config.rms_norm_eps,
+                is_gemma,
+            );
             let mut attn_out = attention(&normed, &hidden_states, layer, config, pos);
             if let Some(post_norm) = &layer.post_attn_norm {
                 attn_out = norm(&attn_out, post_norm, config.rms_norm_eps, is_gemma);
@@ -565,7 +580,9 @@ fn attention_cached(
             .unwrap_or(0)
     };
     let attend_len = pos + 1 - window_start;
-    let scale = config.query_pre_attn_scalar.unwrap_or(1.0 / (head_dim as f32).sqrt());
+    let scale = config
+        .query_pre_attn_scalar
+        .unwrap_or(1.0 / (head_dim as f32).sqrt());
     let mut attn_output = vec![0.0f32; q_dim];
 
     let cache_ro: &dyn KvStore = &*cache;
@@ -743,7 +760,9 @@ fn forward_prefill_inner(
         .partial_rotary_factor
         .map(|f| (head_dim as f32 * f) as usize & !1)
         .unwrap_or(head_dim);
-    let scale = config.query_pre_attn_scalar.unwrap_or(1.0 / (head_dim as f32).sqrt());
+    let scale = config
+        .query_pre_attn_scalar
+        .unwrap_or(1.0 / (head_dim as f32).sqrt());
 
     // Use sequential path when GPU is active (GPU parallelism replaces rayon)
     // or when rayon is not available (e.g. wasm32 builds).
@@ -863,14 +882,15 @@ fn forward_prefill_inner(
             (0..seq_len)
                 .map(|lp| {
                     let abs = pos_offset + lp;
-                    let window = if config.sliding_window_alternating && !layer_idx.is_multiple_of(2) {
-                        0
-                    } else {
-                        config
-                            .sliding_window
-                            .map(|w| (abs as i64 - w as i64 + 1).max(0) as usize)
-                            .unwrap_or(0)
-                    };
+                    let window =
+                        if config.sliding_window_alternating && !layer_idx.is_multiple_of(2) {
+                            0
+                        } else {
+                            config
+                                .sliding_window
+                                .map(|w| (abs as i64 - w as i64 + 1).max(0) as usize)
+                                .unwrap_or(0)
+                        };
                     let attend_len = abs + 1 - window;
                     let mut out = vec![0.0f32; q_dim];
                     for h in 0..n_heads {
@@ -910,14 +930,15 @@ fn forward_prefill_inner(
                     .into_par_iter()
                     .map(|lp| {
                         let abs = pos_offset + lp;
-                        let window = if config.sliding_window_alternating && !layer_idx.is_multiple_of(2) {
-                            0
-                        } else {
-                            config
-                                .sliding_window
-                                .map(|w| (abs as i64 - w as i64 + 1).max(0) as usize)
-                                .unwrap_or(0)
-                        };
+                        let window =
+                            if config.sliding_window_alternating && !layer_idx.is_multiple_of(2) {
+                                0
+                            } else {
+                                config
+                                    .sliding_window
+                                    .map(|w| (abs as i64 - w as i64 + 1).max(0) as usize)
+                                    .unwrap_or(0)
+                            };
                         let attend_len = abs + 1 - window;
                         let mut out = vec![0.0f32; q_dim];
                         for h in 0..n_heads {
@@ -1001,8 +1022,7 @@ fn forward_prefill_inner(
                         let h_t = Tensor::from_vec(h, &[embed_dim]);
                         let a_t = Tensor::from_vec(ao, &[embed_dim]);
                         let after_attn = tensor::add(&h_t, &a_t);
-                        let nf =
-                            norm(&after_attn, &layer.ffn_norm, config.rms_norm_eps, is_gemma);
+                        let nf = norm(&after_attn, &layer.ffn_norm, config.rms_norm_eps, is_gemma);
                         let mut ffn_out = feed_forward(&nf, layer, lora_layer, &mut None, is_gemma);
                         if let Some(post_norm) = &layer.post_ffn_norm {
                             ffn_out = norm(&ffn_out, post_norm, config.rms_norm_eps, is_gemma);
@@ -1379,7 +1399,9 @@ pub fn forward_batch_lora(
         .partial_rotary_factor
         .map(|f| (head_dim as f32 * f) as usize & !1)
         .unwrap_or(head_dim);
-    let scale = config.query_pre_attn_scalar.unwrap_or(1.0 / (head_dim as f32).sqrt());
+    let scale = config
+        .query_pre_attn_scalar
+        .unwrap_or(1.0 / (head_dim as f32).sqrt());
 
     // Interleaved matvec output, reused by every batched matvec in the step.
     let mut scratch: Vec<f32> = Vec::new();
@@ -1449,14 +1471,15 @@ pub fn forward_batch_lora(
             let read_only: Vec<&dyn KvStore> = caches.iter().map(|c| &**c).collect();
             let attend = |s: usize| {
                 let pos = positions[s];
-                let window_start = if config.sliding_window_alternating && !layer_idx.is_multiple_of(2) {
-                    0
-                } else {
-                    config
-                        .sliding_window
-                        .map(|w| (pos as i64 - w as i64 + 1).max(0) as usize)
-                        .unwrap_or(0)
-                };
+                let window_start =
+                    if config.sliding_window_alternating && !layer_idx.is_multiple_of(2) {
+                        0
+                    } else {
+                        config
+                            .sliding_window
+                            .map(|w| (pos as i64 - w as i64 + 1).max(0) as usize)
+                            .unwrap_or(0)
+                    };
                 let mut out = vec![0.0f32; q_dim];
                 attn_heads_cpu(
                     q[s].data(),
@@ -1881,7 +1904,10 @@ mod tests {
             ffn_down: QuantizedTensor::from_f32(&[0.0f32; 32], 4, 8),
         };
         let x = Tensor::from_vec(vec![1.0, 2.0, 3.0, 4.0], &[4]);
-        assert_eq!(feed_forward(&x, &layer, None, &mut None, false).shape(), &[4]);
+        assert_eq!(
+            feed_forward(&x, &layer, None, &mut None, false).shape(),
+            &[4]
+        );
     }
 
     // ── Batched decode ───────────────────────────────────────────────────
@@ -2693,14 +2719,7 @@ mod tests {
         let mut caches: Vec<KvCache> = vec![cache];
         let mut cache_refs: Vec<&mut dyn KvStore> =
             caches.iter_mut().map(|c| c as &mut dyn KvStore).collect();
-        let batch_logits = forward_batch(
-            &weights,
-            &config,
-            &[5],
-            &[4],
-            &mut cache_refs,
-            &mut None,
-        );
+        let batch_logits = forward_batch(&weights, &config, &[5], &[4], &mut cache_refs, &mut None);
         assert_eq!(batch_logits[0].shape(), &[8]);
         for v in batch_logits[0].data() {
             assert!(v.is_finite());

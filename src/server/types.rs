@@ -14,15 +14,26 @@ use serde::{Deserialize, Serialize};
 /// Supported types:
 /// * `"text"` — default, unconstrained (same as omitting the field)
 /// * `"json_object"` — constrains output to a valid JSON object
-///
-/// Example:
-/// ```json
-/// { "response_format": { "type": "json_object" } }
-/// ```
+/// * `"json_schema"` — constrains output to match a provided JSON schema
+/// * `"grammar"` — constrains output to follow a custom GBNF grammar
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ResponseFormat {
     #[serde(rename = "type")]
     pub format_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub json_schema: Option<JsonSchemaResponseFormat>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub grammar: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct JsonSchemaResponseFormat {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub schema: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub strict: Option<bool>,
 }
 
 impl ResponseFormat {
@@ -30,6 +41,85 @@ impl ResponseFormat {
     pub fn is_json_object(&self) -> bool {
         self.format_type == "json_object"
     }
+
+    /// True when this format requires JSON schema constrained output.
+    pub fn is_json_schema(&self) -> bool {
+        self.format_type == "json_schema"
+    }
+
+    /// True when this format requires custom GBNF grammar constrained output.
+    pub fn is_grammar(&self) -> bool {
+        self.format_type == "grammar"
+    }
+}
+
+// ── Tools & Function Calling ──────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Tool {
+    #[serde(rename = "type")]
+    pub tool_type: String,
+    pub function: ToolFunction,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ToolFunction {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parameters: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub strict: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum ToolChoice {
+    Mode(String),
+    Function {
+        #[serde(rename = "type")]
+        tool_type: String,
+        function: ToolChoiceFunction,
+    },
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ToolChoiceFunction {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ToolCall {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub tool_type: String,
+    pub function: FunctionCall,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct FunctionCall {
+    pub name: String,
+    pub arguments: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ToolCallDelta {
+    pub index: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub tool_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub function: Option<FunctionCallDelta>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct FunctionCallDelta {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arguments: Option<String>,
 }
 
 // ── Requests ─────────────────────────────────────────────────────────────────
@@ -60,9 +150,22 @@ pub struct CompletionRequest {
 /// One message in a chat conversation.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ChatMessage {
-    /// "system", "user", or "assistant".
+    /// "system", "user", "assistant", or "tool".
     pub role: String,
-    pub content: String,
+    #[serde(default)]
+    pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+}
+
+impl ChatMessage {
+    pub fn content_str(&self) -> &str {
+        self.content.as_deref().unwrap_or("")
+    }
 }
 
 /// `POST /v1/chat/completions` request body.
@@ -79,6 +182,10 @@ pub struct ChatCompletionRequest {
     pub stream: Option<bool>,
     /// Optional output format constraint.
     pub response_format: Option<ResponseFormat>,
+    /// Optional tools the model may call.
+    pub tools: Option<Vec<Tool>>,
+    /// Tool choice control ("none", "auto", "required", or a specific function).
+    pub tool_choice: Option<ToolChoice>,
 }
 
 /// `POST /v1/responses` request body.
@@ -132,7 +239,10 @@ impl ResponseInput {
         if let Some(system) = instructions.filter(|text| !text.trim().is_empty()) {
             messages.push(ChatMessage {
                 role: "system".to_string(),
-                content: system.to_string(),
+                content: Some(system.to_string()),
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
             });
         }
 
@@ -143,7 +253,10 @@ impl ResponseInput {
                 }
                 messages.push(ChatMessage {
                     role: "user".to_string(),
-                    content: text.clone(),
+                    content: Some(text.clone()),
+                    name: None,
+                    tool_calls: None,
+                    tool_call_id: None,
                 });
             }
             ResponseInput::Messages(items) => {
@@ -153,7 +266,10 @@ impl ResponseInput {
                 for item in items {
                     messages.push(ChatMessage {
                         role: item.role.clone(),
-                        content: item.content.as_text()?,
+                        content: Some(item.content.as_text()?),
+                        name: None,
+                        tool_calls: None,
+                        tool_call_id: None,
                     });
                 }
             }
@@ -239,7 +355,10 @@ pub struct ChatChoice {
 #[derive(Debug, Serialize)]
 pub struct ChatMessageOut {
     pub role: &'static str,
-    pub content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
 }
 
 /// `POST /v1/responses` non-streaming response.
@@ -329,6 +448,8 @@ pub struct ChatDelta {
     pub role: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCallDelta>>,
 }
 
 // ── Models endpoint ───────────────────────────────────────────────────────────
@@ -421,7 +542,7 @@ mod tests {
         let messages = input.to_messages(None).unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].role, "user");
-        assert_eq!(messages[0].content, "Hello");
+        assert_eq!(messages[0].content_str(), "Hello");
     }
 
     #[test]
@@ -430,7 +551,7 @@ mod tests {
         let messages = input.to_messages(Some("Be concise")).unwrap();
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].role, "system");
-        assert_eq!(messages[0].content, "Be concise");
+        assert_eq!(messages[0].content_str(), "Be concise");
         assert_eq!(messages[1].role, "user");
     }
 
@@ -452,7 +573,7 @@ mod tests {
 
         let messages = input.to_messages(None).unwrap();
         assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].content, "Hello world");
+        assert_eq!(messages[0].content_str(), "Hello world");
     }
 
     #[test]
@@ -467,5 +588,58 @@ mod tests {
 
         let err = input.to_messages(None).unwrap_err();
         assert!(err.contains("only text is supported"));
+    }
+
+    #[test]
+    fn test_deserialize_json_schema_response_format() {
+        let json_str = r#"{
+            "type": "json_schema",
+            "json_schema": {
+                "name": "weather_response",
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "temperature": { "type": "number" },
+                        "conditions": { "type": "string" }
+                    },
+                    "required": ["temperature", "conditions"]
+                },
+                "strict": true
+            }
+        }"#;
+
+        let rf: ResponseFormat = serde_json::from_str(json_str).unwrap();
+        assert!(rf.is_json_schema());
+        assert_eq!(rf.json_schema.as_ref().unwrap().name, "weather_response");
+    }
+
+    #[test]
+    fn test_deserialize_tools_and_tool_choice() {
+        let req_json = r#"{
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "What is the weather?"}],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "get_current_weather",
+                    "description": "Get current weather for a location",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "location": { "type": "string" }
+                        },
+                        "required": ["location"]
+                    }
+                }
+            }],
+            "tool_choice": "auto"
+        }"#;
+
+        let req: ChatCompletionRequest = serde_json::from_str(req_json).unwrap();
+        assert_eq!(req.tools.as_ref().unwrap().len(), 1);
+        assert_eq!(
+            req.tools.as_ref().unwrap()[0].function.name,
+            "get_current_weather"
+        );
     }
 }

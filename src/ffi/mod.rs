@@ -258,6 +258,100 @@ pub unsafe extern "C" fn glint_session_new(
     })
 }
 
+/// Create a new generation session with a structured output constraint.
+///
+/// `constraint_type`: `"json_object"`, `"json_schema"`, or `"grammar"`.
+/// `constraint_payload`: JSON Schema string (for `"json_schema"`) or GBNF grammar string (for `"grammar"`), or NULL/empty for `"json_object"`.
+/// `cache_format`: `"f32"` (default) or `"q8"`.
+/// Returns `NULL` on failure. Must be freed with `glint_session_free`.
+#[no_mangle]
+pub unsafe extern "C" fn glint_session_new_constrained(
+    model: *const GlintModelHandle,
+    sampler_opts: *const GlintSamplerOptions,
+    cache_format: *const c_char,
+    constraint_type: *const c_char,
+    constraint_payload: *const c_char,
+) -> *mut GlintSessionHandle {
+    ffi_guard(std::ptr::null_mut(), || {
+        null_check!(model, std::ptr::null_mut());
+        null_check!(sampler_opts, std::ptr::null_mut());
+        null_check!(constraint_type, std::ptr::null_mut());
+        clear_error();
+
+        let fmt = if cache_format.is_null() {
+            CacheFormat::F32
+        } else {
+            let cs = unsafe { CStr::from_ptr(cache_format) };
+            parse_cache_format(cs).unwrap_or(CacheFormat::F32)
+        };
+
+        let type_cstr = unsafe { CStr::from_ptr(constraint_type) };
+        let type_str = match type_cstr.to_str() {
+            Ok(s) => s,
+            Err(e) => {
+                set_error(e);
+                return std::ptr::null_mut();
+            }
+        };
+
+        let payload_str = if constraint_payload.is_null() {
+            ""
+        } else {
+            match unsafe { CStr::from_ptr(constraint_payload) }.to_str() {
+                Ok(s) => s,
+                Err(e) => {
+                    set_error(e);
+                    return std::ptr::null_mut();
+                }
+            }
+        };
+
+        let constraint_spec = match type_str {
+            "json_object" => Some(crate::constrained::ConstraintSpec::JsonObject),
+            "json_schema" => {
+                if constraint_payload.is_null() {
+                    set_error("JSON schema constraint requires non-null payload");
+                    return std::ptr::null_mut();
+                }
+                match serde_json::from_str::<serde_json::Value>(payload_str) {
+                    Ok(val) => Some(crate::constrained::ConstraintSpec::JsonSchema(val)),
+                    Err(e) => {
+                        set_error(format!("invalid JSON schema: {e}"));
+                        return std::ptr::null_mut();
+                    }
+                }
+            }
+            "grammar" => {
+                if constraint_payload.is_null() || payload_str.trim().is_empty() {
+                    set_error("GBNF grammar constraint requires non-null/non-empty payload");
+                    return std::ptr::null_mut();
+                }
+                Some(crate::constrained::ConstraintSpec::Grammar(
+                    payload_str.to_string(),
+                ))
+            }
+            other => {
+                set_error(format!("unknown constraint type: {other}"));
+                return std::ptr::null_mut();
+            }
+        };
+
+        let sopts = unsafe { &*sampler_opts };
+        let mut opts = sopts.to_generation_opts(fmt);
+        opts.constraint = constraint_spec;
+
+        let m = unsafe { &(*model).0 };
+        let session = m.new_session(&opts);
+
+        if let Some(e) = &session.constraint_error {
+            set_error(format!("failed to build specified token constraint: {e}"));
+            return std::ptr::null_mut();
+        }
+
+        Box::into_raw(Box::new(GlintSessionHandle { session, opts }))
+    })
+}
+
 /// Free a session handle.  No-op if `session` is `NULL`.
 #[no_mangle]
 pub unsafe extern "C" fn glint_session_free(session: *mut GlintSessionHandle) {
@@ -658,6 +752,29 @@ mod tests {
     fn test_snapshot_deserialize_truncated_header_returns_null() {
         let truncated = [0u8; 24];
         let ptr = unsafe { glint_snapshot_deserialize(truncated.as_ptr(), truncated.len()) };
+        assert!(ptr.is_null());
+    }
+
+    #[test]
+    fn test_session_new_constrained_null_checks() {
+        let opts = GlintSamplerOptions {
+            temperature: 0.0,
+            top_k: 0,
+            top_p: 1.0,
+            repeat_penalty: 1.0,
+            seed: 0,
+            max_new_tokens: 64,
+        };
+        let ctype = CString::new("json_object").unwrap();
+        let ptr = unsafe {
+            glint_session_new_constrained(
+                std::ptr::null(),
+                &opts,
+                std::ptr::null(),
+                ctype.as_ptr(),
+                std::ptr::null(),
+            )
+        };
         assert!(ptr.is_null());
     }
 }

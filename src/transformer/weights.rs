@@ -189,10 +189,22 @@ impl TransformerWeights {
                     // Gemma 2 layout
                     (
                         hf_vector(st, &format!("{p}.input_layernorm.weight"), embed_dim)?,
-                        hf_vector(st, &format!("{p}.pre_feedforward_layernorm.weight"), embed_dim)?,
-                        Some(hf_vector(st, &format!("{p}.post_attention_layernorm.weight"), embed_dim)?),
+                        hf_vector(
+                            st,
+                            &format!("{p}.pre_feedforward_layernorm.weight"),
+                            embed_dim,
+                        )?,
+                        Some(hf_vector(
+                            st,
+                            &format!("{p}.post_attention_layernorm.weight"),
+                            embed_dim,
+                        )?),
                         if st.contains(&format!("{p}.post_feedforward_layernorm.weight")) {
-                            Some(hf_vector(st, &format!("{p}.post_feedforward_layernorm.weight"), embed_dim)?)
+                            Some(hf_vector(
+                                st,
+                                &format!("{p}.post_feedforward_layernorm.weight"),
+                                embed_dim,
+                            )?)
                         } else {
                             None
                         },
@@ -201,7 +213,11 @@ impl TransformerWeights {
                     // Standard LLaMA / Mistral / Qwen layout
                     (
                         hf_vector(st, &format!("{p}.input_layernorm.weight"), embed_dim)?,
-                        hf_vector(st, &format!("{p}.post_attention_layernorm.weight"), embed_dim)?,
+                        hf_vector(
+                            st,
+                            &format!("{p}.post_attention_layernorm.weight"),
+                            embed_dim,
+                        )?,
                         None,
                         None,
                     )
@@ -222,19 +238,31 @@ impl TransformerWeights {
 
             // Optional Qwen2 attention biases
             let attn_q_bias = if st.contains(&format!("{p}.self_attn.q_proj.bias")) {
-                let b = hf_vector(st, &format!("{p}.self_attn.q_proj.bias"), n_heads * head_dim)?;
+                let b = hf_vector(
+                    st,
+                    &format!("{p}.self_attn.q_proj.bias"),
+                    n_heads * head_dim,
+                )?;
                 Some(permute_bias(b, n_heads, head_dim, rot_dim))
             } else {
                 None
             };
             let attn_k_bias = if st.contains(&format!("{p}.self_attn.k_proj.bias")) {
-                let b = hf_vector(st, &format!("{p}.self_attn.k_proj.bias"), n_kv_heads * head_dim)?;
+                let b = hf_vector(
+                    st,
+                    &format!("{p}.self_attn.k_proj.bias"),
+                    n_kv_heads * head_dim,
+                )?;
                 Some(permute_bias(b, n_kv_heads, head_dim, rot_dim))
             } else {
                 None
             };
             let attn_v_bias = if st.contains(&format!("{p}.self_attn.v_proj.bias")) {
-                Some(hf_vector(st, &format!("{p}.self_attn.v_proj.bias"), n_kv_heads * head_dim)?)
+                Some(hf_vector(
+                    st,
+                    &format!("{p}.self_attn.v_proj.bias"),
+                    n_kv_heads * head_dim,
+                )?)
             } else {
                 None
             };
@@ -1169,7 +1197,10 @@ mod tests {
         assert!(weights.layers[0].attn_q_bias.is_some());
         assert!(weights.layers[0].attn_k_bias.is_some());
         assert!(weights.layers[0].attn_v_bias.is_some());
-        assert_eq!(weights.layers[0].attn_q_bias.as_ref().unwrap().data().len(), EMBED);
+        assert_eq!(
+            weights.layers[0].attn_q_bias.as_ref().unwrap().data().len(),
+            EMBED
+        );
     }
 
     // ── Full directory load ──────────────────────────────────────────────────
