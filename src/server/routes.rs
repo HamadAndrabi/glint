@@ -1323,9 +1323,22 @@ pub async fn embeddings(
     }
 }
 
+// ── GET / and GET /ui ─────────────────────────────────────────────────────────
+
+/// Embedded Single-Page Application (SPA) Web Dashboard.
+pub async fn web_ui() -> Response {
+    axum::response::Html(include_str!("web/index.html")).into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn test_web_ui_returns_html() {
+        let resp = web_ui().await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
 
     // The mapping that decides how a stream terminates. `None` is the load-
     // bearing case: it is what makes a truncated response fail loudly instead
@@ -1355,3 +1368,4 @@ mod tests {
         );
     }
 }
+

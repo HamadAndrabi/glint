@@ -164,6 +164,42 @@ enum Commands {
         /// Use GPU acceleration (requires `vulkan` feature).
         #[arg(long, default_value_t = false)]
         gpu: bool,
+
+        /// Launch in full-screen interactive Terminal UI (TUI) mode.
+        #[arg(long, default_value_t = false)]
+        tui: bool,
+    },
+
+    /// Launch the interactive full-screen Terminal User Interface (TUI).
+    #[cfg(feature = "tui")]
+    Tui {
+        /// Path to a .gguf file, or a HuggingFace model directory / .safetensors file.
+        #[arg(short, long)]
+        file: PathBuf,
+
+        /// Optional system prompt prepended to the conversation.
+        #[arg(long)]
+        system: Option<String>,
+
+        /// Maximum number of new tokens to generate per response.
+        #[arg(short, long, default_value_t = 512)]
+        max_tokens: usize,
+
+        /// Sampling temperature.
+        #[arg(long, default_value_t = 0.7)]
+        temperature: f32,
+
+        /// Top-p (nucleus) sampling.
+        #[arg(long, default_value_t = 0.9)]
+        top_p: f32,
+
+        /// Top-k sampling.
+        #[arg(long, default_value_t = 40)]
+        top_k: usize,
+
+        /// Repetition penalty.
+        #[arg(long, default_value_t = 1.1)]
+        repeat_penalty: f32,
     },
 
     /// Start the OpenAI-compatible HTTP inference server.
@@ -311,8 +347,25 @@ async fn main() {
             seed,
             lora,
             gpu,
+            tui,
         } => {
             let file = maybe_download(&file).await;
+            #[cfg(feature = "tui")]
+            if tui {
+                if let Err(e) = glint::tui::run_tui(
+                    file.clone(),
+                    system.clone(),
+                    temperature,
+                    top_p,
+                    top_k,
+                    repeat_penalty,
+                    max_tokens,
+                ) {
+                    eprintln!("Error running TUI: {e}");
+                }
+                return;
+            }
+
             chat_model(
                 &file,
                 system.as_deref(),
@@ -325,6 +378,29 @@ async fn main() {
                 lora.as_deref(),
                 gpu,
             );
+        }
+        #[cfg(feature = "tui")]
+        Commands::Tui {
+            file,
+            system,
+            max_tokens,
+            temperature,
+            top_p,
+            top_k,
+            repeat_penalty,
+        } => {
+            let file = maybe_download(&file).await;
+            if let Err(e) = glint::tui::run_tui(
+                file.clone(),
+                system.clone(),
+                temperature,
+                top_p,
+                top_k,
+                repeat_penalty,
+                max_tokens,
+            ) {
+                eprintln!("Error running TUI: {e}");
+            }
         }
         #[cfg(feature = "server")]
         Commands::Serve {
@@ -425,7 +501,24 @@ fn main() {
             seed,
             lora,
             gpu,
+            tui,
         } => {
+            #[cfg(feature = "tui")]
+            if tui {
+                if let Err(e) = glint::tui::run_tui(
+                    file.clone(),
+                    system.clone(),
+                    temperature,
+                    top_p,
+                    top_k,
+                    repeat_penalty,
+                    max_tokens,
+                ) {
+                    eprintln!("Error running TUI: {e}");
+                }
+                return;
+            }
+
             chat_model(
                 &file,
                 system.as_deref(),
@@ -438,6 +531,28 @@ fn main() {
                 lora.as_deref(),
                 gpu,
             );
+        }
+        #[cfg(feature = "tui")]
+        Commands::Tui {
+            file,
+            system,
+            max_tokens,
+            temperature,
+            top_p,
+            top_k,
+            repeat_penalty,
+        } => {
+            if let Err(e) = glint::tui::run_tui(
+                file.clone(),
+                system.clone(),
+                temperature,
+                top_p,
+                top_k,
+                repeat_penalty,
+                max_tokens,
+            ) {
+                eprintln!("Error running TUI: {e}");
+            }
         }
         Commands::Bench {
             file,

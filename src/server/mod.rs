@@ -45,6 +45,8 @@ pub async fn run_server(state: AppState, host: &str, port: u16) {
         .allow_headers(Any);
 
     let app = Router::new()
+        .route("/", get(routes::web_ui))
+        .route("/ui", get(routes::web_ui))
         .route("/health", get(routes::health))
         .route("/v1/models", get(routes::list_models))
         .route("/v1/metrics", get(routes::server_metrics))
@@ -56,14 +58,12 @@ pub async fn run_server(state: AppState, host: &str, port: u16) {
         .with_state(shared);
 
     let addr = format!("{host}:{port}");
-    eprintln!("Glint server listening on http://{addr}");
-    eprintln!("  GET  http://{addr}/health");
-    eprintln!("  GET  http://{addr}/v1/models");
-    eprintln!("  GET  http://{addr}/v1/metrics");
-    eprintln!("  POST http://{addr}/v1/completions");
-    eprintln!("  POST http://{addr}/v1/chat/completions");
-    eprintln!("  POST http://{addr}/v1/responses");
-    eprintln!("  POST http://{addr}/v1/embeddings");
+    eprintln!("⚡ Glint inference server running at http://{addr}");
+    eprintln!("  Web Dashboard:              http://{addr}/");
+    eprintln!("  OpenAI Chat Endpoint:       http://{addr}/v1/chat/completions");
+    eprintln!("  OpenAI Completions:         http://{addr}/v1/completions");
+    eprintln!("  Embeddings Endpoint:        http://{addr}/v1/embeddings");
+    eprintln!("  Server Metrics:             http://{addr}/v1/metrics");
 
     let listener = tokio::net::TcpListener::bind(&addr)
         .await

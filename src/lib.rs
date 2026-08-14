@@ -42,3 +42,6 @@ pub mod python;
 
 #[cfg(feature = "wasm")]
 pub mod wasm;
+
+#[cfg(feature = "tui")]
+pub mod tui;

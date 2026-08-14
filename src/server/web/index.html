@@ -1,0 +1,937 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Glint — LLM Inference Engine & Studio</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg-base: #09090b;
+      --bg-surface: #121215;
+      --bg-surface-hover: #1c1c21;
+      --bg-glass: rgba(18, 18, 21, 0.75);
+      --border-subtle: rgba(255, 255, 255, 0.08);
+      --border-focus: rgba(6, 182, 212, 0.5);
+      --accent-cyan: #06b6d4;
+      --accent-cyan-glow: rgba(6, 182, 212, 0.25);
+      --accent-purple: #8b5cf6;
+      --accent-purple-glow: rgba(139, 92, 246, 0.25);
+      --accent-green: #10b981;
+      --text-main: #f4f4f5;
+      --text-muted: #a1a1aa;
+      --text-dim: #71717a;
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+      background-color: var(--bg-base);
+      color: var(--text-main);
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    /* ── Header ─────────────────────────────────────────────────────────────── */
+    header {
+      height: 60px;
+      background: var(--bg-glass);
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
+      border-bottom: 1px solid var(--border-subtle);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 24px;
+      z-index: 100;
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      font-weight: 700;
+      font-size: 18px;
+      letter-spacing: -0.02em;
+    }
+
+    .brand-icon {
+      width: 32px;
+      height: 32px;
+      border-radius: 8px;
+      background: linear-gradient(135deg, var(--accent-cyan), var(--accent-purple));
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: #fff;
+      box-shadow: 0 0 16px var(--accent-cyan-glow);
+    }
+
+    .nav-tabs {
+      display: flex;
+      gap: 4px;
+      background: rgba(0, 0, 0, 0.3);
+      padding: 4px;
+      border-radius: 10px;
+      border: 1px solid var(--border-subtle);
+    }
+
+    .nav-tab {
+      padding: 6px 16px;
+      border-radius: 6px;
+      font-size: 13px;
+      font-weight: 500;
+      color: var(--text-muted);
+      cursor: pointer;
+      transition: all 0.15s ease;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      border: none;
+      background: transparent;
+    }
+
+    .nav-tab:hover {
+      color: var(--text-main);
+      background: rgba(255, 255, 255, 0.04);
+    }
+
+    .nav-tab.active {
+      background: var(--bg-surface-hover);
+      color: var(--accent-cyan);
+      box-shadow: 0 1px 4px rgba(0, 0, 0, 0.3);
+    }
+
+    .header-meta {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .status-badge {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 10px;
+      border-radius: 20px;
+      font-size: 12px;
+      font-weight: 500;
+      background: rgba(16, 185, 129, 0.1);
+      color: var(--accent-green);
+      border: 1px solid rgba(16, 185, 129, 0.2);
+    }
+
+    .status-dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: var(--accent-green);
+      box-shadow: 0 0 8px var(--accent-green);
+    }
+
+    /* ── Main App Body ──────────────────────────────────────────────────────── */
+    main {
+      flex: 1;
+      display: flex;
+      overflow: hidden;
+      position: relative;
+    }
+
+    .tab-pane {
+      display: none;
+      width: 100%;
+      height: 100%;
+    }
+
+    .tab-pane.active {
+      display: flex;
+    }
+
+    /* ── Chat Studio ────────────────────────────────────────────────────────── */
+    .chat-layout {
+      display: flex;
+      width: 100%;
+      height: 100%;
+    }
+
+    .chat-sidebar {
+      width: 280px;
+      background: var(--bg-surface);
+      border-right: 1px solid var(--border-subtle);
+      display: flex;
+      flex-direction: column;
+      padding: 16px;
+      gap: 16px;
+      overflow-y: auto;
+    }
+
+    .sidebar-section-title {
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--text-dim);
+      margin-bottom: 8px;
+    }
+
+    .control-group {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      margin-bottom: 12px;
+    }
+
+    .control-label {
+      font-size: 12px;
+      font-weight: 500;
+      color: var(--text-muted);
+      display: flex;
+      justify-content: space-between;
+    }
+
+    .control-input, .control-textarea, .control-select {
+      background: var(--bg-base);
+      border: 1px solid var(--border-subtle);
+      border-radius: 6px;
+      padding: 8px 10px;
+      color: var(--text-main);
+      font-size: 13px;
+      font-family: inherit;
+      outline: none;
+      transition: border-color 0.15s ease;
+    }
+
+    .control-input:focus, .control-textarea:focus, .control-select:focus {
+      border-color: var(--accent-cyan);
+    }
+
+    .control-range {
+      accent-color: var(--accent-cyan);
+      cursor: pointer;
+    }
+
+    .chat-content {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      background: var(--bg-base);
+      position: relative;
+    }
+
+    .messages-container {
+      flex: 1;
+      overflow-y: auto;
+      padding: 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+    }
+
+    .message-row {
+      display: flex;
+      gap: 12px;
+      max-width: 850px;
+      width: 100%;
+      margin: 0 auto;
+    }
+
+    .message-avatar {
+      width: 32px;
+      height: 32px;
+      border-radius: 8px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 14px;
+      flex-shrink: 0;
+    }
+
+    .message-row.user .message-avatar {
+      background: #27272a;
+      color: var(--text-main);
+    }
+
+    .message-row.assistant .message-avatar {
+      background: linear-gradient(135deg, var(--accent-cyan), var(--accent-purple));
+      color: #fff;
+      box-shadow: 0 0 12px var(--accent-cyan-glow);
+    }
+
+    .message-bubble {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .message-header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--text-muted);
+    }
+
+    .message-body {
+      font-size: 14px;
+      line-height: 1.6;
+      color: var(--text-main);
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
+    .message-body code {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 12px;
+      background: #1e1e24;
+      padding: 2px 6px;
+      border-radius: 4px;
+      color: var(--accent-cyan);
+    }
+
+    .message-body pre {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 13px;
+      background: #18181b;
+      border: 1px solid var(--border-subtle);
+      border-radius: 8px;
+      padding: 12px 16px;
+      overflow-x: auto;
+      margin: 8px 0;
+      color: #e4e4e7;
+    }
+
+    .message-stats {
+      font-size: 11px;
+      color: var(--text-dim);
+      display: flex;
+      gap: 12px;
+      margin-top: 4px;
+    }
+
+    .input-wrapper {
+      padding: 16px 24px;
+      background: var(--bg-surface);
+      border-top: 1px solid var(--border-subtle);
+    }
+
+    .input-box {
+      max-width: 850px;
+      margin: 0 auto;
+      background: var(--bg-base);
+      border: 1px solid var(--border-subtle);
+      border-radius: 12px;
+      padding: 8px 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      transition: border-color 0.15s ease, box-shadow 0.15s ease;
+    }
+
+    .input-box:focus-within {
+      border-color: var(--accent-cyan);
+      box-shadow: 0 0 0 1px var(--accent-cyan-glow);
+    }
+
+    .input-textarea {
+      width: 100%;
+      background: transparent;
+      border: none;
+      outline: none;
+      color: var(--text-main);
+      font-size: 14px;
+      font-family: inherit;
+      resize: none;
+      min-height: 48px;
+      max-height: 180px;
+    }
+
+    .input-actions {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .btn {
+      padding: 6px 14px;
+      border-radius: 6px;
+      font-size: 13px;
+      font-weight: 500;
+      cursor: pointer;
+      transition: all 0.15s ease;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      border: 1px solid transparent;
+    }
+
+    .btn-primary {
+      background: var(--accent-cyan);
+      color: #000;
+      font-weight: 600;
+    }
+
+    .btn-primary:hover {
+      background: #22d3ee;
+      box-shadow: 0 0 12px var(--accent-cyan-glow);
+    }
+
+    .btn-secondary {
+      background: var(--bg-surface-hover);
+      color: var(--text-main);
+      border-color: var(--border-subtle);
+    }
+
+    .btn-secondary:hover {
+      background: #27272a;
+    }
+
+    /* ── Structured Studio & Tool Studio ────────────────────────────────────── */
+    .studio-layout {
+      display: flex;
+      width: 100%;
+      height: 100%;
+      padding: 20px;
+      gap: 20px;
+    }
+
+    .studio-pane {
+      flex: 1;
+      background: var(--bg-surface);
+      border: 1px solid var(--border-subtle);
+      border-radius: 12px;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    .pane-header {
+      height: 44px;
+      background: rgba(0, 0, 0, 0.2);
+      border-bottom: 1px solid var(--border-subtle);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 16px;
+    }
+
+    .pane-title {
+      font-size: 13px;
+      font-weight: 600;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .editor-area {
+      flex: 1;
+      padding: 16px;
+      background: #0d0d10;
+      color: #e4e4e7;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 13px;
+      border: none;
+      outline: none;
+      resize: none;
+      line-height: 1.5;
+    }
+
+    /* ── Metrics Dashboard ──────────────────────────────────────────────────── */
+    .telemetry-layout {
+      width: 100%;
+      height: 100%;
+      padding: 24px;
+      overflow-y: auto;
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 20px;
+      align-content: start;
+    }
+
+    .metric-card {
+      background: var(--bg-surface);
+      border: 1px solid var(--border-subtle);
+      border-radius: 12px;
+      padding: 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      position: relative;
+      overflow: hidden;
+    }
+
+    .metric-card::before {
+      content: '';
+      position: absolute;
+      top: 0;
+      left: 0;
+      right: 0;
+      height: 2px;
+      background: linear-gradient(90deg, var(--accent-cyan), var(--accent-purple));
+    }
+
+    .metric-title {
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+
+    .metric-value {
+      font-size: 32px;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      color: var(--text-main);
+    }
+
+    .metric-subtitle {
+      font-size: 12px;
+      color: var(--text-dim);
+    }
+
+    .progress-bar-bg {
+      width: 100%;
+      height: 6px;
+      background: rgba(255, 255, 255, 0.08);
+      border-radius: 3px;
+      overflow: hidden;
+    }
+
+    .progress-bar-fill {
+      height: 100%;
+      background: linear-gradient(90deg, var(--accent-cyan), var(--accent-purple));
+      border-radius: 3px;
+      transition: width 0.3s ease;
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Header -->
+  <header>
+    <div class="brand">
+      <div class="brand-icon">⚡</div>
+      <span>Glint Studio</span>
+    </div>
+
+    <div class="nav-tabs">
+      <button class="nav-tab active" data-tab="chat">💬 Chat</button>
+      <button class="nav-tab" data-tab="structured">🧬 Structured Outputs</button>
+      <button class="nav-tab" data-tab="tools">🛠️ Tool Calling</button>
+      <button class="nav-tab" data-tab="telemetry">📊 Telemetry</button>
+    </div>
+
+    <div class="header-meta">
+      <div class="status-badge" id="engineStatusBadge">
+        <div class="status-dot"></div>
+        <span id="engineStatusText">Engine Ready</span>
+      </div>
+    </div>
+  </header>
+
+  <!-- Main Content Areas -->
+  <main>
+    <!-- TAB 1: Chat Studio -->
+    <div class="tab-pane active" id="chatPane">
+      <div class="chat-layout">
+        <!-- Sidebar -->
+        <div class="chat-sidebar">
+          <div class="sidebar-section-title">Model Settings</div>
+
+          <div class="control-group">
+            <div class="control-label">
+              <span>Temperature</span>
+              <span id="tempVal">0.70</span>
+            </div>
+            <input type="range" class="control-range" id="tempRange" min="0" max="2" step="0.05" value="0.7">
+          </div>
+
+          <div class="control-group">
+            <div class="control-label">
+              <span>Top-P</span>
+              <span id="topPVal">0.90</span>
+            </div>
+            <input type="range" class="control-range" id="topPRange" min="0" max="1" step="0.05" value="0.9">
+          </div>
+
+          <div class="control-group">
+            <div class="control-label">
+              <span>Max Tokens</span>
+              <span id="maxTokensVal">512</span>
+            </div>
+            <input type="number" class="control-input" id="maxTokensInput" min="16" max="4096" value="512">
+          </div>
+
+          <div class="control-group">
+            <div class="control-label">System Prompt</div>
+            <textarea class="control-textarea" id="sysPromptInput" rows="4">You are Glint, an ultra-fast, intelligent AI pair programmer and assistant.</textarea>
+          </div>
+
+          <button class="btn btn-secondary" id="clearChatBtn" style="margin-top: auto;">🗑️ Clear Conversation</button>
+        </div>
+
+        <!-- Chat Transcript & Input -->
+        <div class="chat-content">
+          <div class="messages-container" id="chatMessages">
+            <div class="message-row assistant">
+              <div class="message-avatar">⚡</div>
+              <div class="message-bubble">
+                <div class="message-header">Glint Assistant</div>
+                <div class="message-body">Hello! I'm Glint, running locally on your hardware with accelerated ARM NEON SIMD. How can I help you today?</div>
+              </div>
+            </div>
+          </div>
+
+          <div class="input-wrapper">
+            <div class="input-box">
+              <textarea class="input-textarea" id="chatInput" placeholder="Type a message... (Enter to send, Shift+Enter for newline)"></textarea>
+              <div class="input-actions">
+                <div style="font-size: 11px; color: var(--text-dim);">Running locally on Glint Core</div>
+                <button class="btn btn-primary" id="sendBtn">Send ➔</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- TAB 2: Structured Outputs & Schema Lab -->
+    <div class="tab-pane" id="structuredPane">
+      <div class="studio-layout">
+        <div class="studio-pane">
+          <div class="pane-header">
+            <div class="pane-title">🧬 JSON Schema / GBNF Grammar</div>
+            <div style="display: flex; gap: 8px;">
+              <button class="btn btn-secondary" style="font-size: 11px; padding: 2px 8px;" id="loadUserSchemaBtn">User Profile</button>
+              <button class="btn btn-secondary" style="font-size: 11px; padding: 2px 8px;" id="loadSqlSchemaBtn">SQL AST</button>
+            </div>
+          </div>
+          <textarea class="editor-area" id="schemaCode">{
+  "type": "object",
+  "properties": {
+    "name": { "type": "string" },
+    "age": { "type": "integer" },
+    "skills": {
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  },
+  "required": ["name", "age", "skills"]
+}</textarea>
+          <div style="padding: 12px; border-top: 1px solid var(--border-subtle); background: var(--bg-surface);">
+            <div class="control-label" style="margin-bottom: 6px;">Prompt</div>
+            <div style="display: flex; gap: 8px;">
+              <input type="text" class="control-input" id="schemaPrompt" value="Generate a senior Rust engineer profile" style="flex: 1;">
+              <button class="btn btn-primary" id="runSchemaBtn">Generate ➔</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="studio-pane">
+          <div class="pane-header">
+            <div class="pane-title">⚡ Guaranteed Valid Output</div>
+            <div id="schemaStreamStats" style="font-size: 12px; color: var(--accent-cyan);">Ready</div>
+          </div>
+          <textarea class="editor-area" id="schemaOutput" readonly style="color: var(--accent-cyan);"></textarea>
+        </div>
+      </div>
+    </div>
+
+    <!-- TAB 3: Tool Calling Studio -->
+    <div class="tab-pane" id="toolsPane">
+      <div class="studio-layout">
+        <div class="studio-pane">
+          <div class="pane-header">
+            <div class="pane-title">🛠️ Tool Definition (OpenAI Format)</div>
+          </div>
+          <textarea class="editor-area" id="toolDefCode">[
+  {
+    "type": "function",
+    "function": {
+      "name": "get_weather",
+      "description": "Get real-time weather conditions for a given city",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "location": { "type": "string", "description": "The city and state, e.g. San Francisco, CA" },
+          "unit": { "type": "string", "enum": ["celsius", "fahrenheit"] }
+        },
+        "required": ["location"]
+      }
+    }
+  }
+]</textarea>
+          <div style="padding: 12px; border-top: 1px solid var(--border-subtle); background: var(--bg-surface);">
+            <div class="control-label" style="margin-bottom: 6px;">User Prompt</div>
+            <div style="display: flex; gap: 8px;">
+              <input type="text" class="control-input" id="toolPrompt" value="What is the weather in Tokyo right now?" style="flex: 1;">
+              <button class="btn btn-primary" id="runToolBtn">Test Tool Call ➔</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="studio-pane">
+          <div class="pane-header">
+            <div class="pane-title">📦 Model Generated Tool Call</div>
+          </div>
+          <textarea class="editor-area" id="toolOutput" readonly style="color: var(--accent-green);"></textarea>
+        </div>
+      </div>
+    </div>
+
+    <!-- TAB 4: Engine Telemetry -->
+    <div class="tab-pane" id="telemetryPane">
+      <div class="telemetry-layout">
+        <div class="metric-card">
+          <div class="metric-title">Throughput</div>
+          <div class="metric-value" id="mTokS">-- tok/s</div>
+          <div class="metric-subtitle">Active generation decode speed</div>
+        </div>
+
+        <div class="metric-card">
+          <div class="metric-title">Time to First Token (TTFT)</div>
+          <div class="metric-value" id="mTTFT">-- ms</div>
+          <div class="metric-subtitle">Prefill latency</div>
+        </div>
+
+        <div class="metric-card">
+          <div class="metric-title">KV Cache Pages</div>
+          <div class="metric-value" id="mKvPages">16 / 512</div>
+          <div class="progress-bar-bg"><div class="progress-bar-fill" id="mKvFill" style="width: 5%;"></div></div>
+          <div class="metric-subtitle">Paged pool allocation</div>
+        </div>
+
+        <div class="metric-card">
+          <div class="metric-title">Engine Hardware</div>
+          <div class="metric-value" style="font-size: 20px; color: var(--accent-cyan);">ARM NEON SIMD</div>
+          <div class="metric-subtitle">Zero-dependency native execution</div>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <script>
+    // ── Navigation Tabs ───────────────────────────────────────────────────────
+    document.querySelectorAll('.nav-tab').forEach(tab => {
+      tab.addEventListener('click', () => {
+        document.querySelectorAll('.nav-tab').forEach(t => t.classList.remove('active'));
+        document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
+        tab.classList.add('active');
+        const target = tab.dataset.tab;
+        document.getElementById(target + 'Pane').classList.add('active');
+      });
+    });
+
+    // ── Sliders ───────────────────────────────────────────────────────────────
+    const tempRange = document.getElementById('tempRange');
+    const tempVal = document.getElementById('tempVal');
+    tempRange.addEventListener('input', () => tempVal.textContent = parseFloat(tempRange.value).toFixed(2));
+
+    const topPRange = document.getElementById('topPRange');
+    const topPVal = document.getElementById('topPVal');
+    topPRange.addEventListener('input', () => topPVal.textContent = parseFloat(topPRange.value).toFixed(2));
+
+    const maxTokensInput = document.getElementById('maxTokensInput');
+
+    // ── Chat State ────────────────────────────────────────────────────────────
+    let conversationHistory = [];
+    const chatMessages = document.getElementById('chatMessages');
+    const chatInput = document.getElementById('chatInput');
+    const sendBtn = document.getElementById('sendBtn');
+    const clearChatBtn = document.getElementById('clearChatBtn');
+
+    clearChatBtn.addEventListener('click', () => {
+      conversationHistory = [];
+      chatMessages.innerHTML = `
+        <div class="message-row assistant">
+          <div class="message-avatar">⚡</div>
+          <div class="message-bubble">
+            <div class="message-header">Glint Assistant</div>
+            <div class="message-body">Conversation cleared. How can I assist you now?</div>
+          </div>
+        </div>
+      `;
+    });
+
+    async function sendChatMessage() {
+      const text = chatInput.value.trim();
+      if (!text) return;
+
+      chatInput.value = '';
+      appendMessage('user', text);
+
+      const sysPrompt = document.getElementById('sysPromptInput').value.trim();
+      const messages = [];
+      if (sysPrompt) messages.push({ role: 'system', content: sysPrompt });
+      conversationHistory.forEach(m => messages.push({ role: m.role, content: m.content }));
+      messages.push({ role: 'user', content: text });
+
+      const assistantBubble = appendMessage('assistant', '');
+      const bodyEl = assistantBubble.querySelector('.message-body');
+      const statsEl = assistantBubble.querySelector('.message-stats');
+
+      const t0 = performance.now();
+      let firstTokenTime = null;
+      let tokenCount = 0;
+      let fullText = '';
+
+      try {
+        const res = await fetch('/v1/chat/completions', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            model: 'default',
+            messages: messages,
+            stream: true,
+            temperature: parseFloat(tempRange.value),
+            top_p: parseFloat(topPRange.value),
+            max_tokens: parseInt(maxTokensInput.value)
+          })
+        });
+
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop() || '';
+
+          for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed || !trimmed.startsWith('data: ')) continue;
+            const dataStr = trimmed.slice(6);
+            if (dataStr === '[DONE]') break;
+
+            try {
+              const parsed = JSON.parse(dataStr);
+              const delta = parsed.choices[0]?.delta?.content || '';
+              if (delta) {
+                if (firstTokenTime === null) {
+                  firstTokenTime = performance.now() - t0;
+                  document.getElementById('mTTFT').textContent = `${Math.round(firstTokenTime)} ms`;
+                }
+                tokenCount++;
+                fullText += delta;
+                bodyEl.textContent = fullText;
+                chatMessages.scrollTop = chatMessages.scrollHeight;
+              }
+            } catch (e) {}
+          }
+        }
+
+        const totalTime = (performance.now() - t0) / 1000;
+        const tokS = totalTime > 0 ? (tokenCount / totalTime).toFixed(1) : 0;
+        statsEl.textContent = `${tokS} tok/s | TTFT: ${Math.round(firstTokenTime || 0)}ms | ${tokenCount} tokens`;
+        document.getElementById('mTokS').textContent = `${tokS} tok/s`;
+
+        conversationHistory.push({ role: 'user', content: text });
+        conversationHistory.push({ role: 'assistant', content: fullText });
+
+      } catch (err) {
+        bodyEl.textContent = `[Error: ${err.message}]`;
+      }
+    }
+
+    function appendMessage(role, text) {
+      const row = document.createElement('div');
+      row.className = `message-row ${role}`;
+      row.innerHTML = `
+        <div class="message-avatar">${role === 'user' ? '👤' : '⚡'}</div>
+        <div class="message-bubble">
+          <div class="message-header">${role === 'user' ? 'You' : 'Glint Assistant'}</div>
+          <div class="message-body">${text}</div>
+          ${role === 'assistant' ? '<div class="message-stats"></div>' : ''}
+        </div>
+      `;
+      chatMessages.appendChild(row);
+      chatMessages.scrollTop = chatMessages.scrollHeight;
+      return row;
+    }
+
+    sendBtn.addEventListener('click', sendChatMessage);
+    chatInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        sendChatMessage();
+      }
+    });
+
+    // ── Structured Output Studio ──────────────────────────────────────────────
+    const runSchemaBtn = document.getElementById('runSchemaBtn');
+    const schemaCode = document.getElementById('schemaCode');
+    const schemaPrompt = document.getElementById('schemaPrompt');
+    const schemaOutput = document.getElementById('schemaOutput');
+
+    runSchemaBtn.addEventListener('click', async () => {
+      schemaOutput.value = 'Compiling schema and generating...';
+      try {
+        const schema = JSON.parse(schemaCode.value);
+        const res = await fetch('/v1/chat/completions', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            model: 'default',
+            messages: [{ role: 'user', content: schemaPrompt.value }],
+            response_format: { type: 'json_schema', json_schema: { schema: schema, strict: true } },
+            max_tokens: 512
+          })
+        });
+        const data = await res.json();
+        const content = data.choices[0]?.message?.content || JSON.stringify(data, null, 2);
+        schemaOutput.value = content;
+      } catch (e) {
+        schemaOutput.value = `Error: ${e.message}`;
+      }
+    });
+
+    // ── Tool Calling Studio ───────────────────────────────────────────────────
+    const runToolBtn = document.getElementById('runToolBtn');
+    const toolDefCode = document.getElementById('toolDefCode');
+    const toolPrompt = document.getElementById('toolPrompt');
+    const toolOutput = document.getElementById('toolOutput');
+
+    runToolBtn.addEventListener('click', async () => {
+      toolOutput.value = 'Running model with tool definition...';
+      try {
+        const tools = JSON.parse(toolDefCode.value);
+        const res = await fetch('/v1/chat/completions', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            model: 'default',
+            messages: [{ role: 'user', content: toolPrompt.value }],
+            tools: tools,
+            tool_choice: 'auto'
+          })
+        });
+        const data = await res.json();
+        const msg = data.choices[0]?.message;
+        if (msg?.tool_calls) {
+          toolOutput.value = JSON.stringify(msg.tool_calls, null, 2);
+        } else {
+          toolOutput.value = `No tool call triggered. Output:\n${msg?.content || JSON.stringify(data, null, 2)}`;
+        }
+      } catch (e) {
+        toolOutput.value = `Error: ${e.message}`;
+      }
+    });
+  </script>
+</body>
+</html>
