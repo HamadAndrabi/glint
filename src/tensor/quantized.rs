@@ -451,6 +451,11 @@ fn dispatch_q8_0(data: &[u8], rows: usize, cols: usize, vec: &[f32]) -> Vec<f32>
             return unsafe { crate::tensor::simd::matvec_q8_0_avx2(data, rows, cols, vec) };
         }
     }
+    #[cfg(all(target_arch = "aarch64", feature = "rayon"))]
+    {
+        unsafe { crate::tensor::simd_neon::matvec_q8_0_neon(data, rows, cols, vec) }
+    }
+    #[cfg(not(all(target_arch = "aarch64", feature = "rayon")))]
     matvec_q8_0_scalar(data, rows, cols, vec)
 }
 
@@ -463,6 +468,11 @@ fn dispatch_q4_k(data: &[u8], rows: usize, cols: usize, vec: &[f32]) -> Vec<f32>
             return unsafe { crate::tensor::simd::matvec_q4_k_avx2(data, rows, cols, vec) };
         }
     }
+    #[cfg(all(target_arch = "aarch64", feature = "rayon"))]
+    {
+        unsafe { crate::tensor::simd_neon::matvec_q4_k_neon(data, rows, cols, vec) }
+    }
+    #[cfg(not(all(target_arch = "aarch64", feature = "rayon")))]
     matvec_q4_k_scalar(data, rows, cols, vec)
 }
 
@@ -475,6 +485,11 @@ fn dispatch_q5_k(data: &[u8], rows: usize, cols: usize, vec: &[f32]) -> Vec<f32>
             return unsafe { crate::tensor::simd::matvec_q5_k_avx2(data, rows, cols, vec) };
         }
     }
+    #[cfg(all(target_arch = "aarch64", feature = "rayon"))]
+    {
+        unsafe { crate::tensor::simd_neon::matvec_q5_k_neon(data, rows, cols, vec) }
+    }
+    #[cfg(not(all(target_arch = "aarch64", feature = "rayon")))]
     matvec_q5_k_scalar(data, rows, cols, vec)
 }
 
@@ -487,6 +502,11 @@ fn dispatch_q6_k(data: &[u8], rows: usize, cols: usize, vec: &[f32]) -> Vec<f32>
             return unsafe { crate::tensor::simd::matvec_q6_k_avx2(data, rows, cols, vec) };
         }
     }
+    #[cfg(all(target_arch = "aarch64", feature = "rayon"))]
+    {
+        unsafe { crate::tensor::simd_neon::matvec_q6_k_neon(data, rows, cols, vec) }
+    }
+    #[cfg(not(all(target_arch = "aarch64", feature = "rayon")))]
     matvec_q6_k_scalar(data, rows, cols, vec)
 }
 
@@ -499,6 +519,11 @@ fn dispatch_q4_0(data: &[u8], rows: usize, cols: usize, vec: &[f32]) -> Vec<f32>
             return unsafe { crate::tensor::simd::matvec_q4_0_avx2(data, rows, cols, vec) };
         }
     }
+    #[cfg(all(target_arch = "aarch64", feature = "rayon"))]
+    {
+        unsafe { crate::tensor::simd_neon::matvec_q4_0_neon(data, rows, cols, vec) }
+    }
+    #[cfg(not(all(target_arch = "aarch64", feature = "rayon")))]
     matvec_q4_0_scalar(data, rows, cols, vec)
 }
 
@@ -511,6 +536,11 @@ fn dispatch_q4_1(data: &[u8], rows: usize, cols: usize, vec: &[f32]) -> Vec<f32>
             return unsafe { crate::tensor::simd::matvec_q4_1_avx2(data, rows, cols, vec) };
         }
     }
+    #[cfg(all(target_arch = "aarch64", feature = "rayon"))]
+    {
+        unsafe { crate::tensor::simd_neon::matvec_q4_1_neon(data, rows, cols, vec) }
+    }
+    #[cfg(not(all(target_arch = "aarch64", feature = "rayon")))]
     matvec_q4_1_scalar(data, rows, cols, vec)
 }
 
@@ -523,6 +553,11 @@ fn dispatch_q5_0(data: &[u8], rows: usize, cols: usize, vec: &[f32]) -> Vec<f32>
             return unsafe { crate::tensor::simd::matvec_q5_0_avx2(data, rows, cols, vec) };
         }
     }
+    #[cfg(all(target_arch = "aarch64", feature = "rayon"))]
+    {
+        unsafe { crate::tensor::simd_neon::matvec_q5_0_neon(data, rows, cols, vec) }
+    }
+    #[cfg(not(all(target_arch = "aarch64", feature = "rayon")))]
     matvec_q5_0_scalar(data, rows, cols, vec)
 }
 
@@ -535,18 +570,20 @@ fn dispatch_q5_1(data: &[u8], rows: usize, cols: usize, vec: &[f32]) -> Vec<f32>
             return unsafe { crate::tensor::simd::matvec_q5_1_avx2(data, rows, cols, vec) };
         }
     }
+    #[cfg(all(target_arch = "aarch64", feature = "rayon"))]
+    {
+        unsafe { crate::tensor::simd_neon::matvec_q5_1_neon(data, rows, cols, vec) }
+    }
+    #[cfg(not(all(target_arch = "aarch64", feature = "rayon")))]
     matvec_q5_1_scalar(data, rows, cols, vec)
 }
 
 // ── Scalar Kernels ───────────────────────────────────────────────────────────
 
-/// Q8_0 matrix-vector multiply (scalar fallback).
-///
-/// Block layout (34 bytes per 32 elements):
-///   [f16 scale (2 bytes)] [32 × i8 values]
 ///
 /// For each output row, iterate over blocks, compute block_sum = Σ i8×f32,
 /// then accumulate block_sum × scale. One scale multiply per block (32 elements).
+#[allow(dead_code)]
 pub(crate) fn matvec_q8_0_scalar(data: &[u8], rows: usize, cols: usize, vec: &[f32]) -> Vec<f32> {
     const BLOCK_ELEMS: usize = 32;
     const BLOCK_BYTES: usize = 34; // 2 (f16 scale) + 32 (i8s)
@@ -581,6 +618,7 @@ pub(crate) fn matvec_q8_0_scalar(data: &[u8], rows: usize, cols: usize, vec: &[f
 /// The nibbles are split-plane, matching the ggml-anchored
 /// [`super::dequantize::unpack_q4_0_block`]: the low nibble of byte `j` is
 /// element `j` and its high nibble is element `j + 16`, not `2j`/`2j+1`.
+#[allow(dead_code)]
 pub(crate) fn matvec_q4_0_scalar(data: &[u8], rows: usize, cols: usize, vec: &[f32]) -> Vec<f32> {
     const BLOCK_ELEMS: usize = 32;
     const HALF: usize = BLOCK_ELEMS / 2;
@@ -619,6 +657,7 @@ pub(crate) fn matvec_q4_0_scalar(data: &[u8], rows: usize, cols: usize, vec: &[f
 /// 8 sub-blocks of 32; each has a 6-bit scale and 6-bit min extracted via
 /// `get_scale_min_q4k`. Low nibbles of each byte → even sub-blocks; high nibbles
 /// → odd sub-blocks (4 groups of 64 per super-block).
+#[allow(dead_code)]
 fn matvec_q4_k_scalar(data: &[u8], rows: usize, cols: usize, vec: &[f32]) -> Vec<f32> {
     const SUPER_BLOCK: usize = 256;
     const BLOCK_BYTES: usize = 144;
@@ -666,6 +705,7 @@ fn matvec_q4_k_scalar(data: &[u8], rows: usize, cols: usize, vec: &[f32]) -> Vec
 ///   [f16 d] [f16 dmin] [scales u8×12] [qh u8×32] [qs u8×128]
 ///
 /// Same sub-block structure as Q4_K; each nibble gains a 5th bit from `qh`.
+#[allow(dead_code)]
 fn matvec_q5_k_scalar(data: &[u8], rows: usize, cols: usize, vec: &[f32]) -> Vec<f32> {
     const SUPER_BLOCK: usize = 256;
     const BLOCK_BYTES: usize = 176;
@@ -721,6 +761,7 @@ fn matvec_q5_k_scalar(data: &[u8], rows: usize, cols: usize, vec: &[f32]) -> Vec
 ///
 /// Two groups of 128; within each group, 32 iterations scatter output to
 /// four non-contiguous positions (l, l+32, l+64, l+96).
+#[allow(dead_code)]
 fn matvec_q6_k_scalar(data: &[u8], rows: usize, cols: usize, vec: &[f32]) -> Vec<f32> {
     const SUPER_BLOCK: usize = 256;
     const BLOCK_BYTES: usize = 210;
@@ -888,6 +929,7 @@ fn matvec_iq4_nl_scalar(data: &[u8], rows: usize, cols: usize, vec: &[f32]) -> V
 /// [`super::dequantize::unpack_q4_1_block`] — the nibbles are split-plane
 /// (low nibbles are elements 0..16, high nibbles 16..32) and the values are
 /// affine (`q*d + m`), not centered like Q4_0.
+#[allow(dead_code)]
 fn matvec_q4_1_scalar(data: &[u8], rows: usize, cols: usize, vec: &[f32]) -> Vec<f32> {
     const BLOCK_SIZE: usize = 32;
     const BLOCK_BYTES: usize = 20;
@@ -917,6 +959,7 @@ fn matvec_q4_1_scalar(data: &[u8], rows: usize, cols: usize, vec: &[f32]) -> Vec
 /// Block layout (22 bytes per 32 elements): [f16 d] [qh u8×4] [qs u8×16].
 /// Unpacks each block through the shared, ggml-anchored
 /// [`super::dequantize::unpack_q5_0_block`].
+#[allow(dead_code)]
 fn matvec_q5_0_scalar(data: &[u8], rows: usize, cols: usize, vec: &[f32]) -> Vec<f32> {
     const BLOCK_SIZE: usize = 32;
     const BLOCK_BYTES: usize = 22;
@@ -946,6 +989,7 @@ fn matvec_q5_0_scalar(data: &[u8], rows: usize, cols: usize, vec: &[f32]) -> Vec
 /// Block layout (24 bytes per 32 elements): [f16 d] [f16 m] [qh u8×4] [qs u8×16].
 /// Unpacks each block through the shared, ggml-anchored
 /// [`super::dequantize::unpack_q5_1_block`].
+#[allow(dead_code)]
 fn matvec_q5_1_scalar(data: &[u8], rows: usize, cols: usize, vec: &[f32]) -> Vec<f32> {
     const BLOCK_SIZE: usize = 32;
     const BLOCK_BYTES: usize = 24;
@@ -1029,6 +1073,13 @@ fn dispatch_q8_0_batch(data: &[u8], rows: usize, cols: usize, inputs: &[&[f32]],
             return;
         }
     }
+    #[cfg(all(target_arch = "aarch64", feature = "rayon"))]
+    {
+        unsafe {
+            crate::tensor::simd_neon::matvec_q8_0_batch_neon(data, rows, cols, inputs, out);
+        }
+    }
+    #[cfg(not(all(target_arch = "aarch64", feature = "rayon")))]
     matvec_q8_0_batch_scalar(data, rows, cols, inputs, out)
 }
 
@@ -1043,6 +1094,13 @@ fn dispatch_q4_0_batch(data: &[u8], rows: usize, cols: usize, inputs: &[&[f32]],
             return;
         }
     }
+    #[cfg(all(target_arch = "aarch64", feature = "rayon"))]
+    {
+        unsafe {
+            crate::tensor::simd_neon::matvec_q4_0_batch_neon(data, rows, cols, inputs, out);
+        }
+    }
+    #[cfg(not(all(target_arch = "aarch64", feature = "rayon")))]
     matvec_q4_0_batch_scalar(data, rows, cols, inputs, out)
 }
 
@@ -1082,6 +1140,15 @@ fn dispatch_q5_0_batch(data: &[u8], rows: usize, cols: usize, inputs: &[&[f32]],
             return;
         }
     }
+    #[cfg(all(target_arch = "aarch64", feature = "rayon"))]
+    {
+        let batch = inputs.len();
+        for (s, input) in inputs.iter().enumerate() {
+            let col = unsafe { crate::tensor::simd_neon::matvec_q5_0_neon(data, rows, cols, input) };
+            scatter_lane(col, s, batch, out);
+        }
+    }
+    #[cfg(not(all(target_arch = "aarch64", feature = "rayon")))]
     matvec_q5_0_batch_scalar(data, rows, cols, inputs, out)
 }
 
@@ -1099,6 +1166,15 @@ fn dispatch_q5_1_batch(data: &[u8], rows: usize, cols: usize, inputs: &[&[f32]],
             return;
         }
     }
+    #[cfg(all(target_arch = "aarch64", feature = "rayon"))]
+    {
+        let batch = inputs.len();
+        for (s, input) in inputs.iter().enumerate() {
+            let col = unsafe { crate::tensor::simd_neon::matvec_q5_1_neon(data, rows, cols, input) };
+            scatter_lane(col, s, batch, out);
+        }
+    }
+    #[cfg(not(all(target_arch = "aarch64", feature = "rayon")))]
     matvec_q5_1_batch_scalar(data, rows, cols, inputs, out)
 }
 
@@ -1113,6 +1189,13 @@ fn dispatch_q4_k_batch(data: &[u8], rows: usize, cols: usize, inputs: &[&[f32]],
             return;
         }
     }
+    #[cfg(all(target_arch = "aarch64", feature = "rayon"))]
+    {
+        unsafe {
+            crate::tensor::simd_neon::matvec_q4_k_batch_neon(data, rows, cols, inputs, out);
+        }
+    }
+    #[cfg(not(all(target_arch = "aarch64", feature = "rayon")))]
     matvec_q4_k_batch_scalar(data, rows, cols, inputs, out)
 }
 
@@ -1127,6 +1210,13 @@ fn dispatch_q5_k_batch(data: &[u8], rows: usize, cols: usize, inputs: &[&[f32]],
             return;
         }
     }
+    #[cfg(all(target_arch = "aarch64", feature = "rayon"))]
+    {
+        unsafe {
+            crate::tensor::simd_neon::matvec_q5_k_batch_neon(data, rows, cols, inputs, out);
+        }
+    }
+    #[cfg(not(all(target_arch = "aarch64", feature = "rayon")))]
     matvec_q5_k_batch_scalar(data, rows, cols, inputs, out)
 }
 
@@ -1141,10 +1231,18 @@ fn dispatch_q6_k_batch(data: &[u8], rows: usize, cols: usize, inputs: &[&[f32]],
             return;
         }
     }
+    #[cfg(all(target_arch = "aarch64", feature = "rayon"))]
+    {
+        unsafe {
+            crate::tensor::simd_neon::matvec_q6_k_batch_neon(data, rows, cols, inputs, out);
+        }
+    }
+    #[cfg(not(all(target_arch = "aarch64", feature = "rayon")))]
     matvec_q6_k_batch_scalar(data, rows, cols, inputs, out)
 }
 
 /// Batched Q8_0 matvec (scalar fallback) — see [`matvec_q8_0_scalar`].
+#[allow(dead_code)]
 pub(crate) fn matvec_q8_0_batch_scalar(
     data: &[u8],
     rows: usize,
@@ -1186,6 +1284,7 @@ pub(crate) fn matvec_q8_0_batch_scalar(
 }
 
 /// Batched Q4_0 matvec (scalar fallback) — see [`matvec_q4_0_scalar`].
+#[allow(dead_code)]
 pub(crate) fn matvec_q4_0_batch_scalar(
     data: &[u8],
     rows: usize,
@@ -1234,6 +1333,7 @@ pub(crate) fn matvec_q4_0_batch_scalar(
 }
 
 /// Batched Q4_K matvec (scalar) — see [`matvec_q4_k_scalar`].
+#[allow(dead_code)]
 fn matvec_q4_k_batch_scalar(
     data: &[u8],
     rows: usize,
@@ -1293,6 +1393,7 @@ fn matvec_q4_k_batch_scalar(
 }
 
 /// Batched Q5_K matvec (scalar) — see [`matvec_q5_k_scalar`].
+#[allow(dead_code)]
 fn matvec_q5_k_batch_scalar(
     data: &[u8],
     rows: usize,
@@ -1362,6 +1463,7 @@ fn matvec_q5_k_batch_scalar(
 /// The single-vector kernel visits four non-contiguous input offsets per `l`
 /// (`l`, `l+32`, `l+64`, `l+96`), so the batched form decodes all four weights
 /// for an `l` before the sequence loop and keeps that same four-add order.
+#[allow(dead_code)]
 fn matvec_q6_k_batch_scalar(
     data: &[u8],
     rows: usize,
@@ -1525,6 +1627,7 @@ fn matvec_iq4_nl_batch_scalar(
 }
 
 /// Batched Q5_0 matvec (scalar) — see [`matvec_q5_0_scalar`].
+#[allow(dead_code)]
 fn matvec_q5_0_batch_scalar(
     data: &[u8],
     rows: usize,
@@ -1544,6 +1647,7 @@ fn matvec_q5_0_batch_scalar(
 }
 
 /// Batched Q5_1 matvec (scalar) — see [`matvec_q5_1_scalar`].
+#[allow(dead_code)]
 fn matvec_q5_1_batch_scalar(
     data: &[u8],
     rows: usize,

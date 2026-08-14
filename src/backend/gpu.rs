@@ -1017,6 +1017,13 @@ pub struct GpuKvBuffer {
     pub(crate) max_seq_len: usize,
 }
 
+impl GpuKvBuffer {
+    /// Number of transformer layers this buffer holds K/V slabs for.
+    pub fn n_layers(&self) -> usize {
+        self.n_layers
+    }
+}
+
 // ── GpuKvCache ────────────────────────────────────────────────────────────────
 
 /// KV cache that keeps K/V vectors GPU-resident.
@@ -1039,6 +1046,13 @@ pub struct GpuKvCache {
     pub(crate) kv_dim: usize, // n_kv_heads * head_dim
     pub(crate) max_seq_len: usize,
     pub(crate) len: usize,
+}
+
+impl GpuKvCache {
+    /// Device the K/V buffers were allocated on.
+    pub fn device(&self) -> &Arc<wgpu::Device> {
+        &self.device
+    }
 }
 
 impl GpuBackend {

@@ -79,10 +79,14 @@ SIMD dispatch pattern:
 if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
     return unsafe { simd::matvec_q8_0_avx2(...) };
 }
+#[cfg(all(target_arch = "aarch64", feature = "rayon"))]
+return unsafe { simd_neon::matvec_q8_0_neon(...) };
+
+#[cfg(not(all(target_arch = "aarch64", feature = "rayon")))]
 matvec_q8_0_scalar(...)
 ```
 
-Note: `simd.rs` is only compiled when both `x86_64` architecture AND `rayon` feature are active.
+Note: `simd.rs` is compiled when `x86_64` AND `rayon` are active; `simd_neon.rs` is compiled when `aarch64` AND `rayon` are active.
 
 Keep a scalar fallback alongside every optimized path.
 
@@ -107,7 +111,8 @@ SafeTensors (HuggingFace) loading is the second, optional entry point — a dire
 | `src/tensor/flash.rs` | Flash attention for single-query decode (online softmax, O(N) memory) |
 | `src/tensor/quantized.rs` | Quantized tensor storage, dispatch, scalar kernels |
 | `src/tensor/dequantize.rs` | Reference dequantization for all formats |
-| `src/tensor/simd.rs` | AVX2 + FMA kernels and unsafe SIMD helpers |
+| `src/tensor/simd.rs` | AVX2 + FMA kernels (x86_64) |
+| `src/tensor/simd_neon.rs` | ARM NEON SIMD kernels (aarch64 / Apple Silicon) |
 | `src/cache/` | KV-cache implementations |
 | `src/cache/paged.rs` | PagedAttention-style paged KV cache (`PagePool`, `PagedKvCache`, CoW `fork_from`) |
 | `src/cache/prefix.rs` | Prefix-cache registry reusing KV pages across requests sharing a prompt prefix |

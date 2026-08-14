@@ -6,6 +6,8 @@ mod ops;
 pub mod quantized;
 #[cfg(all(target_arch = "x86_64", feature = "rayon"))]
 mod simd;
+#[cfg(all(target_arch = "aarch64", feature = "rayon"))]
+mod simd_neon;
 #[allow(clippy::module_inception)]
 mod tensor;
 
