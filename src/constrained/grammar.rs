@@ -103,17 +103,15 @@ mod tests {
             "required": ["name", "age"]
         });
 
-        let mut constraint = JsonSchemaConstraint::from_json_schema(&schema, Arc::clone(&vocab)).unwrap();
+        let mut constraint =
+            JsonSchemaConstraint::from_json_schema(&schema, Arc::clone(&vocab)).unwrap();
         let mask = constraint.allowed_tokens(&[], &vocab);
         assert!(!mask.is_empty());
     }
 
     #[test]
     fn test_grammar_constraint_eos_allowed_on_completion() {
-        let tokens: Vec<String> = vec![
-            "hello".into(),
-            "</s>".into(),
-        ];
+        let tokens: Vec<String> = vec!["hello".into(), "</s>".into()];
         let vocab = VocabIndex::from_vocab(&tokens);
         let gbnf = r#"root ::= "hello""#;
         let mut constraint = GrammarConstraint::from_gbnf_str(gbnf, Arc::clone(&vocab)).unwrap();
@@ -125,5 +123,48 @@ mod tests {
         constraint.advance(0); // advance "hello"
         let mask2 = constraint.allowed_tokens(&[0], &vocab);
         assert!(mask2[1], "eos must be allowed after completing grammar");
+    }
+}
+
+#[cfg(test)]
+mod eos_masking_tests {
+    use super::*;
+    use crate::constrained::VocabIndex;
+    use std::sync::Arc;
+
+    /// The regression this guards: with EOS unrecognised, a completed grammar
+    /// produced an all-false mask, every logit became -inf, and the sequence
+    /// emitted token 0 until it hit `max_tokens`.
+    #[test]
+    fn a_completed_grammar_can_stop_even_when_eos_has_an_unusual_spelling() {
+        let tokens: Vec<String> = vec!["hello".into(), "<|end|>".into()];
+        let vocab = VocabIndex::from_vocab_with_eos(&tokens, &[1]);
+        let gbnf = r#"root ::= "hello""#;
+        let mut c = GrammarConstraint::from_gbnf_str(gbnf, Arc::clone(&vocab)).unwrap();
+
+        let before = c.allowed_tokens(&[], &vocab);
+        assert!(before[0], "\"hello\" allowed before completion");
+        assert!(!before[1], "EOS not allowed before completion");
+
+        c.advance(0);
+        let after = c.allowed_tokens(&[0], &vocab);
+        assert!(
+            after[1],
+            "EOS must be allowed once the grammar is satisfied"
+        );
+    }
+
+    /// Padding slots decode to "" and must never be offered as a way to stop.
+    #[test]
+    fn padding_slots_are_never_allowed_as_a_stop_token() {
+        let tokens: Vec<String> = vec!["hello".into(), "".into(), "".into(), "</s>".into()];
+        let vocab = VocabIndex::from_vocab_with_eos(&tokens, &[3]);
+        let gbnf = r#"root ::= "hello""#;
+        let mut c = GrammarConstraint::from_gbnf_str(gbnf, Arc::clone(&vocab)).unwrap();
+
+        c.advance(0);
+        let mask = c.allowed_tokens(&[0], &vocab);
+        assert!(!mask[1] && !mask[2], "empty vocab slots must stay masked");
+        assert!(mask[3], "the real EOS must be allowed");
     }
 }

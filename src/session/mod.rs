@@ -95,6 +95,14 @@ pub struct Session {
     /// Vocabulary index used by the constraint for mask lookups.
     /// Set alongside `constraint`; `None` when no constraint is active.
     pub vocab_index: Option<Arc<VocabIndex>>,
+    /// Why the requested constraint could not be built, if it could not be.
+    ///
+    /// `Session::new` and `Model::new_session` cannot fail, so a malformed
+    /// schema or grammar is recorded here instead. It must be checked before
+    /// generating: `constraint == None` alone cannot distinguish "no constraint
+    /// requested" from "the requested constraint failed to compile", and
+    /// treating the latter as the former yields unconstrained output.
+    pub constraint_error: Option<String>,
     /// Per-session LoRA adapter.  When `Some`, overrides the base model's
     /// global adapter during forward passes.
     pub lora_adapter: Option<Arc<LoraWeights>>,
@@ -139,6 +147,7 @@ impl Session {
             max_remaining: opts.max_new_tokens,
             constraint: None,
             vocab_index: None,
+            constraint_error: None,
             lora_adapter: opts.lora_adapter,
         }
     }

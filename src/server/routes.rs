@@ -266,7 +266,9 @@ fn resolve_tool_constraint(
                 }));
             }
             if !variants.is_empty() {
-                Some(ConstraintSpec::JsonSchema(serde_json::json!({ "anyOf": variants })))
+                Some(ConstraintSpec::JsonSchema(
+                    serde_json::json!({ "anyOf": variants }),
+                ))
             } else {
                 None
             }
@@ -335,7 +337,8 @@ fn prepare_chat_generation(
             if let Some(t) = tools {
                 if !t.is_empty() {
                     let tool_prompt = format_tools_system_prompt(t);
-                    owned_messages.push((m.role.clone(), format!("{}{}", content_str, tool_prompt)));
+                    owned_messages
+                        .push((m.role.clone(), format!("{}{}", content_str, tool_prompt)));
                     continue;
                 }
             }
@@ -619,6 +622,12 @@ pub async fn completions(
     };
 
     if let Some(spec) = resolve_constraint(req.response_format.as_ref()) {
+        if let Err(msg) = spec.validate() {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                format!("invalid response_format: {msg}"),
+            );
+        }
         prepared.constraint = Some(spec);
     }
 
@@ -955,9 +964,21 @@ pub async fn chat_completions(
     let mut specific_tool_name = None;
 
     if let Some(spec) = resolve_constraint(req.response_format.as_ref()) {
+        if let Err(msg) = spec.validate() {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                format!("invalid response_format: {msg}"),
+            );
+        }
         prepared.constraint = Some(spec);
     } else if let Some(t) = tools {
         if let Some(tool_constraint) = resolve_tool_constraint(t, req.tool_choice.as_ref()) {
+            if let Err(msg) = tool_constraint.validate() {
+                return api_error(
+                    StatusCode::BAD_REQUEST,
+                    format!("invalid tools schema: {msg}"),
+                );
+            }
             prepared.constraint = Some(tool_constraint);
             is_tool_call_mode = true;
             if let Some(ToolChoice::Function { function, .. }) = req.tool_choice.as_ref() {

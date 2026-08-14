@@ -77,8 +77,22 @@ impl VocabIndex {
     /// `vocab[i]` should be the decoded string for token id `i`.  This is the
     /// same order as the tokenizer's internal vocab table.
     pub fn from_vocab(vocab: &[String]) -> Arc<Self> {
+        Self::from_vocab_with_eos(vocab, &[])
+    }
+
+    /// Build the index, marking `eos_ids` as end-of-sequence tokens.
+    ///
+    /// Callers that know the model's real EOS id (from the tokenizer) should
+    /// use this rather than [`Self::from_vocab`]: the string heuristic below
+    /// only recognises the handful of conventional spellings, and a model
+    /// whose EOS decodes to anything else would never be allowed to stop.
+    pub fn from_vocab_with_eos(vocab: &[String], eos_ids: &[u32]) -> Arc<Self> {
         let mut char_to_ids: HashMap<char, Vec<u32>> = HashMap::new();
         let mut eos_token_ids: Vec<u32> = Vec::new();
+        // Fallback for callers that have no tokenizer handy. Deliberately does
+        // NOT include empty strings: unused vocab slots decode to "" and are
+        // not stop tokens, so allowing them would let a completed sequence
+        // sample a padding id and keep generating.
         let eos_candidates = [
             "</s>",
             "<|endoftext|>",
@@ -92,8 +106,13 @@ impl VocabIndex {
             if let Some(ch) = s.chars().next() {
                 char_to_ids.entry(ch).or_default().push(id as u32);
             }
-            if eos_candidates.contains(&s.as_str()) || s.is_empty() {
+            if eos_candidates.contains(&s.as_str()) {
                 eos_token_ids.push(id as u32);
+            }
+        }
+        for &id in eos_ids {
+            if (id as usize) < vocab.len() && !eos_token_ids.contains(&id) {
+                eos_token_ids.push(id);
             }
         }
         Arc::new(Self {
@@ -101,30 +120,6 @@ impl VocabIndex {
             char_to_ids,
             eos_token_ids,
         })
-    }
-
-    /// Add an explicit EOS token ID.
-    pub fn with_eos_token(mut self: Arc<Self>, eos_id: u32) -> Arc<Self> {
-        if let Some(s) = Arc::get_mut(&mut self) {
-            if !s.eos_token_ids.contains(&eos_id) {
-                s.eos_token_ids.push(eos_id);
-            }
-            self
-        } else {
-            let mut cloned = (*self).clone_data();
-            if !cloned.eos_token_ids.contains(&eos_id) {
-                cloned.eos_token_ids.push(eos_id);
-            }
-            Arc::new(cloned)
-        }
-    }
-
-    fn clone_data(&self) -> Self {
-        Self {
-            strings: self.strings.clone(),
-            char_to_ids: self.char_to_ids.clone(),
-            eos_token_ids: self.eos_token_ids.clone(),
-        }
     }
 }
 
@@ -149,6 +144,24 @@ pub enum ConstraintSpec {
     JsonSchema(serde_json::Value),
     /// Force the model to follow a custom GBNF grammar.
     Grammar(String),
+}
+
+impl ConstraintSpec {
+    /// Check that this spec compiles, without needing a vocabulary.
+    ///
+    /// Schema compilation and GBNF parsing depend only on the spec, so callers
+    /// that accept specs from untrusted input (the HTTP API) can validate here
+    /// and reject the request up front rather than failing mid-generation.
+    pub fn validate(&self) -> Result<(), String> {
+        match self {
+            Self::JsonObject | Self::JsonEnum(_) => Ok(()),
+            Self::JsonSchema(schema) => {
+                let gbnf = json_schema::json_schema_to_gbnf(schema)?;
+                gbnf::GbnfGrammar::from_str(&gbnf).map(|_| ())
+            }
+            Self::Grammar(src) => gbnf::GbnfGrammar::from_str(src).map(|_| ()),
+        }
+    }
 }
 
 // ── JSON parse state ──────────────────────────────────────────────────────────
@@ -419,7 +432,9 @@ pub fn build_constraint(
 ) -> Result<Box<dyn TokenConstraint>, String> {
     match spec {
         ConstraintSpec::JsonObject => Ok(Box::new(JsonObjectConstraint::new(vocab))),
-        ConstraintSpec::JsonEnum(opts) => Ok(Box::new(JsonEnumConstraint::new(opts.clone(), vocab))),
+        ConstraintSpec::JsonEnum(opts) => {
+            Ok(Box::new(JsonEnumConstraint::new(opts.clone(), vocab)))
+        }
         ConstraintSpec::JsonSchema(schema) => {
             let c = JsonSchemaConstraint::from_json_schema(schema, vocab)?;
             Ok(Box::new(c))
@@ -547,5 +562,57 @@ mod tests {
         assert!(mask[0], "\"yes\" should be allowed");
         assert!(mask[1], "\"no\" should be allowed");
         assert!(!mask[2], "\"maybe\" should not be allowed");
+    }
+}
+
+#[cfg(test)]
+mod eos_and_validation_tests {
+    use super::*;
+
+    /// A model whose EOS decodes to a spelling outside the built-in candidate
+    /// list must still be allowed to stop, or a completed sequence gets an
+    /// all-false mask and every logit becomes -inf.
+    #[test]
+    fn explicit_eos_id_is_marked_even_when_its_spelling_is_unknown() {
+        let vocab: Vec<String> = vec!["hello".into(), "<|end|>".into()];
+        let vi = VocabIndex::from_vocab_with_eos(&vocab, &[1]);
+        assert_eq!(vi.eos_token_ids, vec![1]);
+    }
+
+    /// Unused vocab slots decode to "" and are not stop tokens; allowing them
+    /// would let a completed sequence sample a padding id and keep going.
+    #[test]
+    fn empty_vocab_slots_are_not_treated_as_eos() {
+        let vocab: Vec<String> = vec!["hello".into(), "".into(), "".into(), "</s>".into()];
+        let vi = VocabIndex::from_vocab_with_eos(&vocab, &[]);
+        assert_eq!(
+            vi.eos_token_ids,
+            vec![3],
+            "only the real EOS should be marked"
+        );
+    }
+
+    #[test]
+    fn explicit_eos_id_is_not_duplicated_and_out_of_range_ids_are_ignored() {
+        let vocab: Vec<String> = vec!["hi".into(), "</s>".into()];
+        let vi = VocabIndex::from_vocab_with_eos(&vocab, &[1, 99]);
+        assert_eq!(vi.eos_token_ids, vec![1]);
+    }
+
+    #[test]
+    fn validate_accepts_good_specs_and_rejects_bad_ones() {
+        assert!(ConstraintSpec::JsonObject.validate().is_ok());
+        assert!(ConstraintSpec::Grammar(r#"root ::= "a""#.into())
+            .validate()
+            .is_ok());
+        assert!(ConstraintSpec::Grammar("root ::= \"unterminated".into())
+            .validate()
+            .is_err());
+        assert!(
+            ConstraintSpec::JsonSchema(serde_json::json!({ "type": "strng" }))
+                .validate()
+                .is_err(),
+            "a misspelled type must be rejected, not widened to any-value"
+        );
     }
 }

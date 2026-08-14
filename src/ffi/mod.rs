@@ -343,8 +343,8 @@ pub unsafe extern "C" fn glint_session_new_constrained(
         let m = unsafe { &(*model).0 };
         let session = m.new_session(&opts);
 
-        if opts.constraint.is_some() && session.constraint.is_none() {
-            set_error("failed to build specified token constraint");
+        if let Some(e) = &session.constraint_error {
+            set_error(format!("failed to build specified token constraint: {e}"));
             return std::ptr::null_mut();
         }
 

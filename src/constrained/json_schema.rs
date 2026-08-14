@@ -18,7 +18,8 @@ pub fn json_schema_to_gbnf(schema: &Value) -> Result<String, String> {
     gbnf.push_str(" ws\n\n");
 
     // Emit standard primitives and helper whitespace rules
-    gbnf.push_str(r#"ws ::= [ \t\n\r]*
+    gbnf.push_str(
+        r#"ws ::= [ \t\n\r]*
 string ::= "\"" ([^"\\\x00-\x1f] | "\\" [^\x00-\x1f])* "\""
 number ::= ("-")? ([0-9] | [1-9] [0-9]*) ("." [0-9]+)? ([eE] [-+]? [0-9]+)?
 integer ::= ("-")? ([0-9] | [1-9] [0-9]*)
@@ -28,7 +29,8 @@ value ::= object | array | string | number | boolean | null
 object ::= "{" ws (pair ("," ws pair)*)? ws "}"
 pair ::= string ws ":" ws value
 array ::= "[" ws (value ("," ws value)*)? ws "]"
-"#);
+"#,
+    );
 
     // Emit all custom rules generated during compilation
     for (name, rule) in &compiler.generated_rules {
@@ -66,7 +68,13 @@ fn generate_permutations<T: Clone>(items: &[T]) -> Vec<Vec<T>> {
 fn sanitize_ident(name: &str) -> String {
     let s: String = name
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     if s.is_empty() || s.chars().next().unwrap().is_ascii_digit() {
         format!("p_{s}")
@@ -112,14 +120,20 @@ impl SchemaCompiler {
 
         // Handle $ref
         if let Some(ref_str) = schema.get("$ref").and_then(Value::as_str) {
-            let ref_name = ref_str.trim_start_matches("#/$defs/").trim_start_matches("#/definitions/");
+            let ref_name = ref_str
+                .trim_start_matches("#/$defs/")
+                .trim_start_matches("#/definitions/");
             if let Some(ref_schema) = self.defs.get(ref_name).cloned() {
                 return self.compile_schema(&ref_schema, ref_name);
             }
         }
 
         // Handle anyOf / oneOf
-        if let Some(any_of) = schema.get("anyOf").or_else(|| schema.get("oneOf")).and_then(Value::as_array) {
+        if let Some(any_of) = schema
+            .get("anyOf")
+            .or_else(|| schema.get("oneOf"))
+            .and_then(Value::as_array)
+        {
             let mut branches = Vec::new();
             for (i, sub) in any_of.iter().enumerate() {
                 let sub_hint = format!("{rule_hint}_branch_{i}");
@@ -152,7 +166,11 @@ impl SchemaCompiler {
             "null" => Ok("null".to_string()),
             "array" => self.compile_array(schema, rule_hint),
             "object" => self.compile_object(schema, rule_hint),
-            _ => Ok("value".to_string()),
+            // No `type` at all (or a non-string `type`, e.g. `["string","null"]`)
+            // means "unconstrained". A `type` we do not recognise is a mistake
+            // in the schema, and must not silently widen to "any JSON value".
+            "any" => Ok("value".to_string()),
+            other => Err(format!("unsupported JSON schema type '{other}'")),
         }
     }
 
@@ -242,12 +260,55 @@ impl SchemaCompiler {
                     format!("({})", branches.join(" | "))
                 }
             } else {
-                let field_matches: Vec<String> = prop_items.into_iter().map(|(_, fm, _)| fm).collect();
-                let any_prop = format!("({})", field_matches.join(" | "));
-                if required.is_empty() {
-                    format!("({any_prop} (\",\" ws {any_prop})*)?")
+                // Beyond 4 properties the permutation set is factorial, so fix
+                // the key order (declaration order) and encode presence with a
+                // linear chain of rules. Unlike an unordered repetition this
+                // still enforces `required` and still forbids duplicate keys —
+                // it only gives up on accepting arbitrary key orderings.
+                let exprs: Vec<(String, bool)> = prop_items
+                    .into_iter()
+                    .map(|(_, field_match, is_req)| (field_match, is_req))
+                    .collect();
+
+                // `tail_i` matches properties `i..n`, each carrying its own
+                // leading comma, so an absent optional property takes its
+                // comma with it.
+                for i in (1..n).rev() {
+                    let (expr, is_req) = &exprs[i];
+                    let own = if *is_req {
+                        format!("\",\" ws {expr}")
+                    } else {
+                        format!("(\",\" ws {expr})?")
+                    };
+                    let piece = if i + 1 < n {
+                        format!("{own} {rule_name}_tail_{}", i + 1)
+                    } else {
+                        own
+                    };
+                    self.generated_rules
+                        .insert(format!("{rule_name}_tail_{i}"), piece);
+                }
+
+                // The first property emitted carries no leading comma. Only a
+                // property with no required property before it can be first.
+                let first_required = exprs.iter().position(|(_, is_req)| *is_req);
+                let last_possible_start = first_required.unwrap_or(n - 1);
+                let branches: Vec<String> = (0..=last_possible_start)
+                    .map(|k| {
+                        if k + 1 < n {
+                            format!("{} {rule_name}_tail_{}", exprs[k].0, k + 1)
+                        } else {
+                            exprs[k].0.clone()
+                        }
+                    })
+                    .collect();
+
+                let joined = format!("({})", branches.join(" | "));
+                if first_required.is_some() {
+                    joined
                 } else {
-                    format!("{any_prop} (\",\" ws {any_prop})*")
+                    // Nothing is required, so the empty object is valid too.
+                    format!("{joined}?")
                 }
             };
 
@@ -318,17 +379,26 @@ mod tests {
         // Test 1: required only
         let mut m1 = GbnfMatcher::new(Arc::clone(&grammar));
         m1.advance_str(r#"{"name": "Alice"}"#);
-        assert!(m1.is_terminal(), "object with only required field must be terminal");
+        assert!(
+            m1.is_terminal(),
+            "object with only required field must be terminal"
+        );
 
         // Test 2: required + optional
         let mut m2 = GbnfMatcher::new(Arc::clone(&grammar));
         m2.advance_str(r#"{"name": "Alice", "age": 30}"#);
-        assert!(m2.is_terminal(), "object with required and optional field must be terminal");
+        assert!(
+            m2.is_terminal(),
+            "object with required and optional field must be terminal"
+        );
 
         // Test 3: optional only should NOT be terminal
         let mut m3 = GbnfMatcher::new(Arc::clone(&grammar));
         m3.advance_str(r#"{"age": 30}"#);
-        assert!(!m3.is_terminal(), "missing required field should not be terminal");
+        assert!(
+            !m3.is_terminal(),
+            "missing required field should not be terminal"
+        );
     }
 
     #[test]
@@ -364,6 +434,121 @@ mod tests {
 
         let mut matcher2 = GbnfMatcher::new(Arc::new(grammar));
         matcher2.advance_str("\"other\"");
-        assert_eq!(matcher2.current_state, crate::constrained::gbnf::GbnfExpr::Reject);
+        assert_eq!(
+            matcher2.current_state,
+            crate::constrained::gbnf::GbnfExpr::Reject
+        );
+    }
+}
+
+#[cfg(test)]
+mod many_property_tests {
+    use super::*;
+    use crate::constrained::gbnf::{GbnfGrammar, GbnfMatcher};
+    use serde_json::json;
+    use std::sync::Arc;
+
+    fn grammar_for(schema: &serde_json::Value) -> Arc<GbnfGrammar> {
+        let gbnf = json_schema_to_gbnf(schema).expect("schema should compile");
+        Arc::new(GbnfGrammar::from_str(&gbnf).expect("gbnf should parse"))
+    }
+
+    fn accepts(grammar: &Arc<GbnfGrammar>, s: &str) -> bool {
+        let mut m = GbnfMatcher::new(Arc::clone(grammar));
+        m.advance_str(s);
+        m.is_terminal()
+    }
+
+    fn five_required() -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "a": {"type": "integer"}, "b": {"type": "integer"},
+                "c": {"type": "integer"}, "d": {"type": "integer"},
+                "e": {"type": "integer"}
+            },
+            "required": ["a", "b", "c", "d", "e"]
+        })
+    }
+
+    /// Past 4 properties the compiler stops permuting; it must still demand
+    /// every required property rather than accepting any single one.
+    #[test]
+    fn beyond_four_properties_required_fields_are_still_enforced() {
+        let g = grammar_for(&five_required());
+        assert!(
+            accepts(&g, r#"{"a": 1, "b": 2, "c": 3, "d": 4, "e": 5}"#),
+            "all required fields present must be accepted"
+        );
+        assert!(
+            !accepts(&g, r#"{"a": 1}"#),
+            "a single required field is not enough"
+        );
+        assert!(
+            !accepts(&g, r#"{"a": 1, "b": 2, "c": 3, "d": 4}"#),
+            "one missing required field must be rejected"
+        );
+    }
+
+    #[test]
+    fn beyond_four_properties_duplicate_keys_are_rejected() {
+        let g = grammar_for(&five_required());
+        assert!(!accepts(&g, r#"{"a": 1, "a": 2, "a": 3}"#));
+    }
+
+    #[test]
+    fn beyond_four_properties_optional_fields_may_be_omitted() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "a": {"type": "integer"}, "b": {"type": "integer"},
+                "c": {"type": "integer"}, "d": {"type": "integer"},
+                "e": {"type": "integer"}
+            },
+            "required": ["c"]
+        });
+        let g = grammar_for(&schema);
+        assert!(accepts(&g, r#"{"c": 3}"#), "required-only must be accepted");
+        assert!(
+            accepts(&g, r#"{"a": 1, "c": 3}"#),
+            "optional before required"
+        );
+        assert!(
+            accepts(&g, r#"{"c": 3, "e": 5}"#),
+            "optional after required"
+        );
+        assert!(
+            accepts(&g, r#"{"a": 1, "b": 2, "c": 3, "d": 4, "e": 5}"#),
+            "every field present"
+        );
+        assert!(
+            !accepts(&g, r#"{"a": 1, "b": 2}"#),
+            "required field missing"
+        );
+    }
+
+    #[test]
+    fn beyond_four_properties_with_nothing_required_allows_the_empty_object() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "a": {"type": "integer"}, "b": {"type": "integer"},
+                "c": {"type": "integer"}, "d": {"type": "integer"},
+                "e": {"type": "integer"}
+            }
+        });
+        let g = grammar_for(&schema);
+        assert!(accepts(&g, r#"{}"#));
+        assert!(accepts(&g, r#"{"b": 2}"#));
+        assert!(accepts(&g, r#"{"a": 1, "e": 5}"#));
+    }
+
+    #[test]
+    fn an_unrecognised_type_is_an_error_not_an_unconstrained_value() {
+        let err = json_schema_to_gbnf(&json!({ "type": "strng" }));
+        assert!(
+            err.is_err(),
+            "a misspelled type must not compile to `value`"
+        );
     }
 }
