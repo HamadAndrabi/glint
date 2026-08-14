@@ -3,36 +3,40 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Glint // Predator-Grade Local LLM Engine</title>
+  <title>Glint - High-Performance LLM Inference Engine</title>
   <link rel="icon" type="image/svg+xml" href="/assets/logo.svg">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:ital,wght@0,300;0,400;0,500;0,600;0,700;1,400&family=Space+Grotesk:wght@400;500;600;700&family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
   <style>
     :root {
-      --bg-void: #060709;
-      --bg-surface: #0d0f13;
-      --bg-surface-raised: #14171d;
-      --bg-surface-hover: #1c2028;
-      --border-steel: rgba(255, 255, 255, 0.08);
-      --border-steel-bright: rgba(255, 255, 255, 0.16);
+      --bg-canvas: #090a0c;
+      --bg-subtle: #111317;
+      --bg-surface: #16181d;
+      --bg-surface-hover: #1e2127;
+      --bg-surface-active: #252930;
       
-      --cyan-optic: #00f0ff;
-      --cyan-optic-glow: rgba(0, 240, 255, 0.25);
-      --cyan-dim: rgba(0, 240, 255, 0.12);
-      --cyan-border: rgba(0, 240, 255, 0.4);
+      --border-subtle: #22252b;
+      --border-muted: #2d3139;
+      --border-focus: #3b82f6;
 
-      --steel-400: #94a3b8;
-      --steel-300: #cbd5e1;
-      --steel-200: #e2e8f0;
-      --steel-100: #f8fafc;
-      --steel-600: #475569;
-      --steel-800: #1e293b;
-      --steel-900: #0f172a;
+      --text-primary: #f1f5f9;
+      --text-secondary: #94a3b8;
+      --text-muted: #64748b;
+      --text-disabled: #475569;
 
-      --emerald-ready: #10b981;
-      --amber-warn: #f59e0b;
-      --crimson-err: #ef4444;
+      --accent-primary: #3b82f6;
+      --accent-primary-hover: #2563eb;
+      --accent-subtle: rgba(59, 130, 246, 0.1);
+      
+      --status-success: #10b981;
+      --status-warning: #f59e0b;
+      --status-error: #ef4444;
+
+      --radius-sm: 6px;
+      --radius-md: 8px;
+      --radius-lg: 12px;
+      --radius-full: 9999px;
     }
 
     * {
@@ -40,170 +44,143 @@
       margin: 0;
       padding: 0;
       scrollbar-width: thin;
-      scrollbar-color: var(--steel-800) transparent;
+      scrollbar-color: var(--border-muted) transparent;
     }
 
     body {
-      font-family: 'Inter', -apple-system, sans-serif;
-      background-color: var(--bg-void);
-      color: var(--steel-200);
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background-color: var(--bg-canvas);
+      color: var(--text-primary);
       height: 100vh;
       display: flex;
       flex-direction: column;
       overflow: hidden;
       -webkit-font-smoothing: antialiased;
-      background-image: 
-        radial-gradient(circle at 50% 0%, rgba(0, 240, 255, 0.03) 0%, transparent 60%),
-        linear-gradient(rgba(255, 255, 255, 0.015) 1px, transparent 1px),
-        linear-gradient(90deg, rgba(255, 255, 255, 0.015) 1px, transparent 1px);
-      background-size: 100% 100%, 32px 32px, 32px 32px;
     }
 
     /* ── Header ─────────────────────────────────────────────────────────────── */
     header {
-      height: 64px;
-      background: rgba(13, 15, 19, 0.85);
-      backdrop-filter: blur(16px);
-      -webkit-backdrop-filter: blur(16px);
-      border-bottom: 1px solid var(--border-steel);
+      height: 56px;
+      background: var(--bg-canvas);
+      border-bottom: 1px solid var(--border-subtle);
       display: flex;
       align-items: center;
       justify-content: space-between;
-      padding: 0 24px;
-      z-index: 100;
+      padding: 0 20px;
+      flex-shrink: 0;
     }
 
-    .brand-section {
+    .brand {
       display: flex;
       align-items: center;
-      gap: 14px;
-      cursor: pointer;
+      gap: 10px;
+      text-decoration: none;
+      color: var(--text-primary);
     }
 
-    .wolf-avatar {
-      width: 38px;
-      height: 38px;
-      background: #090a0d;
-      border: 1px solid var(--cyan-border);
-      border-radius: 8px;
+    .brand-logo {
+      width: 28px;
+      height: 28px;
+      border-radius: var(--radius-sm);
+      background: var(--bg-surface);
+      border: 1px solid var(--border-subtle);
       display: flex;
       align-items: center;
       justify-content: center;
-      position: relative;
       overflow: hidden;
-      box-shadow: 0 0 16px var(--cyan-optic-glow);
     }
 
-    .wolf-avatar img {
-      width: 32px;
-      height: 32px;
+    .brand-logo img {
+      width: 22px;
+      height: 22px;
       object-fit: contain;
-      filter: drop-shadow(0 0 4px var(--cyan-optic));
-    }
-
-    .brand-text {
-      display: flex;
-      flex-direction: column;
     }
 
     .brand-title {
-      font-family: 'Space Grotesk', sans-serif;
-      font-weight: 700;
-      font-size: 18px;
-      letter-spacing: 0.08em;
-      color: #fff;
-      display: flex;
-      align-items: center;
-      gap: 8px;
-    }
-
-    .brand-title .brand-accent {
-      color: var(--cyan-optic);
-      text-shadow: 0 0 10px var(--cyan-optic-glow);
-    }
-
-    .brand-subtitle {
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 10px;
-      letter-spacing: 0.12em;
-      color: var(--steel-400);
-      text-transform: uppercase;
-    }
-
-    /* ── Navigation Tabs ─────────────────────────────────────────────────────── */
-    .nav-tabs {
-      display: flex;
-      gap: 2px;
-      background: rgba(6, 7, 9, 0.7);
-      padding: 4px;
-      border-radius: 8px;
-      border: 1px solid var(--border-steel);
-    }
-
-    .nav-tab {
-      padding: 8px 18px;
-      border-radius: 6px;
-      font-family: 'Space Grotesk', sans-serif;
-      font-size: 12px;
+      font-size: 15px;
       font-weight: 600;
-      letter-spacing: 0.04em;
-      color: var(--steel-400);
-      cursor: pointer;
-      transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+      letter-spacing: -0.01em;
+      color: var(--text-primary);
       display: flex;
       align-items: center;
       gap: 8px;
-      border: none;
-      background: transparent;
-      text-transform: uppercase;
     }
 
-    .nav-tab:hover {
-      color: #fff;
-      background: rgba(255, 255, 255, 0.04);
-    }
-
-    .nav-tab.active {
-      background: var(--bg-surface-raised);
-      color: var(--cyan-optic);
-      border: 1px solid rgba(0, 240, 255, 0.25);
-      box-shadow: 0 0 12px rgba(0, 240, 255, 0.15);
-    }
-
-    .header-controls {
-      display: flex;
-      align-items: center;
-      gap: 16px;
-    }
-
-    .telemetry-pill {
+    .brand-version {
       font-family: 'JetBrains Mono', monospace;
       font-size: 11px;
-      padding: 6px 12px;
-      border-radius: 20px;
-      background: var(--bg-surface-raised);
-      border: 1px solid var(--border-steel);
+      font-weight: 400;
+      color: var(--text-muted);
+      background: var(--bg-surface);
+      padding: 2px 6px;
+      border-radius: var(--radius-sm);
+      border: 1px solid var(--border-subtle);
+    }
+
+    /* Navigation */
+    .nav-group {
       display: flex;
       align-items: center;
-      gap: 8px;
-      color: var(--steel-300);
+      gap: 4px;
+      background: var(--bg-subtle);
+      padding: 3px;
+      border-radius: var(--radius-md);
+      border: 1px solid var(--border-subtle);
     }
 
-    .optic-indicator {
-      width: 7px;
-      height: 7px;
+    .nav-item {
+      padding: 6px 14px;
+      border-radius: var(--radius-sm);
+      font-size: 13px;
+      font-weight: 500;
+      color: var(--text-secondary);
+      cursor: pointer;
+      border: none;
+      background: transparent;
+      transition: all 0.15s ease;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .nav-item:hover {
+      color: var(--text-primary);
+      background: var(--bg-surface-hover);
+    }
+
+    .nav-item.active {
+      background: var(--bg-surface);
+      color: var(--text-primary);
+      box-shadow: 0 1px 2px rgba(0, 0, 0, 0.2);
+    }
+
+    .header-meta {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .status-badge {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 11px;
+      color: var(--text-secondary);
+      background: var(--bg-subtle);
+      padding: 4px 10px;
+      border-radius: var(--radius-full);
+      border: 1px solid var(--border-subtle);
+    }
+
+    .status-dot {
+      width: 6px;
+      height: 6px;
       border-radius: 50%;
-      background: var(--cyan-optic);
-      box-shadow: 0 0 8px var(--cyan-optic);
-      animation: opticPulse 2s infinite ease-in-out;
+      background: var(--status-success);
     }
 
-    @keyframes opticPulse {
-      0%, 100% { opacity: 1; transform: scale(1); }
-      50% { opacity: 0.4; transform: scale(0.85); }
-    }
-
-    /* ── Main Panes ─────────────────────────────────────────────────────────── */
+    /* ── Main Container ──────────────────────────────────────────────────────── */
     main {
       flex: 1;
       display: flex;
@@ -211,269 +188,314 @@
       position: relative;
     }
 
-    .tab-pane {
+    .workspace-pane {
       display: none;
       width: 100%;
       height: 100%;
     }
 
-    .tab-pane.active {
+    .workspace-pane.active {
       display: flex;
     }
 
-    /* ── Chat Studio ────────────────────────────────────────────────────────── */
-    .chat-layout {
-      display: flex;
-      width: 100%;
-      height: 100%;
-    }
-
-    .control-deck {
-      width: 320px;
-      background: var(--bg-surface);
-      border-right: 1px solid var(--border-steel);
+    /* ── Chat Studio ─────────────────────────────────────────────────────────── */
+    .sidebar {
+      width: 280px;
+      background: var(--bg-subtle);
+      border-right: 1px solid var(--border-subtle);
       display: flex;
       flex-direction: column;
-      padding: 20px;
-      gap: 20px;
+      padding: 16px;
+      gap: 18px;
       overflow-y: auto;
-    }
-
-    .deck-header {
-      font-family: 'Space Grotesk', sans-serif;
-      font-size: 11px;
-      font-weight: 700;
-      text-transform: uppercase;
-      letter-spacing: 0.1em;
-      color: var(--steel-400);
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      border-bottom: 1px solid var(--border-steel);
-      padding-bottom: 8px;
-    }
-
-    .param-block {
-      display: flex;
-      flex-direction: column;
-      gap: 8px;
-    }
-
-    .param-label-row {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 11px;
-      color: var(--steel-400);
-    }
-
-    .param-val-badge {
-      color: var(--cyan-optic);
-      font-weight: 600;
-      background: var(--cyan-dim);
-      padding: 2px 6px;
-      border-radius: 4px;
-      border: 1px solid rgba(0, 240, 255, 0.2);
-    }
-
-    .tactical-range {
-      appearance: none;
-      -webkit-appearance: none;
-      width: 100%;
-      height: 4px;
-      background: var(--steel-800);
-      border-radius: 2px;
-      outline: none;
-    }
-
-    .tactical-range::-webkit-slider-thumb {
-      -webkit-appearance: none;
-      width: 14px;
-      height: 14px;
-      border-radius: 4px;
-      background: var(--cyan-optic);
-      cursor: pointer;
-      box-shadow: 0 0 8px var(--cyan-optic-glow);
-      border: 2px solid #000;
-    }
-
-    .tactical-input, .tactical-textarea {
-      width: 100%;
-      background: var(--bg-void);
-      border: 1px solid var(--border-steel);
-      border-radius: 6px;
-      padding: 10px 12px;
-      color: var(--steel-100);
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 12px;
-      outline: none;
-      transition: all 0.2s ease;
-    }
-
-    .tactical-input:focus, .tactical-textarea:focus {
-      border-color: var(--cyan-border);
-      box-shadow: 0 0 10px var(--cyan-optic-glow);
-    }
-
-    /* ── Chat Feed ──────────────────────────────────────────────────────────── */
-    .chat-feed-container {
-      flex: 1;
-      display: flex;
-      flex-direction: column;
-      background: var(--bg-void);
-      position: relative;
-    }
-
-    .chat-messages {
-      flex: 1;
-      overflow-y: auto;
-      padding: 28px 32px;
-      display: flex;
-      flex-direction: column;
-      gap: 24px;
-    }
-
-    .message-card {
-      max-width: 900px;
-      width: 100%;
-      margin: 0 auto;
-      display: flex;
-      gap: 16px;
-      animation: fadeIn 0.25s cubic-bezier(0.16, 1, 0.3, 1);
-    }
-
-    @keyframes fadeIn {
-      from { opacity: 0; transform: translateY(8px); }
-      to { opacity: 1; transform: translateY(0); }
-    }
-
-    .msg-crest {
-      width: 36px;
-      height: 36px;
-      border-radius: 8px;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 13px;
-      font-weight: 700;
       flex-shrink: 0;
-      border: 1px solid var(--border-steel);
     }
 
-    .message-card.user .msg-crest {
-      background: var(--steel-800);
-      color: var(--steel-200);
+    .sidebar-section-title {
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--text-muted);
+      margin-bottom: 6px;
     }
 
-    .message-card.assistant .msg-crest {
-      background: #090b0e;
-      border-color: var(--cyan-border);
-      box-shadow: 0 0 12px var(--cyan-optic-glow);
-    }
-
-    .message-card.assistant .msg-crest img {
-      width: 24px;
-      height: 24px;
-      object-fit: contain;
-    }
-
-    .msg-body-wrapper {
-      flex: 1;
+    .control-group {
       display: flex;
       flex-direction: column;
-      gap: 8px;
-      background: var(--bg-surface);
-      border: 1px solid var(--border-steel);
-      border-radius: 10px;
-      padding: 16px 20px;
-      position: relative;
-    }
-
-    .message-card.assistant .msg-body-wrapper {
-      border-left: 2px solid var(--cyan-optic);
-    }
-
-    .msg-header-line {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      font-family: 'Space Grotesk', sans-serif;
-      font-size: 12px;
-      font-weight: 600;
-      letter-spacing: 0.04em;
-      color: var(--steel-400);
-    }
-
-    .msg-role-tag {
-      text-transform: uppercase;
-      display: flex;
-      align-items: center;
       gap: 6px;
     }
 
-    .message-card.assistant .msg-role-tag {
-      color: var(--cyan-optic);
+    .control-label-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 12px;
+      color: var(--text-secondary);
     }
 
-    .msg-text-content {
+    .control-value {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 11px;
+      color: var(--text-primary);
+      background: var(--bg-surface);
+      padding: 1px 6px;
+      border-radius: var(--radius-sm);
+      border: 1px solid var(--border-subtle);
+    }
+
+    input[type="range"] {
+      -webkit-appearance: none;
+      appearance: none;
+      width: 100%;
+      height: 4px;
+      background: var(--border-muted);
+      border-radius: var(--radius-full);
+      outline: none;
+    }
+
+    input[type="range"]::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      width: 14px;
+      height: 14px;
+      border-radius: 50%;
+      background: var(--text-primary);
+      cursor: pointer;
+      box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
+    }
+
+    input[type="number"], textarea, input[type="text"] {
+      width: 100%;
+      background: var(--bg-surface);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-sm);
+      padding: 8px 10px;
+      color: var(--text-primary);
+      font-family: inherit;
+      font-size: 13px;
+      outline: none;
+      transition: border-color 0.15s ease;
+    }
+
+    input[type="number"]:focus, textarea:focus, input[type="text"]:focus {
+      border-color: var(--border-focus);
+    }
+
+    textarea {
+      resize: vertical;
+      line-height: 1.5;
+    }
+
+    .btn-secondary {
+      background: var(--bg-surface);
+      border: 1px solid var(--border-subtle);
+      color: var(--text-secondary);
+      font-size: 12px;
+      font-weight: 500;
+      padding: 8px 12px;
+      border-radius: var(--radius-sm);
+      cursor: pointer;
+      transition: all 0.15s ease;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+    }
+
+    .btn-secondary:hover {
+      background: var(--bg-surface-hover);
+      color: var(--text-primary);
+      border-color: var(--border-muted);
+    }
+
+    /* ── Chat Feed ───────────────────────────────────────────────────────────── */
+    .chat-container {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      background: var(--bg-canvas);
+      position: relative;
+    }
+
+    .chat-scroll {
+      flex: 1;
+      overflow-y: auto;
+      padding: 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+    }
+
+    .empty-state {
+      max-width: 580px;
+      margin: auto;
+      text-align: center;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 16px;
+      padding: 40px 20px;
+    }
+
+    .empty-logo {
+      width: 48px;
+      height: 48px;
+      border-radius: var(--radius-md);
+      background: var(--bg-subtle);
+      border: 1px solid var(--border-subtle);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .empty-logo img {
+      width: 36px;
+      height: 36px;
+      object-fit: contain;
+    }
+
+    .empty-title {
+      font-size: 18px;
+      font-weight: 600;
+      color: var(--text-primary);
+      letter-spacing: -0.01em;
+    }
+
+    .empty-subtitle {
+      font-size: 13px;
+      color: var(--text-secondary);
+      line-height: 1.5;
+    }
+
+    .prompt-suggestions {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      width: 100%;
+      margin-top: 8px;
+    }
+
+    .suggestion-item {
+      background: var(--bg-subtle);
+      border: 1px solid var(--border-subtle);
+      padding: 10px 14px;
+      border-radius: var(--radius-md);
+      font-size: 13px;
+      color: var(--text-secondary);
+      text-align: left;
+      cursor: pointer;
+      transition: all 0.15s ease;
+    }
+
+    .suggestion-item:hover {
+      background: var(--bg-surface);
+      color: var(--text-primary);
+      border-color: var(--border-muted);
+    }
+
+    .chat-row {
+      max-width: 800px;
+      width: 100%;
+      margin: 0 auto;
+      display: flex;
+      gap: 14px;
+    }
+
+    .avatar {
+      width: 28px;
+      height: 28px;
+      border-radius: var(--radius-sm);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 11px;
+      font-weight: 600;
+      flex-shrink: 0;
+      margin-top: 2px;
+    }
+
+    .chat-row.user .avatar {
+      background: var(--bg-surface-active);
+      color: var(--text-secondary);
+      border: 1px solid var(--border-subtle);
+    }
+
+    .chat-row.assistant .avatar {
+      background: var(--bg-subtle);
+      border: 1px solid var(--border-subtle);
+      overflow: hidden;
+    }
+
+    .chat-row.assistant .avatar img {
+      width: 20px;
+      height: 20px;
+      object-fit: contain;
+    }
+
+    .message-content-box {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .message-meta {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-size: 12px;
+      font-weight: 500;
+      color: var(--text-secondary);
+    }
+
+    .message-body {
       font-size: 14px;
-      line-height: 1.65;
-      color: var(--steel-100);
+      line-height: 1.6;
+      color: var(--text-primary);
       white-space: pre-wrap;
       word-break: break-word;
     }
 
-    .msg-text-content code {
+    .message-body code {
       font-family: 'JetBrains Mono', monospace;
       font-size: 12px;
-      background: rgba(0, 0, 0, 0.4);
-      padding: 2px 6px;
-      border-radius: 4px;
-      color: var(--cyan-optic);
-      border: 1px solid rgba(0, 240, 255, 0.15);
+      background: var(--bg-subtle);
+      border: 1px solid var(--border-subtle);
+      padding: 2px 5px;
+      border-radius: var(--radius-sm);
+      color: var(--text-primary);
     }
 
-    .msg-text-content pre {
+    .message-body pre {
+      background: var(--bg-subtle);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-md);
+      padding: 12px 14px;
       font-family: 'JetBrains Mono', monospace;
-      font-size: 13px;
-      background: #08090c;
-      border: 1px solid var(--border-steel);
-      border-radius: 8px;
-      padding: 14px 18px;
+      font-size: 12.5px;
       overflow-x: auto;
-      margin: 12px 0;
-      color: #f1f5f9;
-      position: relative;
+      margin: 10px 0;
+      color: #e2e8f0;
     }
 
-    .msg-telemetry-footer {
+    .message-telemetry {
       display: flex;
       align-items: center;
-      gap: 16px;
+      gap: 12px;
       font-family: 'JetBrains Mono', monospace;
       font-size: 11px;
-      color: var(--steel-600);
-      border-top: 1px solid rgba(255, 255, 255, 0.04);
-      padding-top: 8px;
+      color: var(--text-muted);
       margin-top: 4px;
     }
 
-    .msg-telemetry-footer span {
-      display: flex;
-      align-items: center;
-      gap: 4px;
-    }
-
-    .typing-cursor {
+    .cursor-blink {
       display: inline-block;
-      width: 8px;
-      height: 16px;
-      background: var(--cyan-optic);
+      width: 6px;
+      height: 14px;
+      background: var(--text-secondary);
       vertical-align: middle;
-      animation: blink 0.9s infinite;
-      box-shadow: 0 0 6px var(--cyan-optic);
+      animation: blink 0.8s infinite;
+      margin-left: 2px;
     }
 
     @keyframes blink {
@@ -481,548 +503,531 @@
       50% { opacity: 0; }
     }
 
-    /* ── Command Deck / Prompt Box ──────────────────────────────────────────── */
-    .prompt-deck {
-      padding: 20px 32px;
-      background: rgba(13, 15, 19, 0.95);
-      border-top: 1px solid var(--border-steel);
-      position: relative;
+    /* Input area */
+    .input-wrapper {
+      padding: 16px 24px;
+      background: var(--bg-canvas);
+      border-top: 1px solid var(--border-subtle);
     }
 
-    .prompt-box {
-      max-width: 900px;
+    .input-box {
+      max-width: 800px;
       margin: 0 auto;
-      background: var(--bg-surface-raised);
-      border: 1px solid var(--border-steel);
-      border-radius: 12px;
-      padding: 12px 16px;
+      background: var(--bg-subtle);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-lg);
+      padding: 10px 14px;
       display: flex;
       flex-direction: column;
-      gap: 10px;
-      transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+      gap: 8px;
+      transition: border-color 0.15s ease, box-shadow 0.15s ease;
     }
 
-    .prompt-box:focus-within {
-      border-color: var(--cyan-border);
-      box-shadow: 0 0 20px rgba(0, 240, 255, 0.12);
+    .input-box:focus-within {
+      border-color: var(--border-focus);
+      box-shadow: 0 0 0 1px var(--border-focus);
     }
 
-    .prompt-textarea {
+    .chat-textarea {
       width: 100%;
       background: transparent;
       border: none;
       outline: none;
-      color: #fff;
+      color: var(--text-primary);
       font-size: 14px;
       font-family: inherit;
       resize: none;
-      min-height: 52px;
-      max-height: 200px;
+      min-height: 48px;
+      max-height: 180px;
       line-height: 1.5;
     }
 
-    .prompt-bar-footer {
+    .input-actions {
       display: flex;
       justify-content: space-between;
       align-items: center;
     }
 
-    .shortcut-hints {
-      display: flex;
-      gap: 12px;
-      font-family: 'JetBrains Mono', monospace;
+    .keyboard-hint {
       font-size: 11px;
-      color: var(--steel-600);
-    }
-
-    .shortcut-hints kbd {
-      background: rgba(255, 255, 255, 0.05);
-      border: 1px solid var(--border-steel);
-      padding: 2px 5px;
-      border-radius: 4px;
-      color: var(--steel-400);
-    }
-
-    .btn-hunt {
-      background: linear-gradient(135deg, #00f0ff, #0284c7);
-      color: #000;
-      font-family: 'Space Grotesk', sans-serif;
-      font-weight: 700;
-      font-size: 13px;
-      letter-spacing: 0.06em;
-      text-transform: uppercase;
-      padding: 8px 20px;
-      border-radius: 6px;
-      border: none;
-      cursor: pointer;
+      color: var(--text-muted);
       display: flex;
       align-items: center;
-      gap: 8px;
-      transition: all 0.2s ease;
-      box-shadow: 0 0 16px var(--cyan-optic-glow);
+      gap: 4px;
     }
 
-    .btn-hunt:hover {
-      transform: translateY(-1px);
-      box-shadow: 0 0 24px rgba(0, 240, 255, 0.4);
+    kbd {
+      background: var(--bg-surface);
+      border: 1px solid var(--border-subtle);
+      padding: 1px 4px;
+      border-radius: var(--radius-sm);
+      font-family: inherit;
+      font-size: 10px;
+      color: var(--text-secondary);
     }
 
-    .btn-hunt:active {
-      transform: translateY(0);
+    .btn-primary {
+      background: var(--accent-primary);
+      color: #ffffff;
+      font-size: 13px;
+      font-weight: 500;
+      padding: 6px 14px;
+      border-radius: var(--radius-sm);
+      border: none;
+      cursor: pointer;
+      transition: background 0.15s ease;
+      display: flex;
+      align-items: center;
+      gap: 6px;
     }
 
-    /* ── Split Studio Views (Structured & Tools) ────────────────────────────── */
-    .studio-grid {
+    .btn-primary:hover {
+      background: var(--accent-primary-hover);
+    }
+
+    /* ── Split Studios (Structured & Tools) ─────────────────────────────────── */
+    .studio-layout {
       display: grid;
       grid-template-columns: 1fr 1fr;
       width: 100%;
       height: 100%;
-      padding: 24px;
-      gap: 24px;
+      padding: 20px;
+      gap: 20px;
     }
 
-    .studio-card {
-      background: var(--bg-surface);
-      border: 1px solid var(--border-steel);
-      border-radius: 12px;
+    .panel-card {
+      background: var(--bg-subtle);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-lg);
       display: flex;
       flex-direction: column;
       overflow: hidden;
     }
 
-    .card-header-bar {
-      height: 48px;
-      background: var(--bg-surface-raised);
-      border-bottom: 1px solid var(--border-steel);
+    .panel-header {
+      height: 44px;
+      background: var(--bg-surface);
+      border-bottom: 1px solid var(--border-subtle);
       display: flex;
       align-items: center;
       justify-content: space-between;
-      padding: 0 18px;
-      font-family: 'Space Grotesk', sans-serif;
+      padding: 0 16px;
       font-size: 12px;
-      font-weight: 700;
-      text-transform: uppercase;
-      letter-spacing: 0.08em;
-      color: var(--steel-300);
+      font-weight: 600;
+      color: var(--text-secondary);
     }
 
-    .studio-editor {
+    .code-editor {
       flex: 1;
-      background: #07090c;
-      padding: 18px;
-      color: #e2e8f0;
+      background: var(--bg-canvas);
+      padding: 16px;
+      color: var(--text-primary);
       font-family: 'JetBrains Mono', monospace;
-      font-size: 13px;
+      font-size: 12.5px;
       border: none;
       outline: none;
       resize: none;
-      line-height: 1.55;
+      line-height: 1.5;
     }
 
-    .studio-footer-actions {
-      padding: 14px 18px;
-      background: var(--bg-surface-raised);
-      border-top: 1px solid var(--border-steel);
-      display: flex;
-      gap: 10px;
-    }
-
-    /* ── Telemetry Cockpit ──────────────────────────────────────────────────── */
-    .cockpit-layout {
-      width: 100%;
-      height: 100%;
-      padding: 28px;
-      overflow-y: auto;
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
-      gap: 24px;
-      align-content: start;
-    }
-
-    .cockpit-gauge-card {
+    .panel-footer {
+      padding: 12px 16px;
       background: var(--bg-surface);
-      border: 1px solid var(--border-steel);
-      border-radius: 12px;
-      padding: 24px;
+      border-top: 1px solid var(--border-subtle);
       display: flex;
-      flex-direction: column;
-      gap: 16px;
-      position: relative;
-      overflow: hidden;
-    }
-
-    .cockpit-gauge-card::before {
-      content: '';
-      position: absolute;
-      top: 0;
-      left: 0;
-      right: 0;
-      height: 2px;
-      background: linear-gradient(90deg, var(--cyan-optic), transparent);
-    }
-
-    .gauge-title {
-      font-family: 'Space Grotesk', sans-serif;
-      font-size: 12px;
-      font-weight: 700;
-      text-transform: uppercase;
-      letter-spacing: 0.1em;
-      color: var(--steel-400);
-    }
-
-    .gauge-number {
-      font-family: 'Space Grotesk', sans-serif;
-      font-size: 42px;
-      font-weight: 700;
-      letter-spacing: -0.03em;
-      color: #fff;
-      display: flex;
-      align-items: baseline;
       gap: 8px;
     }
 
-    .gauge-unit {
-      font-size: 16px;
-      font-weight: 500;
-      color: var(--cyan-optic);
+    /* ── Metrics Dashboard ──────────────────────────────────────────────────── */
+    .metrics-layout {
+      width: 100%;
+      height: 100%;
+      padding: 24px;
+      overflow-y: auto;
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 20px;
+      align-content: start;
     }
 
-    .kv-grid-viz {
+    .metric-card {
+      background: var(--bg-subtle);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-lg);
+      padding: 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    .metric-title {
+      font-size: 12px;
+      font-weight: 500;
+      color: var(--text-muted);
+    }
+
+    .metric-stat {
+      font-size: 32px;
+      font-weight: 600;
+      letter-spacing: -0.02em;
+      color: var(--text-primary);
+      display: flex;
+      align-items: baseline;
+      gap: 6px;
+    }
+
+    .metric-unit {
+      font-size: 14px;
+      font-weight: 400;
+      color: var(--text-muted);
+    }
+
+    .metric-desc {
+      font-size: 12px;
+      color: var(--text-secondary);
+      line-height: 1.4;
+    }
+
+    .kv-matrix {
       display: grid;
       grid-template-columns: repeat(16, 1fr);
       gap: 4px;
-      margin-top: 8px;
+      margin-top: 4px;
     }
 
-    .kv-cell {
-      height: 14px;
+    .kv-block {
+      height: 12px;
       border-radius: 2px;
-      background: var(--steel-800);
-      border: 1px solid rgba(255, 255, 255, 0.05);
-      transition: background-color 0.2s ease;
+      background: var(--bg-surface);
+      border: 1px solid var(--border-subtle);
     }
 
-    .kv-cell.active {
-      background: var(--cyan-optic);
-      box-shadow: 0 0 6px var(--cyan-optic-glow);
+    .kv-block.active {
+      background: var(--accent-primary);
     }
 
-    .kv-cell.cached {
-      background: var(--steel-600);
+    .kv-block.cached {
+      background: var(--text-muted);
     }
   </style>
 </head>
 <body>
 
-  <!-- Precision Header -->
+  <!-- Top Navigation Bar -->
   <header>
-    <div class="brand-section">
-      <div class="wolf-avatar">
-        <img src="/assets/logo.svg" alt="Glint Wolf">
+    <a href="/" class="brand">
+      <div class="brand-logo">
+        <img src="/assets/logo.svg" alt="Glint">
       </div>
-      <div class="brand-text">
-        <div class="brand-title">GLINT <span class="brand-accent">// CORE</span></div>
-        <div class="brand-subtitle">Predator-Grade LLM Engine</div>
+      <div class="brand-title">
+        Glint
+        <span class="brand-version">v0.1.0</span>
       </div>
-    </div>
+    </a>
 
-    <div class="nav-tabs">
-      <button class="nav-tab active" data-tab="chat">💬 Chat Terminal</button>
-      <button class="nav-tab" data-tab="structured">🧬 Schema Matrix</button>
-      <button class="nav-tab" data-tab="tools">🛠️ Tool Cockpit</button>
-      <button class="nav-tab" data-tab="cockpit">📊 Telemetry</button>
-    </div>
+    <nav class="nav-group">
+      <button class="nav-item active" data-tab="chat">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+        Chat
+      </button>
+      <button class="nav-item" data-tab="structured">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>
+        Structured Outputs
+      </button>
+      <button class="nav-item" data-tab="tools">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
+        Tools
+      </button>
+      <button class="nav-item" data-tab="metrics">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+        Metrics
+      </button>
+    </nav>
 
-    <div class="header-controls">
-      <div class="telemetry-pill">
-        <div class="optic-indicator"></div>
-        <span id="headerEngineTag">ARM NEON // APPLE SILICON</span>
+    <div class="header-meta">
+      <div class="status-badge">
+        <div class="status-dot"></div>
+        <span id="backendIndicator">ARM NEON SIMD</span>
       </div>
     </div>
   </header>
 
-  <!-- Main Workspaces -->
   <main>
-    <!-- TAB 1: Chat Terminal -->
-    <div class="tab-pane active" id="chatPane">
-      <div class="chat-layout">
-        <!-- Sidebar Controls -->
-        <div class="control-deck">
-          <div class="deck-header">
-            <span>Inference Matrix</span>
-            <span style="color: var(--cyan-optic);">v0.2.0</span>
-          </div>
-
-          <div class="param-block">
-            <div class="param-label-row">
-              <span>TEMPERATURE</span>
-              <span class="param-val-badge" id="tempBadge">0.70</span>
+    <!-- Pane 1: Chat -->
+    <div class="workspace-pane active" id="chatPane">
+      <aside class="sidebar">
+        <div>
+          <div class="sidebar-section-title">Parameters</div>
+          <div class="control-group" style="margin-bottom: 14px;">
+            <div class="control-label-row">
+              <span>Temperature</span>
+              <span class="control-value" id="tempValue">0.70</span>
             </div>
-            <input type="range" class="tactical-range" id="tempSlider" min="0" max="2" step="0.05" value="0.7">
+            <input type="range" id="tempRange" min="0" max="2" step="0.05" value="0.7">
           </div>
 
-          <div class="param-block">
-            <div class="param-label-row">
-              <span>TOP-P (NUCLEUS)</span>
-              <span class="param-val-badge" id="topPBadge">0.90</span>
+          <div class="control-group" style="margin-bottom: 14px;">
+            <div class="control-label-row">
+              <span>Top P</span>
+              <span class="control-value" id="topPValue">0.90</span>
             </div>
-            <input type="range" class="tactical-range" id="topPSlider" min="0" max="1" step="0.05" value="0.9">
+            <input type="range" id="topPRange" min="0" max="1" step="0.05" value="0.9">
           </div>
 
-          <div class="param-block">
-            <div class="param-label-row">
-              <span>MAX TOKENS</span>
-              <span class="param-val-badge" id="maxTokensBadge">512</span>
+          <div class="control-group" style="margin-bottom: 14px;">
+            <div class="control-label-row">
+              <span>Max Tokens</span>
+              <span class="control-value" id="maxTokensValue">512</span>
             </div>
-            <input type="number" class="tactical-input" id="maxTokensInput" min="16" max="4096" value="512">
+            <input type="number" id="maxTokensInput" min="16" max="4096" value="512">
           </div>
-
-          <div class="param-block">
-            <div class="param-label-row">
-              <span>SYSTEM DIRECTIVE</span>
-            </div>
-            <textarea class="tactical-textarea" id="systemDirective" rows="5">You are Glint, an ultra-fast, intelligent AI pair programmer and LLM inference engine built from scratch in Rust.</textarea>
-          </div>
-
-          <button id="clearChatBtn" class="tactical-input" style="cursor: pointer; margin-top: auto; text-align: center; background: rgba(239, 68, 68, 0.1); border-color: rgba(239, 68, 68, 0.3); color: #fca5a5;">
-            PURGE CONVERSATION
-          </button>
         </div>
 
-        <!-- Chat Feed & Prompt Bar -->
-        <div class="chat-feed-container">
-          <div class="chat-messages" id="chatFeed">
-            <div class="message-card assistant">
-              <div class="msg-crest">
-                <img src="/assets/logo.svg" alt="Glint">
-              </div>
-              <div class="msg-body-wrapper">
-                <div class="msg-header-line">
-                  <div class="msg-role-tag">GLINT TACTICAL ASSISTANT</div>
-                  <div style="font-family: 'JetBrains Mono', monospace; font-size: 10px; color: var(--steel-600);">CORE READY</div>
-                </div>
-                <div class="msg-text-content">Glint inference engine initialized. ARM NEON quantized SIMD kernels engaged. Awaiting prompt directive.</div>
-              </div>
-            </div>
-          </div>
+        <div class="control-group">
+          <div class="sidebar-section-title">System Prompt</div>
+          <textarea id="systemPrompt" rows="4" placeholder="Optional system instructions...">You are Glint, an efficient and helpful AI assistant.</textarea>
+        </div>
 
-          <div class="prompt-deck">
-            <div class="prompt-box">
-              <textarea class="prompt-textarea" id="userPromptInput" placeholder="Enter tactical prompt directive... (Enter to send, Shift+Enter for newline)"></textarea>
-              <div class="prompt-bar-footer">
-                <div class="shortcut-hints">
-                  <span><kbd>Enter</kbd> Dispatch</span>
-                  <span><kbd>Shift+Enter</kbd> Linebreak</span>
-                  <span><kbd>Esc</kbd> Abort</span>
-                </div>
-                <button class="btn-hunt" id="dispatchBtn">
-                  <span>Dispatch</span>
-                  <span style="font-size: 16px;">⚡</span>
-                </button>
-              </div>
+        <button class="btn-secondary" id="clearChatBtn" style="margin-top: auto;">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+          Clear History
+        </button>
+      </aside>
+
+      <section class="chat-container">
+        <div class="chat-scroll" id="chatFeed">
+          <div class="empty-state" id="emptyState">
+            <div class="empty-logo">
+              <img src="/assets/logo.svg" alt="Glint">
+            </div>
+            <div class="empty-title">Welcome to Glint</div>
+            <div class="empty-subtitle">Direct, zero-dependency local LLM inference running with SIMD acceleration.</div>
+            <div class="prompt-suggestions">
+              <div class="suggestion-item" data-prompt="Explain the difference between LLaMA and Qwen architectures.">Explain the difference between LLaMA and Qwen architectures.</div>
+              <div class="suggestion-item" data-prompt="Write a fast Rust function for SIMD vector dot products.">Write a fast Rust function for SIMD vector dot products.</div>
+              <div class="suggestion-item" data-prompt="What are the trade-offs of Q4_K_M vs Q8_0 quantization?">What are the trade-offs of Q4_K_M vs Q8_0 quantization?</div>
             </div>
           </div>
         </div>
-      </div>
+
+        <div class="input-wrapper">
+          <div class="input-box">
+            <textarea class="chat-textarea" id="chatInput" placeholder="Send a message..."></textarea>
+            <div class="input-actions">
+              <div class="keyboard-hint">
+                <kbd>Return</kbd> to send, <kbd>Shift + Return</kbd> for new line
+              </div>
+              <button class="btn-primary" id="sendBtn">
+                Send
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+              </button>
+            </div>
+          </div>
+        </div>
+      </section>
     </div>
 
-    <!-- TAB 2: Schema Matrix -->
-    <div class="tab-pane" id="structuredPane">
-      <div class="studio-grid">
-        <div class="studio-card">
-          <div class="card-header-bar">
-            <span>Schema Constraint Specification</span>
+    <!-- Pane 2: Structured Outputs -->
+    <div class="workspace-pane" id="structuredPane">
+      <div class="studio-layout">
+        <div class="panel-card">
+          <div class="panel-header">
+            <span>JSON Schema Definition</span>
             <div style="display: flex; gap: 6px;">
-              <button class="param-val-badge" style="cursor: pointer;" id="presetProfile">Profile</button>
-              <button class="param-val-badge" style="cursor: pointer;" id="presetSql">SQL AST</button>
+              <button class="btn-secondary" style="padding: 2px 8px; font-size: 11px;" id="presetUser">User Object</button>
+              <button class="btn-secondary" style="padding: 2px 8px; font-size: 11px;" id="presetEntity">Entity Extraction</button>
             </div>
           </div>
-          <textarea class="studio-editor" id="schemaDefinition">{
+          <textarea class="code-editor" id="schemaInput">{
   "type": "object",
   "properties": {
-    "agent": { "type": "string" },
-    "action": { "type": "string", "enum": ["compile", "test", "deploy"] },
-    "target": { "type": "string" },
-    "confidence": { "type": "number" }
+    "name": { "type": "string" },
+    "role": { "type": "string" },
+    "skills": { 
+      "type": "array", 
+      "items": { "type": "string" } 
+    }
   },
-  "required": ["agent", "action", "target", "confidence"]
+  "required": ["name", "role", "skills"]
 }</textarea>
-          <div class="studio-footer-actions">
-            <input type="text" class="tactical-input" id="schemaPromptInput" value="Issue compile directive for Glint SIMD kernel" style="flex: 1;">
-            <button class="btn-hunt" id="runSchemaBtn">Execute Matrix ➔</button>
+          <div class="panel-footer">
+            <input type="text" id="schemaPrompt" value="Create a profile for a senior systems software engineer specializing in Rust" style="flex: 1;">
+            <button class="btn-primary" id="executeSchemaBtn">Generate</button>
           </div>
         </div>
 
-        <div class="studio-card">
-          <div class="card-header-bar">
-            <span>Guaranteed Valid Output</span>
-            <span id="schemaStatusTag" style="color: var(--cyan-optic);">AWAITING DIRECTIVE</span>
+        <div class="panel-card">
+          <div class="panel-header">
+            <span>Validated Output</span>
+            <span id="schemaStatus" style="font-family: 'JetBrains Mono', monospace; font-size: 11px;">Ready</span>
           </div>
-          <textarea class="studio-editor" id="schemaResultBox" readonly style="color: var(--cyan-optic);"></textarea>
+          <textarea class="code-editor" id="schemaOutput" readonly placeholder="Structured output will appear here..."></textarea>
         </div>
       </div>
     </div>
 
-    <!-- TAB 3: Tool Cockpit -->
-    <div class="tab-pane" id="toolsPane">
-      <div class="studio-grid">
-        <div class="studio-card">
-          <div class="card-header-bar">
-            <span>OpenAI Function Manifest</span>
+    <!-- Pane 3: Tools -->
+    <div class="workspace-pane" id="toolsPane">
+      <div class="studio-layout">
+        <div class="panel-card">
+          <div class="panel-header">
+            <span>Tools / Function Declarations</span>
           </div>
-          <textarea class="studio-editor" id="toolsDefinition">[
+          <textarea class="code-editor" id="toolsConfig">[
   {
     "type": "function",
     "function": {
-      "name": "query_database",
-      "description": "Execute high-performance query against cluster DB",
+      "name": "get_weather",
+      "description": "Get the current weather for a location",
       "parameters": {
         "type": "object",
         "properties": {
-          "query": { "type": "string" },
-          "timeout_ms": { "type": "integer" }
+          "location": { "type": "string", "description": "City and state, e.g. San Francisco, CA" },
+          "unit": { "type": "string", "enum": ["celsius", "fahrenheit"] }
         },
-        "required": ["query"]
+        "required": ["location"]
       }
     }
   }
 ]</textarea>
-          <div class="studio-footer-actions">
-            <input type="text" class="tactical-input" id="toolPromptInput" value="Find top 10 latency spikes from last hour" style="flex: 1;">
-            <button class="btn-hunt" id="runToolBtn">Test Tool Call ➔</button>
+          <div class="panel-footer">
+            <input type="text" id="toolPrompt" value="What is the weather like in Tokyo right now?" style="flex: 1;">
+            <button class="btn-primary" id="executeToolBtn">Invoke</button>
           </div>
         </div>
 
-        <div class="studio-card">
-          <div class="card-header-bar">
-            <span>Generated Tool Invocation</span>
+        <div class="panel-card">
+          <div class="panel-header">
+            <span>Tool Calls</span>
           </div>
-          <textarea class="studio-editor" id="toolResultBox" readonly style="color: var(--emerald-ready);"></textarea>
+          <textarea class="code-editor" id="toolsOutput" readonly placeholder="Tool invocation response will appear here..."></textarea>
         </div>
       </div>
     </div>
 
-    <!-- TAB 4: Telemetry Cockpit -->
-    <div class="tab-pane" id="cockpitPane">
-      <div class="cockpit-layout">
-        <div class="cockpit-gauge-card">
-          <div class="gauge-title">Inference Throughput</div>
-          <div class="gauge-number" id="cockpitTokS">-- <span class="gauge-unit">tok/sec</span></div>
-          <div style="font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--steel-400);">Continuous Batched SIMD Decode</div>
+    <!-- Pane 4: Metrics -->
+    <div class="workspace-pane" id="metricsPane">
+      <div class="metrics-layout">
+        <div class="metric-card">
+          <div class="metric-title">Throughput</div>
+          <div class="metric-stat" id="statThroughput">-- <span class="metric-unit">tok/s</span></div>
+          <div class="metric-desc">Continuous autoregressive decoding rate across active requests.</div>
         </div>
 
-        <div class="cockpit-gauge-card">
-          <div class="gauge-title">Time to First Token (TTFT)</div>
-          <div class="gauge-number" id="cockpitTTFT">-- <span class="gauge-unit">ms</span></div>
-          <div style="font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--steel-400);">Hardware Prefill Latency</div>
+        <div class="metric-card">
+          <div class="metric-title">Time to First Token (TTFT)</div>
+          <div class="metric-stat" id="statTTFT">-- <span class="metric-unit">ms</span></div>
+          <div class="metric-desc">Prefill latency from request admission to initial token emission.</div>
         </div>
 
-        <div class="cockpit-gauge-card" style="grid-column: span 2;">
-          <div class="gauge-title">Paged KV-Cache Memory Matrix (16-Token Pages)</div>
-          <div class="kv-grid-viz" id="kvMatrixGrid">
-            <!-- 64 dynamic cell blocks -->
+        <div class="metric-card" style="grid-column: span 2;">
+          <div class="metric-title">KV Cache Page Pool (16-Token Pages)</div>
+          <div class="kv-matrix" id="kvGrid">
+            <!-- 64 blocks -->
           </div>
-          <div style="display: flex; justify-content: space-between; font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--steel-400); margin-top: 8px;">
-            <span>Allocated: <b id="kvAllocText" style="color: var(--cyan-optic);">16 / 512</b> pages</span>
-            <span>Prefix Caching: <b style="color: var(--emerald-ready);">ENABLED</b></span>
+          <div style="display: flex; justify-content: space-between; font-size: 12px; color: var(--text-secondary); margin-top: 6px;">
+            <span>Pool Utilization: <span id="kvAllocated" style="font-family: 'JetBrains Mono', monospace; color: var(--text-primary);">8 / 512 pages</span></span>
+            <span>Prefix Caching: Active</span>
           </div>
         </div>
 
-        <div class="cockpit-gauge-card">
-          <div class="gauge-title">Core Execution Backend</div>
-          <div class="gauge-number" style="font-size: 24px; color: var(--cyan-optic);">ARM NEON SIMD</div>
-          <div style="font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--steel-400);">Vectorized Quantized Dot-Products</div>
+        <div class="metric-card">
+          <div class="metric-title">Compute Acceleration</div>
+          <div class="metric-stat" style="font-size: 20px;">ARM NEON SIMD</div>
+          <div class="metric-desc">Vectorized 128-bit SIMD matrix kernels with multi-threaded Rayon execution.</div>
         </div>
 
-        <div class="cockpit-gauge-card">
-          <div class="gauge-title">Engine Architecture</div>
-          <div class="gauge-number" style="font-size: 24px; color: var(--steel-100);" id="cockpitArchTag">LLaMA / QWEN</div>
-          <div style="font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--steel-400);">Flash Attention & SwiGLU / GeGLU</div>
+        <div class="metric-card">
+          <div class="metric-title">Model Architecture</div>
+          <div class="metric-stat" style="font-size: 20px;" id="statArch">LLaMA / Qwen</div>
+          <div class="metric-desc">FlashAttention, SwiGLU / GeGLU FFN, and RoPE rotary position embeddings.</div>
         </div>
       </div>
     </div>
   </main>
 
   <script>
-    // ── Tab Switching ─────────────────────────────────────────────────────────
-    document.querySelectorAll('.nav-tab').forEach(tab => {
-      tab.addEventListener('click', () => {
-        document.querySelectorAll('.nav-tab').forEach(t => t.classList.remove('active'));
-        document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
-        tab.classList.add('active');
-        const paneId = tab.dataset.tab + 'Pane';
-        const pane = document.getElementById(paneId);
-        if (pane) pane.classList.add('active');
+    // ── Tab Management ────────────────────────────────────────────────────────
+    document.querySelectorAll('.nav-item').forEach(btn => {
+      btn.addEventListener('click', () => {
+        document.querySelectorAll('.nav-item').forEach(b => b.classList.remove('active'));
+        document.querySelectorAll('.workspace-pane').forEach(p => p.classList.remove('active'));
+        btn.classList.add('active');
+        const target = document.getElementById(btn.dataset.tab + 'Pane');
+        if (target) target.classList.add('active');
       });
     });
 
-    // ── Sliders & Badges ──────────────────────────────────────────────────────
-    const tempSlider = document.getElementById('tempSlider');
-    const tempBadge = document.getElementById('tempBadge');
-    tempSlider.addEventListener('input', () => tempBadge.textContent = parseFloat(tempSlider.value).toFixed(2));
+    // ── Sliders & Number Sync ─────────────────────────────────────────────────
+    const tempRange = document.getElementById('tempRange');
+    const tempValue = document.getElementById('tempValue');
+    tempRange.addEventListener('input', () => tempValue.textContent = parseFloat(tempRange.value).toFixed(2));
 
-    const topPSlider = document.getElementById('topPSlider');
-    const topPBadge = document.getElementById('topPBadge');
-    topPSlider.addEventListener('input', () => topPBadge.textContent = parseFloat(topPSlider.value).toFixed(2));
+    const topPRange = document.getElementById('topPRange');
+    const topPValue = document.getElementById('topPValue');
+    topPRange.addEventListener('input', () => topPValue.textContent = parseFloat(topPRange.value).toFixed(2));
 
     const maxTokensInput = document.getElementById('maxTokensInput');
-    const maxTokensBadge = document.getElementById('maxTokensBadge');
-    maxTokensInput.addEventListener('input', () => maxTokensBadge.textContent = maxTokensInput.value);
+    const maxTokensValue = document.getElementById('maxTokensValue');
+    maxTokensInput.addEventListener('input', () => maxTokensValue.textContent = maxTokensInput.value);
 
     // ── KV Grid Init ──────────────────────────────────────────────────────────
-    const kvGrid = document.getElementById('kvMatrixGrid');
+    const kvGrid = document.getElementById('kvGrid');
     if (kvGrid) {
       for (let i = 0; i < 64; i++) {
-        const cell = document.createElement('div');
-        cell.className = 'kv-cell' + (i < 6 ? ' active' : i < 14 ? ' cached' : '');
-        kvGrid.appendChild(cell);
+        const d = document.createElement('div');
+        d.className = 'kv-block' + (i < 4 ? ' active' : i < 10 ? ' cached' : '');
+        kvGrid.appendChild(d);
       }
     }
 
-    // ── Chat Dispatch Logic ───────────────────────────────────────────────────
-    let chatHistory = [];
+    // ── Prompt Suggestions ────────────────────────────────────────────────────
+    document.querySelectorAll('.suggestion-item').forEach(item => {
+      item.addEventListener('click', () => {
+        const input = document.getElementById('chatInput');
+        input.value = item.dataset.prompt;
+        input.focus();
+      });
+    });
+
+    // ── Chat Logic ────────────────────────────────────────────────────────────
+    let conversation = [];
     const chatFeed = document.getElementById('chatFeed');
-    const userPromptInput = document.getElementById('userPromptInput');
-    const dispatchBtn = document.getElementById('dispatchBtn');
+    const chatInput = document.getElementById('chatInput');
+    const sendBtn = document.getElementById('sendBtn');
+    const emptyState = document.getElementById('emptyState');
     const clearChatBtn = document.getElementById('clearChatBtn');
 
     clearChatBtn.addEventListener('click', () => {
-      chatHistory = [];
-      chatFeed.innerHTML = `
-        <div class="message-card assistant">
-          <div class="msg-crest"><img src="/assets/logo.svg" alt="Glint"></div>
-          <div class="msg-body-wrapper">
-            <div class="msg-header-line">
-              <div class="msg-role-tag">GLINT TACTICAL ASSISTANT</div>
-              <div style="font-family: 'JetBrains Mono', monospace; font-size: 10px; color: var(--steel-600);">RESET</div>
-            </div>
-            <div class="msg-text-content">Conversation purged. Awaiting next directive.</div>
-          </div>
-        </div>
-      `;
+      conversation = [];
+      chatFeed.innerHTML = '';
+      chatFeed.appendChild(emptyState);
+      emptyState.style.display = 'flex';
     });
 
-    async function dispatchPrompt() {
-      const text = userPromptInput.value.trim();
+    async function sendMessage() {
+      const text = chatInput.value.trim();
       if (!text) return;
 
-      userPromptInput.value = '';
-      appendCard('user', text);
+      if (emptyState) emptyState.style.display = 'none';
 
-      const sys = document.getElementById('systemDirective').value.trim();
+      chatInput.value = '';
+      appendMessageRow('user', text);
+
+      const sys = document.getElementById('systemPrompt').value.trim();
       const messages = [];
       if (sys) messages.push({ role: 'system', content: sys });
-      chatHistory.forEach(m => messages.push({ role: m.role, content: m.content }));
+      conversation.forEach(m => messages.push({ role: m.role, content: m.content }));
       messages.push({ role: 'user', content: text });
 
-      const assistantCard = appendCard('assistant', '');
-      const contentEl = assistantCard.querySelector('.msg-text-content');
-      const footerEl = assistantCard.querySelector('.msg-telemetry-footer');
+      const assistantRow = appendMessageRow('assistant', '');
+      const bodyEl = assistantRow.querySelector('.message-body');
+      const telemetryEl = assistantRow.querySelector('.message-telemetry');
 
       const t0 = performance.now();
       let ttft = null;
       let tokenCount = 0;
-      let streamed = '';
+      let fullText = '';
 
       try {
         const res = await fetch('/v1/chat/completions', {
@@ -1032,8 +1037,8 @@
             model: 'default',
             messages: messages,
             stream: true,
-            temperature: parseFloat(tempSlider.value),
-            top_p: parseFloat(topPSlider.value),
+            temperature: parseFloat(tempRange.value),
+            top_p: parseFloat(topPRange.value),
             max_tokens: parseInt(maxTokensInput.value)
           })
         });
@@ -1062,11 +1067,11 @@
               if (delta) {
                 if (ttft === null) {
                   ttft = performance.now() - t0;
-                  document.getElementById('cockpitTTFT').innerHTML = `${Math.round(ttft)} <span class="gauge-unit">ms</span>`;
+                  document.getElementById('statTTFT').innerHTML = `${Math.round(ttft)} <span class="metric-unit">ms</span>`;
                 }
                 tokenCount++;
-                streamed += delta;
-                contentEl.innerHTML = formatMarkdown(streamed) + '<span class="typing-cursor"></span>';
+                fullText += delta;
+                bodyEl.innerHTML = formatMarkdown(fullText) + '<span class="cursor-blink"></span>';
                 chatFeed.scrollTop = chatFeed.scrollHeight;
               }
             } catch (e) {}
@@ -1075,104 +1080,110 @@
 
         const totalSecs = (performance.now() - t0) / 1000;
         const tokS = totalSecs > 0 ? (tokenCount / totalSecs).toFixed(1) : '0';
-        contentEl.innerHTML = formatMarkdown(streamed);
-        footerEl.innerHTML = `
-          <span>⚡ <b>${tokS}</b> tok/s</span>
-          <span>⏱ <b>${Math.round(ttft || 0)}ms</b> TTFT</span>
-          <span>📦 <b>${tokenCount}</b> tokens</span>
+        bodyEl.innerHTML = formatMarkdown(fullText);
+        telemetryEl.innerHTML = `
+          <span>${tokS} tok/s</span>
+          <span>${Math.round(ttft || 0)}ms TTFT</span>
+          <span>${tokenCount} tokens</span>
         `;
-        document.getElementById('cockpitTokS').innerHTML = `${tokS} <span class="gauge-unit">tok/sec</span>`;
+        document.getElementById('statThroughput').innerHTML = `${tokS} <span class="metric-unit">tok/s</span>`;
 
-        chatHistory.push({ role: 'user', content: text });
-        chatHistory.push({ role: 'assistant', content: streamed });
+        conversation.push({ role: 'user', content: text });
+        conversation.push({ role: 'assistant', content: fullText });
 
       } catch (err) {
-        contentEl.innerHTML = `<span style="color: var(--crimson-err);">[Execution Interrupted: ${err.message}]</span>`;
+        bodyEl.innerHTML = `<span style="color: var(--status-error);">Error: ${err.message}</span>`;
       }
     }
 
     function formatMarkdown(text) {
-      // Escape HTML
       let escaped = text
         .replace(/&/g, "&amp;")
         .replace(/</g, "&lt;")
         .replace(/>/g, "&gt;");
 
-      // Code blocks
       escaped = escaped.replace(/```([a-zA-Z0-9_-]*)\n([\s\S]*?)```/g, (match, lang, code) => {
         return `<pre><code>${code}</code></pre>`;
       });
 
-      // Inline code
       escaped = escaped.replace(/`([^`]+)`/g, '<code>$1</code>');
       return escaped;
     }
 
-    function appendCard(role, text) {
-      const card = document.createElement('div');
-      card.className = `message-card ${role}`;
-      card.innerHTML = `
-        <div class="msg-crest">
-          ${role === 'user' ? 'YOU' : '<img src="/assets/logo.svg" alt="Glint">'}
+    function appendMessageRow(role, text) {
+      const row = document.createElement('div');
+      row.className = `chat-row ${role}`;
+      row.innerHTML = `
+        <div class="avatar">
+          ${role === 'user' ? 'U' : '<img src="/assets/logo.svg" alt="Glint">'}
         </div>
-        <div class="msg-body-wrapper">
-          <div class="msg-header-line">
-            <div class="msg-role-tag">${role === 'user' ? 'MISSION DIRECTIVE' : 'GLINT TACTICAL ASSISTANT'}</div>
-            <div style="font-family: 'JetBrains Mono', monospace; font-size: 10px; color: var(--steel-600);">${new Date().toLocaleTimeString()}</div>
+        <div class="message-content-box">
+          <div class="message-meta">
+            <span>${role === 'user' ? 'You' : 'Glint'}</span>
+            <span style="font-size: 11px; color: var(--text-muted);">${new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
           </div>
-          <div class="msg-text-content">${formatMarkdown(text)}</div>
-          ${role === 'assistant' ? '<div class="msg-telemetry-footer"><span>⚡ Awaiting inference...</span></div>' : ''}
+          <div class="message-body">${formatMarkdown(text)}</div>
+          ${role === 'assistant' ? '<div class="message-telemetry"><span>Generating...</span></div>' : ''}
         </div>
       `;
-      chatFeed.appendChild(card);
+      chatFeed.appendChild(row);
       chatFeed.scrollTop = chatFeed.scrollHeight;
-      return card;
+      return row;
     }
 
-    dispatchBtn.addEventListener('click', dispatchPrompt);
-    userPromptInput.addEventListener('keydown', (e) => {
+    sendBtn.addEventListener('click', sendMessage);
+    chatInput.addEventListener('keydown', (e) => {
       if (e.key === 'Enter' && !e.shiftKey) {
         e.preventDefault();
-        dispatchPrompt();
+        sendMessage();
       }
     });
 
-    // ── Structured Matrix Studio ──────────────────────────────────────────────
-    const runSchemaBtn = document.getElementById('runSchemaBtn');
-    const schemaDef = document.getElementById('schemaDefinition');
-    const schemaPrompt = document.getElementById('schemaPromptInput');
-    const schemaResultBox = document.getElementById('schemaResultBox');
-    const schemaStatusTag = document.getElementById('schemaStatusTag');
+    // ── Structured Outputs Studio ─────────────────────────────────────────────
+    const executeSchemaBtn = document.getElementById('executeSchemaBtn');
+    const schemaInput = document.getElementById('schemaInput');
+    const schemaPrompt = document.getElementById('schemaPrompt');
+    const schemaOutput = document.getElementById('schemaOutput');
+    const schemaStatus = document.getElementById('schemaStatus');
 
-    document.getElementById('presetProfile').addEventListener('click', () => {
-      schemaDef.value = JSON.stringify({
+    document.getElementById('presetUser').addEventListener('click', () => {
+      schemaInput.value = JSON.stringify({
         type: "object",
         properties: {
-          codename: { type: "string" },
-          clearance: { type: "integer" },
-          specialties: { type: "array", items: { type: "string" } }
+          name: { type: "string" },
+          email: { type: "string" },
+          department: { type: "string", enum: ["Engineering", "Product", "Operations"] },
+          experience_years: { type: "integer" }
         },
-        required: ["codename", "clearance", "specialties"]
+        required: ["name", "email", "department", "experience_years"]
       }, null, 2);
     });
 
-    document.getElementById('presetSql').addEventListener('click', () => {
-      schemaDef.value = JSON.stringify({
+    document.getElementById('presetEntity').addEventListener('click', () => {
+      schemaInput.value = JSON.stringify({
         type: "object",
         properties: {
-          table: { type: "string" },
-          operation: { type: "string", enum: ["SELECT", "INSERT", "UPDATE"] },
-          columns: { type: "array", items: { type: "string" } }
+          entities: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                name: { type: "string" },
+                category: { type: "string", enum: ["Person", "Organization", "Location", "Technology"] }
+              },
+              required: ["name", "category"]
+            }
+          }
         },
-        required: ["table", "operation", "columns"]
+        required: ["entities"]
       }, null, 2);
     });
 
-    runSchemaBtn.addEventListener('click', async () => {
-      schemaResultBox.value = '// Compiling GBNF constraint derivative engine...\n// Executing inference under strict AST mask...';
-      schemaStatusTag.textContent = 'GRAMMAR CONSTRAINT ENFORCED';
+    executeSchemaBtn.addEventListener('click', async () => {
+      schemaOutput.value = '// Enforcing JSON Schema constraint...\n// Generating constrained tokens...';
+      schemaStatus.textContent = 'Generating...';
       try {
-        const schema = JSON.parse(schemaDef.value);
+        const schema = JSON.parse(schemaInput.value);
         const res = await fetch('/v1/chat/completions', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -1185,24 +1196,24 @@
         });
         const data = await res.json();
         const content = data.choices[0]?.message?.content || JSON.stringify(data, null, 2);
-        schemaResultBox.value = content;
-        schemaStatusTag.textContent = 'AST VALIDATED';
+        schemaOutput.value = content;
+        schemaStatus.textContent = 'Success (Valid JSON)';
       } catch (e) {
-        schemaResultBox.value = `// ERROR: ${e.message}`;
-        schemaStatusTag.textContent = 'VALIDATION FAILED';
+        schemaOutput.value = `// Error: ${e.message}`;
+        schemaStatus.textContent = 'Error';
       }
     });
 
-    // ── Tool Calling Cockpit ──────────────────────────────────────────────────
-    const runToolBtn = document.getElementById('runToolBtn');
-    const toolsDef = document.getElementById('toolsDefinition');
-    const toolPrompt = document.getElementById('toolPromptInput');
-    const toolResultBox = document.getElementById('toolResultBox');
+    // ── Tools Studio ──────────────────────────────────────────────────────────
+    const executeToolBtn = document.getElementById('executeToolBtn');
+    const toolsConfig = document.getElementById('toolsConfig');
+    const toolPrompt = document.getElementById('toolPrompt');
+    const toolsOutput = document.getElementById('toolsOutput');
 
-    runToolBtn.addEventListener('click', async () => {
-      toolResultBox.value = '// Running OpenAI Tool Calling Engine...';
+    executeToolBtn.addEventListener('click', async () => {
+      toolsOutput.value = '// Evaluating tool declarations...';
       try {
-        const tools = JSON.parse(toolsDef.value);
+        const tools = JSON.parse(toolsConfig.value);
         const res = await fetch('/v1/chat/completions', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -1216,12 +1227,12 @@
         const data = await res.json();
         const msg = data.choices[0]?.message;
         if (msg?.tool_calls) {
-          toolResultBox.value = JSON.stringify(msg.tool_calls, null, 2);
+          toolsOutput.value = JSON.stringify(msg.tool_calls, null, 2);
         } else {
-          toolResultBox.value = `// No tool call triggered.\n${msg?.content || JSON.stringify(data, null, 2)}`;
+          toolsOutput.value = msg?.content || JSON.stringify(data, null, 2);
         }
       } catch (e) {
-        toolResultBox.value = `// ERROR: ${e.message}`;
+        toolsOutput.value = `// Error: ${e.message}`;
       }
     });
   </script>

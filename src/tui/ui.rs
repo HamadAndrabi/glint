@@ -45,7 +45,7 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
     let header_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Length(28), // Brand
+            Constraint::Length(18), // Brand
             Constraint::Min(35),   // Tabs
             Constraint::Length(35), // Model Badges
         ])
@@ -53,8 +53,8 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
 
     // 1. Brand / Logo
     let brand = Paragraph::new(Line::from(vec![
-        Span::styled("🐺 GLINT ", Style::default().fg(Color::Cyan).bold()),
-        Span::styled("// CORE v0.2.0", Style::default().fg(Color::DarkGray)),
+        Span::styled("GLINT ", Style::default().fg(Color::Cyan).bold()),
+        Span::styled("v0.1.0", Style::default().fg(Color::DarkGray)),
     ]))
     .block(
         Block::default()
@@ -66,9 +66,9 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
 
     // 2. Tabs
     let tab_titles = vec![
-        Line::from(" [1] 💬 DIALOGUE "),
-        Line::from(" [2] 🧬 SCHEMA MATRIX "),
-        Line::from(" [3] 📊 TELEMETRY "),
+        Line::from(" [1] Chat "),
+        Line::from(" [2] Structured Lab "),
+        Line::from(" [3] Telemetry "),
     ];
     let selected_tab = match app.active_tab {
         ActiveTab::Chat => 0,
@@ -98,7 +98,7 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
         app.model_name, app.context_length
     );
     let badges = Paragraph::new(Line::from(vec![
-        Span::styled("● ", Style::default().fg(if app.is_generating { Color::Yellow } else { Color::Cyan })),
+        Span::styled("● ", Style::default().fg(if app.is_generating { Color::Yellow } else { Color::Green })),
         Span::styled(status_text, Style::default().fg(Color::Gray)),
     ]))
     .alignment(Alignment::Right)
@@ -124,10 +124,10 @@ fn render_chat_view(f: &mut Frame, app: &mut App, area: Rect) {
 
     for m in &app.messages {
         let (role_label, border_color, text_color) = match m.role.as_str() {
-            "user" => (" [DIRECTIVE // USER] ", Color::Blue, Color::White),
-            "assistant" => (" [GLINT // OPTIC-CORE] ", Color::Cyan, Color::White),
-            "system" => (" [SYSTEM DIRECTIVE] ", Color::DarkGray, Color::Gray),
-            _ => (" [PROMPT] ", Color::Gray, Color::White),
+            "user" => (" You ", Color::Blue, Color::White),
+            "assistant" => (" Glint ", Color::Cyan, Color::White),
+            "system" => (" System ", Color::DarkGray, Color::Gray),
+            _ => (" Message ", Color::Gray, Color::White),
         };
 
         let mut lines = vec![
@@ -135,7 +135,7 @@ fn render_chat_view(f: &mut Frame, app: &mut App, area: Rect) {
                 Span::styled(role_label, Style::default().fg(border_color).bold()),
                 if let (Some(tok_s), Some(ttft)) = (m.tok_per_sec, m.ttft_ms) {
                     Span::styled(
-                        format!(" [⚡ {tok_s:.1} tok/s · ⏱ {ttft}ms TTFT]"),
+                        format!(" [{tok_s:.1} tok/s | {ttft}ms TTFT]"),
                         Style::default().fg(Color::DarkGray),
                     )
                 } else {
@@ -164,8 +164,8 @@ fn render_chat_view(f: &mut Frame, app: &mut App, area: Rect) {
     if app.is_generating || !app.streaming_response.is_empty() {
         let mut lines = vec![
             Line::from(vec![
-                Span::styled(" [GLINT // OPTIC-CORE] ", Style::default().fg(Color::Cyan).bold()),
-                Span::styled(" [vector stream active...]", Style::default().fg(Color::Yellow)),
+                Span::styled(" Glint ", Style::default().fg(Color::Cyan).bold()),
+                Span::styled(" [generating...]", Style::default().fg(Color::Yellow)),
             ]),
             Line::from(""),
         ];
@@ -179,7 +179,7 @@ fn render_chat_view(f: &mut Frame, app: &mut App, area: Rect) {
     let list = List::new(items)
         .block(
             Block::default()
-                .title(" Target Acquisition & Dialogue ")
+                .title(" Chat ")
                 .title_style(Style::default().fg(Color::Cyan).bold())
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
@@ -208,10 +208,10 @@ fn render_lab_view(f: &mut Frame, app: &App, area: Rect) {
     let modes = vec![Line::from(" JSON Schema "), Line::from(" GBNF Grammar ")];
     let mode_tabs = Tabs::new(modes)
         .select(app.lab_mode)
-        .highlight_style(Style::default().fg(Color::Magenta).bold())
+        .highlight_style(Style::default().fg(Color::Cyan).bold())
         .block(
             Block::default()
-                .title(" Constraint Type (Ctrl+T to toggle) ")
+                .title(" Mode (Ctrl+T to toggle) ")
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded),
         );
@@ -233,7 +233,7 @@ fn render_lab_view(f: &mut Frame, app: &App, area: Rect) {
         .block(
             Block::default()
                 .title(editor_title)
-                .title_style(Style::default().fg(Color::Magenta).bold())
+                .title_style(Style::default().fg(Color::Cyan).bold())
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(Color::DarkGray)),
@@ -246,7 +246,7 @@ fn render_lab_view(f: &mut Frame, app: &App, area: Rect) {
         .style(Style::default().fg(Color::Cyan))
         .block(
             Block::default()
-                .title(" Lab Prompt (Press Ctrl+Enter to Run) ")
+                .title(" Prompt (Press Ctrl+Enter to Run) ")
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(Color::DarkGray)),
@@ -259,7 +259,7 @@ fn render_lab_view(f: &mut Frame, app: &App, area: Rect) {
         .style(Style::default().fg(Color::Green))
         .block(
             Block::default()
-                .title(" Constrained Generation Stream ")
+                .title(" Output ")
                 .title_style(Style::default().fg(Color::Green).bold())
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
@@ -294,7 +294,7 @@ fn render_telemetry_view(f: &mut Frame, app: &App, area: Rect) {
     let speed_gauge = Gauge::default()
         .block(
             Block::default()
-                .title(" Generation Throughput ")
+                .title(" Throughput ")
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded),
         )
@@ -308,7 +308,7 @@ fn render_telemetry_view(f: &mut Frame, app: &App, area: Rect) {
     let ttft_p = Paragraph::new(vec![
         Line::from(""),
         Line::from(vec![
-            Span::styled("⚡ TTFT: ", Style::default().fg(Color::Yellow).bold()),
+            Span::styled("TTFT: ", Style::default().fg(Color::Yellow).bold()),
             Span::styled(ttft_label, Style::default().fg(Color::White).bold()),
         ]),
     ])
@@ -325,7 +325,7 @@ fn render_telemetry_view(f: &mut Frame, app: &App, area: Rect) {
     let total_p = Paragraph::new(vec![
         Line::from(""),
         Line::from(vec![
-            Span::styled("📦 Tokens: ", Style::default().fg(Color::Green).bold()),
+            Span::styled("Tokens: ", Style::default().fg(Color::Green).bold()),
             Span::styled(
                 format!("{}", app.total_tokens_generated),
                 Style::default().fg(Color::White).bold(),
@@ -335,7 +335,7 @@ fn render_telemetry_view(f: &mut Frame, app: &App, area: Rect) {
     .alignment(Alignment::Center)
     .block(
         Block::default()
-            .title(" Session Tokens ")
+            .title(" Generated Tokens ")
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded),
     );
