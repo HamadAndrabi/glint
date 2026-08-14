@@ -88,6 +88,14 @@ impl VocabIndex {
     }
 }
 
+pub mod gbnf;
+pub mod grammar;
+pub mod json_schema;
+
+pub use gbnf::GbnfGrammar;
+pub use grammar::{GrammarConstraint, JsonSchemaConstraint};
+pub use json_schema::json_schema_to_gbnf;
+
 // ── ConstraintSpec ────────────────────────────────────────────────────────────
 
 /// Declarative constraint specification.
@@ -97,6 +105,10 @@ pub enum ConstraintSpec {
     JsonObject,
     /// Force the model to produce one of the given string literals.
     JsonEnum(Vec<String>),
+    /// Force the model to produce JSON adhering to a JSON Schema.
+    JsonSchema(serde_json::Value),
+    /// Force the model to follow a custom GBNF grammar.
+    Grammar(String),
 }
 
 // ── JSON parse state ──────────────────────────────────────────────────────────
@@ -356,6 +368,24 @@ pub fn build_constraint(spec: &ConstraintSpec, vocab: Arc<VocabIndex>) -> Box<dy
     match spec {
         ConstraintSpec::JsonObject => Box::new(JsonObjectConstraint::new(vocab)),
         ConstraintSpec::JsonEnum(opts) => Box::new(JsonEnumConstraint::new(opts.clone(), vocab)),
+        ConstraintSpec::JsonSchema(schema) => {
+            match JsonSchemaConstraint::from_json_schema(schema, Arc::clone(&vocab)) {
+                Ok(c) => Box::new(c),
+                Err(e) => {
+                    eprintln!("Warning: failed to compile JSON schema to GBNF ({e}), falling back to JsonObject");
+                    Box::new(JsonObjectConstraint::new(vocab))
+                }
+            }
+        }
+        ConstraintSpec::Grammar(grammar_str) => {
+            match GrammarConstraint::from_gbnf_str(grammar_str, Arc::clone(&vocab)) {
+                Ok(c) => Box::new(c),
+                Err(e) => {
+                    eprintln!("Warning: failed to parse GBNF grammar ({e}), falling back to JsonObject");
+                    Box::new(JsonObjectConstraint::new(vocab))
+                }
+            }
+        }
     }
 }
 
