@@ -91,7 +91,8 @@ impl ModelConfig {
         let attn_logit_softcapping = get_f32("attention.logit_softcapping")
             .or_else(|| get_f32("attn_logit_softcapping"));
         let final_logit_softcapping = get_f32("final_logit_softcapping");
-        let query_pre_attn_scalar = get_f32("attention.query_pre_attn_scalar");
+        let query_pre_attn_scalar =
+            get_f32("attention.query_pre_attn_scalar").map(|s| 1.0 / s.sqrt());
         let sliding_window_alternating = arch == "gemma2";
 
         let chat_template = metadata
@@ -120,6 +121,11 @@ impl ModelConfig {
             query_pre_attn_scalar,
             sliding_window_alternating,
         })
+    }
+
+    /// True when this model uses the Gemma or Gemma 2 architecture family.
+    pub fn is_gemma(&self) -> bool {
+        self.architecture == "gemma" || self.architecture == "gemma2"
     }
 
     /// Dimension of each attention head: `head_dim_override` or `embedding_length / head_count`.

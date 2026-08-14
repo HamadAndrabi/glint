@@ -127,6 +127,30 @@ pub fn rms_norm(x: &Tensor, weight: &Tensor, eps: f32) -> Tensor {
     Tensor::from_vec(data, x.shape())
 }
 
+/// Gemma RMSNorm: `x / sqrt(mean(x²) + eps) * (1.0 + weight)`.
+///
+/// In Gemma models, the learned scale weights are stored as offsets (Δw) centered at 0,
+/// so the scaling factor is `(1.0 + weight)`.
+pub fn rms_norm_gemma(x: &Tensor, weight: &Tensor, eps: f32) -> Tensor {
+    assert_eq!(x.ndim(), 1);
+    assert_eq!(weight.ndim(), 1);
+    assert_eq!(x.shape()[0], weight.shape()[0]);
+
+    let x_data = x.data();
+    let w_data = weight.data();
+    let n = x_data.len();
+
+    let mean_sq: f32 = x_data.iter().map(|v| v * v).sum::<f32>() / n as f32;
+    let rsqrt = 1.0 / (mean_sq + eps).sqrt();
+
+    let data: Vec<f32> = x_data
+        .iter()
+        .zip(w_data)
+        .map(|(&x, &w)| x * rsqrt * (1.0 + w))
+        .collect();
+    Tensor::from_vec(data, x.shape())
+}
+
 /// SiLU activation: `x * sigmoid(x)`.
 ///
 /// Also called "swish". Used in LLaMA's feed-forward network (SwiGLU variant).
@@ -135,6 +159,22 @@ pub fn silu(x: &Tensor) -> Tensor {
         .data()
         .iter()
         .map(|&v| v * (1.0 / (1.0 + (-v).exp())))
+        .collect();
+    Tensor::from_vec(data, x.shape())
+}
+
+/// GeLU activation (tanh approximation): `0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))`.
+///
+/// Used in Gemma / Gemma 2 feed-forward networks (GeGLU variant).
+pub fn gelu(x: &Tensor) -> Tensor {
+    const SQRT_2_OVER_PI: f32 = 0.797_884_6; // sqrt(2.0 / PI)
+    const COEF: f32 = 0.044715;
+    let data: Vec<f32> = x
+        .data()
+        .iter()
+        .map(|&v| {
+            0.5 * v * (1.0 + (SQRT_2_OVER_PI * (v + COEF * v * v * v)).tanh())
+        })
         .collect();
     Tensor::from_vec(data, x.shape())
 }
@@ -185,8 +225,9 @@ pub fn rope(
     let mut out = data.to_vec();
 
     let pos_scaled = pos as f32 / scaling_factor;
+    let rot = (rot_dim.min(head_dim)) & !1;
 
-    for i in (0..rot_dim).step_by(2) {
+    for i in (0..rot).step_by(2) {
         let freq = 1.0 / freq_base.powf(i as f32 / head_dim as f32);
         let angle = pos_scaled * freq;
         let cos_val = angle.cos();
