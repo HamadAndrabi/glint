@@ -61,14 +61,36 @@ fn silu_mul_maybe_gpu(gate: &Tensor, up: &Tensor, gpu: Option<&GpuBackend>) -> T
     tensor::mul(&tensor::silu(gate), up)
 }
 
+#[inline]
+fn norm(x: &Tensor, weight: &Tensor, eps: f32, is_gemma: bool) -> Tensor {
+    if is_gemma {
+        tensor::rms_norm_gemma(x, weight, eps)
+    } else {
+        tensor::rms_norm(x, weight, eps)
+    }
+}
+
+#[inline]
+fn get_embedding(weights: &TransformerWeights, config: &ModelConfig, token_id: u32) -> Tensor {
+    let mut row = weights.token_embedding.row_as_f32(token_id as usize);
+    if config.is_gemma() {
+        let scale = (config.embedding_length as f32).sqrt();
+        for v in row.data_mut() {
+            *v *= scale;
+        }
+    }
+    row
+}
+
 /// Run a full forward pass: token_ids → logits.
 ///
 /// Recomputes attention over all positions each time (no KV-cache).
 pub fn forward(weights: &TransformerWeights, config: &ModelConfig, token_ids: &[u32]) -> Tensor {
+    let is_gemma = config.is_gemma();
     let n_tokens = token_ids.len();
     let mut hidden_states: Vec<Tensor> = token_ids
         .iter()
-        .map(|&id| weights.token_embedding.row_as_f32(id as usize))
+        .map(|&id| get_embedding(weights, config, id))
         .collect();
 
     for (layer_idx, layer) in weights.layers.iter().enumerate() {
@@ -76,11 +98,17 @@ pub fn forward(weights: &TransformerWeights, config: &ModelConfig, token_ids: &[
         let mut new_hidden_states = Vec::with_capacity(n_tokens);
         for pos in 0..n_tokens {
             let normed =
-                tensor::rms_norm(&hidden_states[pos], &layer.attn_norm, config.rms_norm_eps);
-            let attn_out = attention(&normed, &hidden_states, layer, config, pos);
+                norm(&hidden_states[pos], &layer.attn_norm, config.rms_norm_eps, is_gemma);
+            let mut attn_out = attention(&normed, &hidden_states, layer, config, pos);
+            if let Some(post_norm) = &layer.post_attn_norm {
+                attn_out = norm(&attn_out, post_norm, config.rms_norm_eps, is_gemma);
+            }
             let after_attn = tensor::add(&hidden_states[pos], &attn_out);
-            let normed_ffn = tensor::rms_norm(&after_attn, &layer.ffn_norm, config.rms_norm_eps);
-            let ffn_out = feed_forward(&normed_ffn, layer, None, &mut None);
+            let normed_ffn = norm(&after_attn, &layer.ffn_norm, config.rms_norm_eps, is_gemma);
+            let mut ffn_out = feed_forward(&normed_ffn, layer, None, &mut None, is_gemma);
+            if let Some(post_norm) = &layer.post_ffn_norm {
+                ffn_out = norm(&ffn_out, post_norm, config.rms_norm_eps, is_gemma);
+            }
             new_hidden_states.push(tensor::add(&after_attn, &ffn_out));
         }
         hidden_states = new_hidden_states;
@@ -88,8 +116,12 @@ pub fn forward(weights: &TransformerWeights, config: &ModelConfig, token_ids: &[
     eprintln!();
 
     let last_hidden = &hidden_states[n_tokens - 1];
-    let normed = tensor::rms_norm(last_hidden, &weights.output_norm, config.rms_norm_eps);
-    weights.output.matvec(normed.data())
+    let normed = norm(last_hidden, &weights.output_norm, config.rms_norm_eps, is_gemma);
+    let mut logits = weights.output.matvec(normed.data());
+    if let Some(cap) = config.final_logit_softcapping {
+        tensor::logit_softcap_in_place(logits.data_mut(), cap);
+    }
+    logits
 }
 
 /// Multi-head self-attention (no KV-cache; recomputes K/V for all positions).
@@ -100,7 +132,7 @@ fn attention(
     config: &ModelConfig,
     pos: usize,
 ) -> Tensor {
-    let embed_dim = config.embedding_length as usize;
+    let is_gemma = config.is_gemma();
     let n_heads = config.head_count as usize;
     let n_kv_heads = config.head_count_kv as usize;
     let head_dim = config.head_dim() as usize;
@@ -112,18 +144,33 @@ fn attention(
         .map(|f| (head_dim as f32 * f) as usize & !1)
         .unwrap_or(head_dim);
 
-    let q_all = layer.attn_q.matvec(x.data());
-    let k_cur = layer.attn_k.matvec(x.data());
-    let v_cur = layer.attn_v.matvec(x.data());
+    let mut q_all = layer.attn_q.matvec(x.data());
+    let mut k_cur = layer.attn_k.matvec(x.data());
+    let mut v_cur = layer.attn_v.matvec(x.data());
+    if let Some(bias) = &layer.attn_q_bias {
+        tensor::add_in_place(q_all.data_mut(), bias.data());
+    }
+    if let Some(bias) = &layer.attn_k_bias {
+        tensor::add_in_place(k_cur.data_mut(), bias.data());
+    }
+    if let Some(bias) = &layer.attn_v_bias {
+        tensor::add_in_place(v_cur.data_mut(), bias.data());
+    }
     let q_all = tensor::rope(&q_all, pos, head_dim, freq_base, rope_scaling, rot_dim);
     let k_cur = tensor::rope(&k_cur, pos, head_dim, freq_base, rope_scaling, rot_dim);
 
     let mut k_cache: Vec<Tensor> = Vec::with_capacity(pos + 1);
     let mut v_cache: Vec<Tensor> = Vec::with_capacity(pos + 1);
     for (p, hidden) in all_hidden.iter().enumerate().take(pos) {
-        let normed_p = tensor::rms_norm(hidden, &layer.attn_norm, config.rms_norm_eps);
-        let k_p = layer.attn_k.matvec(normed_p.data());
-        let v_p = layer.attn_v.matvec(normed_p.data());
+        let normed_p = norm(hidden, &layer.attn_norm, config.rms_norm_eps, is_gemma);
+        let mut k_p = layer.attn_k.matvec(normed_p.data());
+        let mut v_p = layer.attn_v.matvec(normed_p.data());
+        if let Some(bias) = &layer.attn_k_bias {
+            tensor::add_in_place(k_p.data_mut(), bias.data());
+        }
+        if let Some(bias) = &layer.attn_v_bias {
+            tensor::add_in_place(v_p.data_mut(), bias.data());
+        }
         k_cache.push(tensor::rope(
             &k_p,
             p,
@@ -138,8 +185,9 @@ fn attention(
     v_cache.push(v_cur);
 
     let seq_len = k_cache.len();
-    let scale = 1.0 / (head_dim as f32).sqrt();
-    let mut attn_output = vec![0.0f32; embed_dim];
+    let scale = config.query_pre_attn_scalar.unwrap_or(1.0 / (head_dim as f32).sqrt());
+    let q_dim = n_heads * head_dim;
+    let mut attn_output = vec![0.0f32; q_dim];
 
     for h in 0..n_heads {
         let kv_h = h / kv_group_size;
@@ -148,7 +196,11 @@ fn attention(
         let mut scores = vec![0.0f32; seq_len];
         for (s, k_pos) in k_cache.iter().enumerate() {
             let k_head = &k_pos.data()[kv_h * head_dim..(kv_h + 1) * head_dim];
-            scores[s] = q_head.iter().zip(k_head).map(|(a, b)| a * b).sum::<f32>() * scale;
+            let mut dot = q_head.iter().zip(k_head).map(|(a, b)| a * b).sum::<f32>() * scale;
+            if let Some(cap) = config.attn_logit_softcapping {
+                dot = cap * (dot / cap).tanh();
+            }
+            scores[s] = dot;
         }
         let scores_t = Tensor::from_vec(scores, &[seq_len]);
         let attn_weights = tensor::softmax(&scores_t);
@@ -161,7 +213,7 @@ fn attention(
         }
     }
 
-    let attn_vec = Tensor::from_vec(attn_output, &[embed_dim]);
+    let attn_vec = Tensor::from_vec(attn_output, &[q_dim]);
     layer.attn_output.matvec(attn_vec.data())
 }
 
@@ -184,13 +236,14 @@ fn attn_heads_cpu(
     kv_group_size: usize,
     head_dim: usize,
     scale: f32,
+    softcap: Option<f32>,
     out: &mut [f32],
 ) {
     // Tiled online softmax — O(1) extra memory per head.
     for h in 0..n_heads {
         let kv_h = h / kv_group_size;
         let q_offset = h * head_dim;
-        tensor::flash_attn_1d(
+        tensor::flash_attn_1d_ext(
             &q_all[q_offset..q_offset + head_dim],
             cache,
             layer_idx,
@@ -199,17 +252,19 @@ fn attn_heads_cpu(
             attend_len,
             head_dim,
             scale,
+            softcap,
             &mut out[q_offset..q_offset + head_dim],
         );
     }
 }
 
-/// SwiGLU feed-forward: `down(silu(gate(x)) * up(x))`.
+/// Feed-forward network (SwiGLU for standard architectures, GeGLU for Gemma).
 fn feed_forward(
     x: &Tensor,
     layer: &LayerWeights,
     lora: Option<&LoraLayerAdapters>,
     gpu: &mut Option<&mut GpuBackend>,
+    is_gemma: bool,
 ) -> Tensor {
     let mut gate = matvec_maybe_gpu(&layer.ffn_gate, x.data(), reborrow(gpu));
     let mut up = matvec_maybe_gpu(&layer.ffn_up, x.data(), reborrow(gpu));
@@ -221,10 +276,27 @@ fn feed_forward(
             a.apply(x.data(), up.data_mut());
         }
     }
+    let act = if is_gemma {
+        tensor::gelu(&gate)
+    } else {
+        #[cfg(feature = "vulkan")]
+        {
+            silu_mul_maybe_gpu(&gate, &up, gpu.as_deref())
+        }
+        #[cfg(not(feature = "vulkan"))]
+        {
+            tensor::silu(&gate)
+        }
+    };
     #[cfg(feature = "vulkan")]
-    let hidden = silu_mul_maybe_gpu(&gate, &up, gpu.as_deref());
+    let hidden = if is_gemma {
+        tensor::mul(&act, &up)
+    } else {
+        act
+    };
     #[cfg(not(feature = "vulkan"))]
-    let hidden = tensor::mul(&tensor::silu(&gate), &up);
+    let hidden = tensor::mul(&act, &up);
+
     let mut out = matvec_maybe_gpu(&layer.ffn_down, hidden.data(), reborrow(gpu));
     if let Some(ll) = lora {
         if let Some(a) = &ll.ffn_down {
@@ -269,28 +341,35 @@ pub fn embed_batch(
 
 /// Compute a text embedding by mean-pooling the final hidden states.
 pub fn embed(weights: &TransformerWeights, config: &ModelConfig, token_ids: &[u32]) -> Vec<f32> {
+    let is_gemma = config.is_gemma();
     let n_tokens = token_ids.len();
     let embed_dim = config.embedding_length as usize;
     let mut hidden_states: Vec<Tensor> = token_ids
         .iter()
-        .map(|&id| weights.token_embedding.row_as_f32(id as usize))
+        .map(|&id| get_embedding(weights, config, id))
         .collect();
     for layer in weights.layers.iter() {
         let mut new_hs = Vec::with_capacity(n_tokens);
         for pos in 0..n_tokens {
             let normed =
-                tensor::rms_norm(&hidden_states[pos], &layer.attn_norm, config.rms_norm_eps);
-            let attn_out = attention(&normed, &hidden_states, layer, config, pos);
+                norm(&hidden_states[pos], &layer.attn_norm, config.rms_norm_eps, is_gemma);
+            let mut attn_out = attention(&normed, &hidden_states, layer, config, pos);
+            if let Some(post_norm) = &layer.post_attn_norm {
+                attn_out = norm(&attn_out, post_norm, config.rms_norm_eps, is_gemma);
+            }
             let after_attn = tensor::add(&hidden_states[pos], &attn_out);
-            let normed_ffn = tensor::rms_norm(&after_attn, &layer.ffn_norm, config.rms_norm_eps);
-            let ffn_out = feed_forward(&normed_ffn, layer, None, &mut None);
+            let normed_ffn = norm(&after_attn, &layer.ffn_norm, config.rms_norm_eps, is_gemma);
+            let mut ffn_out = feed_forward(&normed_ffn, layer, None, &mut None, is_gemma);
+            if let Some(post_norm) = &layer.post_ffn_norm {
+                ffn_out = norm(&ffn_out, post_norm, config.rms_norm_eps, is_gemma);
+            }
             new_hs.push(tensor::add(&after_attn, &ffn_out));
         }
         hidden_states = new_hs;
     }
     let mut embedding = vec![0.0f32; embed_dim];
     for hidden in &hidden_states {
-        let normed = tensor::rms_norm(hidden, &weights.output_norm, config.rms_norm_eps);
+        let normed = norm(hidden, &weights.output_norm, config.rms_norm_eps, is_gemma);
         for (acc, &v) in embedding.iter_mut().zip(normed.data()) {
             *acc += v;
         }
@@ -362,7 +441,8 @@ pub fn forward_one_lora(
     gpu: &mut Option<&mut GpuBackend>,
     lora: Option<&LoraWeights>,
 ) -> Tensor {
-    let mut hidden = weights.token_embedding.row_as_f32(token_id as usize);
+    let is_gemma = config.is_gemma();
+    let mut hidden = get_embedding(weights, config, token_id);
 
     for (layer_idx, layer) in weights.layers.iter().enumerate() {
         let effective_lora = lora.or(weights.lora.as_ref());
@@ -375,10 +455,13 @@ pub fn forward_one_lora(
             gpu.as_deref(),
         );
         #[cfg(not(feature = "vulkan"))]
-        let normed = tensor::rms_norm(&hidden, &layer.attn_norm, config.rms_norm_eps);
-        let attn_out = attention_cached(
+        let normed = norm(&hidden, &layer.attn_norm, config.rms_norm_eps, is_gemma);
+        let mut attn_out = attention_cached(
             &normed, layer, lora_layer, config, pos, layer_idx, cache, gpu,
         );
+        if let Some(post_norm) = &layer.post_attn_norm {
+            attn_out = norm(&attn_out, post_norm, config.rms_norm_eps, is_gemma);
+        }
         #[cfg(feature = "vulkan")]
         let after_attn = add_maybe_gpu(&hidden, &attn_out, gpu.as_deref());
         #[cfg(not(feature = "vulkan"))]
@@ -391,8 +474,11 @@ pub fn forward_one_lora(
             gpu.as_deref(),
         );
         #[cfg(not(feature = "vulkan"))]
-        let normed_ffn = tensor::rms_norm(&after_attn, &layer.ffn_norm, config.rms_norm_eps);
-        let ffn_out = feed_forward(&normed_ffn, layer, lora_layer, gpu);
+        let normed_ffn = norm(&after_attn, &layer.ffn_norm, config.rms_norm_eps, is_gemma);
+        let mut ffn_out = feed_forward(&normed_ffn, layer, lora_layer, gpu, is_gemma);
+        if let Some(post_norm) = &layer.post_ffn_norm {
+            ffn_out = norm(&ffn_out, post_norm, config.rms_norm_eps, is_gemma);
+        }
         #[cfg(feature = "vulkan")]
         {
             hidden = add_maybe_gpu(&after_attn, &ffn_out, gpu.as_deref());
@@ -412,8 +498,12 @@ pub fn forward_one_lora(
         gpu.as_deref(),
     );
     #[cfg(not(feature = "vulkan"))]
-    let normed = tensor::rms_norm(&hidden, &weights.output_norm, config.rms_norm_eps);
-    matvec_maybe_gpu(&weights.output, normed.data(), reborrow(gpu))
+    let normed = norm(&hidden, &weights.output_norm, config.rms_norm_eps, is_gemma);
+    let mut logits = matvec_maybe_gpu(&weights.output, normed.data(), reborrow(gpu));
+    if let Some(cap) = config.final_logit_softcapping {
+        tensor::logit_softcap_in_place(logits.data_mut(), cap);
+    }
+    logits
 }
 
 fn attention_cached(
@@ -426,10 +516,10 @@ fn attention_cached(
     cache: &mut dyn KvStore,
     gpu: &mut Option<&mut GpuBackend>,
 ) -> Tensor {
-    let embed_dim = config.embedding_length as usize;
     let n_heads = config.head_count as usize;
     let n_kv_heads = config.head_count_kv as usize;
     let head_dim = config.head_dim() as usize;
+    let q_dim = n_heads * head_dim;
     let kv_group_size = n_heads / n_kv_heads;
     let freq_base = config.rope_freq_base.unwrap_or(10000.0);
     let rope_scaling = config.rope_scaling_factor.unwrap_or(1.0);
@@ -441,6 +531,15 @@ fn attention_cached(
     let mut q_all = matvec_maybe_gpu(&layer.attn_q, x.data(), reborrow(gpu));
     let mut k_cur = matvec_maybe_gpu(&layer.attn_k, x.data(), reborrow(gpu));
     let mut v_cur = matvec_maybe_gpu(&layer.attn_v, x.data(), reborrow(gpu));
+    if let Some(bias) = &layer.attn_q_bias {
+        tensor::add_in_place(q_all.data_mut(), bias.data());
+    }
+    if let Some(bias) = &layer.attn_k_bias {
+        tensor::add_in_place(k_cur.data_mut(), bias.data());
+    }
+    if let Some(bias) = &layer.attn_v_bias {
+        tensor::add_in_place(v_cur.data_mut(), bias.data());
+    }
     if let Some(ll) = lora {
         if let Some(a) = &ll.attn_q {
             a.apply(x.data(), q_all.data_mut());
@@ -457,28 +556,21 @@ fn attention_cached(
 
     cache.write(layer_idx, pos, k_cur.data(), v_cur.data());
 
-    let window_start = config
-        .sliding_window
-        .map(|w| (pos as i64 - w as i64 + 1).max(0) as usize)
-        .unwrap_or(0);
+    let window_start = if config.sliding_window_alternating && !layer_idx.is_multiple_of(2) {
+        0 // Full context on odd layers (Gemma 2)
+    } else {
+        config
+            .sliding_window
+            .map(|w| (pos as i64 - w as i64 + 1).max(0) as usize)
+            .unwrap_or(0)
+    };
     let attend_len = pos + 1 - window_start;
-    let scale = 1.0 / (head_dim as f32).sqrt();
-    let mut attn_output = vec![0.0f32; embed_dim];
+    let scale = config.query_pre_attn_scalar.unwrap_or(1.0 / (head_dim as f32).sqrt());
+    let mut attn_output = vec![0.0f32; q_dim];
 
     let cache_ro: &dyn KvStore = &*cache;
 
     // ── GPU attention path ──────────────────────────────────────────────────
-    // Two sub-paths:
-    //
-    // 1. GPU-resident (GpuKvCache): K/V are already in a GPU buffer; bind
-    //    them directly.  Only the new token's slice was uploaded this step.
-    //    This is the efficient path: O(head_dim) CPU→GPU per decode step.
-    //
-    // 2. CPU-cache (KvCache / KvCacheQ8): extract the full K/V window into
-    //    flat CPU buffers, then upload to GPU for the attention dispatch.
-    //    O(seq_len * head_dim) upload per decode step (existing behaviour).
-    //
-    // Falls back to CPU flash attention if GPU is unavailable or seq_len > 4096.
     #[cfg(feature = "vulkan")]
     let gpu_attn: Option<Tensor> = {
         if let Some(ref mut g) = *gpu {
@@ -497,7 +589,7 @@ fn attention_cached(
                         scale,
                     )
                     .ok()
-                    .map(|data| Tensor::from_vec(data, &[embed_dim]))
+                    .map(|data| Tensor::from_vec(data, &[q_dim]))
                 } else {
                     // Path 2: CPU cache — copy full window to GPU, then dispatch.
                     let kv_stride = n_kv_heads * head_dim;
@@ -533,7 +625,7 @@ fn attention_cached(
                         scale,
                     )
                     .ok()
-                    .map(|data| Tensor::from_vec(data, &[embed_dim]))
+                    .map(|data| Tensor::from_vec(data, &[q_dim]))
                 }
             } else {
                 None
@@ -558,9 +650,10 @@ fn attention_cached(
             kv_group_size,
             head_dim,
             scale,
+            config.attn_logit_softcapping,
             &mut attn_output,
         );
-        Tensor::from_vec(attn_output, &[embed_dim])
+        Tensor::from_vec(attn_output, &[q_dim])
     };
     let mut out = matvec_maybe_gpu(&layer.attn_output, attn_vec.data(), reborrow(gpu));
     if let Some(ll) = lora {
@@ -637,10 +730,12 @@ fn forward_prefill_inner(
         return vec![];
     }
 
+    let is_gemma = config.is_gemma();
     let embed_dim = config.embedding_length as usize;
     let n_heads = config.head_count as usize;
     let n_kv_heads = config.head_count_kv as usize;
     let head_dim = config.head_dim() as usize;
+    let q_dim = n_heads * head_dim;
     let kv_group = n_heads / n_kv_heads;
     let freq_base = config.rope_freq_base.unwrap_or(10000.0);
     let rope_scale = config.rope_scaling_factor.unwrap_or(1.0);
@@ -648,7 +743,7 @@ fn forward_prefill_inner(
         .partial_rotary_factor
         .map(|f| (head_dim as f32 * f) as usize & !1)
         .unwrap_or(head_dim);
-    let scale = 1.0 / (head_dim as f32).sqrt();
+    let scale = config.query_pre_attn_scalar.unwrap_or(1.0 / (head_dim as f32).sqrt());
 
     // Use sequential path when GPU is active (GPU parallelism replaces rayon)
     // or when rayon is not available (e.g. wasm32 builds).
@@ -660,13 +755,7 @@ fn forward_prefill_inner(
     // 1. Embed all tokens
     let mut hidden: Vec<Vec<f32>> = token_ids
         .iter()
-        .map(|&id| {
-            weights
-                .token_embedding
-                .row_as_f32(id as usize)
-                .data()
-                .to_vec()
-        })
+        .map(|&id| get_embedding(weights, config, id).data().to_vec())
         .collect();
 
     // 2. Transformer layers
@@ -691,10 +780,19 @@ fn forward_prefill_inner(
                         gpu.as_deref(),
                     );
                     #[cfg(not(feature = "vulkan"))]
-                    let normed = tensor::rms_norm(&h_t, &layer.attn_norm, config.rms_norm_eps);
+                    let normed = norm(&h_t, &layer.attn_norm, config.rms_norm_eps, is_gemma);
                     let mut q = matvec_maybe_gpu(&layer.attn_q, normed.data(), reborrow(gpu));
                     let mut k = matvec_maybe_gpu(&layer.attn_k, normed.data(), reborrow(gpu));
                     let mut v = matvec_maybe_gpu(&layer.attn_v, normed.data(), reborrow(gpu));
+                    if let Some(bias) = &layer.attn_q_bias {
+                        tensor::add_in_place(q.data_mut(), bias.data());
+                    }
+                    if let Some(bias) = &layer.attn_k_bias {
+                        tensor::add_in_place(k.data_mut(), bias.data());
+                    }
+                    if let Some(bias) = &layer.attn_v_bias {
+                        tensor::add_in_place(v.data_mut(), bias.data());
+                    }
                     if let Some(ll) = lora_layer {
                         if let Some(a) = &ll.attn_q {
                             a.apply(normed.data(), q.data_mut());
@@ -720,10 +818,19 @@ fn forward_prefill_inner(
                     .map(|(lp, h)| {
                         let abs = pos_offset + lp;
                         let h_t = Tensor::from_vec(h.clone(), &[embed_dim]);
-                        let normed = tensor::rms_norm(&h_t, &layer.attn_norm, config.rms_norm_eps);
+                        let normed = norm(&h_t, &layer.attn_norm, config.rms_norm_eps, is_gemma);
                         let mut q = layer.attn_q.matvec(normed.data());
                         let mut k = layer.attn_k.matvec(normed.data());
                         let mut v = layer.attn_v.matvec(normed.data());
+                        if let Some(bias) = &layer.attn_q_bias {
+                            tensor::add_in_place(q.data_mut(), bias.data());
+                        }
+                        if let Some(bias) = &layer.attn_k_bias {
+                            tensor::add_in_place(k.data_mut(), bias.data());
+                        }
+                        if let Some(bias) = &layer.attn_v_bias {
+                            tensor::add_in_place(v.data_mut(), bias.data());
+                        }
                         if let Some(ll) = lora_layer {
                             if let Some(a) = &ll.attn_q {
                                 a.apply(normed.data(), q.data_mut());
@@ -756,16 +863,20 @@ fn forward_prefill_inner(
             (0..seq_len)
                 .map(|lp| {
                     let abs = pos_offset + lp;
-                    let window = config
-                        .sliding_window
-                        .map(|w| (abs as i64 - w as i64 + 1).max(0) as usize)
-                        .unwrap_or(0);
+                    let window = if config.sliding_window_alternating && !layer_idx.is_multiple_of(2) {
+                        0
+                    } else {
+                        config
+                            .sliding_window
+                            .map(|w| (abs as i64 - w as i64 + 1).max(0) as usize)
+                            .unwrap_or(0)
+                    };
                     let attend_len = abs + 1 - window;
-                    let mut out = vec![0.0f32; embed_dim];
+                    let mut out = vec![0.0f32; q_dim];
                     for h in 0..n_heads {
                         let kv_h = h / kv_group;
                         let q_off = h * head_dim;
-                        tensor::flash_attn_1d(
+                        tensor::flash_attn_1d_ext(
                             &qkv[lp].0[q_off..q_off + head_dim],
                             cache_ro,
                             layer_idx,
@@ -774,16 +885,20 @@ fn forward_prefill_inner(
                             attend_len,
                             head_dim,
                             scale,
+                            config.attn_logit_softcapping,
                             &mut out[q_off..q_off + head_dim],
                         );
                     }
-                    let attn_vec = Tensor::from_vec(out, &[embed_dim]);
+                    let attn_vec = Tensor::from_vec(out, &[q_dim]);
                     let mut proj =
                         matvec_maybe_gpu(&layer.attn_output, attn_vec.data(), reborrow(gpu));
                     if let Some(ll) = lora_layer {
                         if let Some(a) = &ll.attn_output {
                             a.apply(attn_vec.data(), proj.data_mut());
                         }
+                    }
+                    if let Some(post_norm) = &layer.post_attn_norm {
+                        proj = norm(&proj, post_norm, config.rms_norm_eps, is_gemma);
                     }
                     proj.data().to_vec()
                 })
@@ -795,16 +910,20 @@ fn forward_prefill_inner(
                     .into_par_iter()
                     .map(|lp| {
                         let abs = pos_offset + lp;
-                        let window = config
-                            .sliding_window
-                            .map(|w| (abs as i64 - w as i64 + 1).max(0) as usize)
-                            .unwrap_or(0);
+                        let window = if config.sliding_window_alternating && !layer_idx.is_multiple_of(2) {
+                            0
+                        } else {
+                            config
+                                .sliding_window
+                                .map(|w| (abs as i64 - w as i64 + 1).max(0) as usize)
+                                .unwrap_or(0)
+                        };
                         let attend_len = abs + 1 - window;
-                        let mut out = vec![0.0f32; embed_dim];
+                        let mut out = vec![0.0f32; q_dim];
                         for h in 0..n_heads {
                             let kv_h = h / kv_group;
                             let q_off = h * head_dim;
-                            tensor::flash_attn_1d(
+                            tensor::flash_attn_1d_ext(
                                 &qkv[lp].0[q_off..q_off + head_dim],
                                 cache_ro,
                                 layer_idx,
@@ -813,15 +932,19 @@ fn forward_prefill_inner(
                                 attend_len,
                                 head_dim,
                                 scale,
+                                config.attn_logit_softcapping,
                                 &mut out[q_off..q_off + head_dim],
                             );
                         }
-                        let attn_vec = Tensor::from_vec(out, &[embed_dim]);
+                        let attn_vec = Tensor::from_vec(out, &[q_dim]);
                         let mut proj = layer.attn_output.matvec(attn_vec.data());
                         if let Some(ll) = lora_layer {
                             if let Some(a) = &ll.attn_output {
                                 a.apply(attn_vec.data(), proj.data_mut());
                             }
+                        }
+                        if let Some(post_norm) = &layer.post_attn_norm {
+                            proj = norm(&proj, post_norm, config.rms_norm_eps, is_gemma);
                         }
                         proj.data().to_vec()
                     })
@@ -851,8 +974,11 @@ fn forward_prefill_inner(
                         gpu.as_deref(),
                     );
                     #[cfg(not(feature = "vulkan"))]
-                    let nf = tensor::rms_norm(&after_attn, &layer.ffn_norm, config.rms_norm_eps);
-                    let ffn_out = feed_forward(&nf, layer, lora_layer, gpu);
+                    let nf = norm(&after_attn, &layer.ffn_norm, config.rms_norm_eps, is_gemma);
+                    let mut ffn_out = feed_forward(&nf, layer, lora_layer, gpu, is_gemma);
+                    if let Some(post_norm) = &layer.post_ffn_norm {
+                        ffn_out = norm(&ffn_out, post_norm, config.rms_norm_eps, is_gemma);
+                    }
                     #[cfg(feature = "vulkan")]
                     {
                         add_maybe_gpu(&after_attn, &ffn_out, gpu.as_deref())
@@ -876,8 +1002,11 @@ fn forward_prefill_inner(
                         let a_t = Tensor::from_vec(ao, &[embed_dim]);
                         let after_attn = tensor::add(&h_t, &a_t);
                         let nf =
-                            tensor::rms_norm(&after_attn, &layer.ffn_norm, config.rms_norm_eps);
-                        let ffn_out = feed_forward(&nf, layer, lora_layer, &mut None);
+                            norm(&after_attn, &layer.ffn_norm, config.rms_norm_eps, is_gemma);
+                        let mut ffn_out = feed_forward(&nf, layer, lora_layer, &mut None, is_gemma);
+                        if let Some(post_norm) = &layer.post_ffn_norm {
+                            ffn_out = norm(&ffn_out, post_norm, config.rms_norm_eps, is_gemma);
+                        }
                         tensor::add(&after_attn, &ffn_out).data().to_vec()
                     })
                     .collect();
@@ -905,8 +1034,12 @@ fn forward_prefill_inner(
                 gpu.as_deref(),
             );
             #[cfg(not(feature = "vulkan"))]
-            let normed = tensor::rms_norm(&h_t, &weights.output_norm, config.rms_norm_eps);
-            matvec_maybe_gpu(&weights.output, normed.data(), reborrow(gpu))
+            let normed = norm(&h_t, &weights.output_norm, config.rms_norm_eps, is_gemma);
+            let mut logits = matvec_maybe_gpu(&weights.output, normed.data(), reborrow(gpu));
+            if let Some(cap) = config.final_logit_softcapping {
+                tensor::logit_softcap_in_place(logits.data_mut(), cap);
+            }
+            logits
         })
         .collect()
 }
@@ -1234,10 +1367,11 @@ pub fn forward_batch_lora(
 
     // ── CPU batch path ─────────────────────────────────────────────────────
 
-    let embed_dim = config.embedding_length as usize;
+    let is_gemma = config.is_gemma();
     let n_heads = config.head_count as usize;
     let n_kv_heads = config.head_count_kv as usize;
     let head_dim = config.head_dim() as usize;
+    let q_dim = n_heads * head_dim;
     let kv_group_size = n_heads / n_kv_heads;
     let freq_base = config.rope_freq_base.unwrap_or(10000.0);
     let rope_scaling = config.rope_scaling_factor.unwrap_or(1.0);
@@ -1245,13 +1379,13 @@ pub fn forward_batch_lora(
         .partial_rotary_factor
         .map(|f| (head_dim as f32 * f) as usize & !1)
         .unwrap_or(head_dim);
-    let scale = 1.0 / (head_dim as f32).sqrt();
+    let scale = config.query_pre_attn_scalar.unwrap_or(1.0 / (head_dim as f32).sqrt());
 
     // Interleaved matvec output, reused by every batched matvec in the step.
     let mut scratch: Vec<f32> = Vec::new();
     let mut hidden: Vec<Tensor> = tokens
         .iter()
-        .map(|&t| weights.token_embedding.row_as_f32(t as usize))
+        .map(|&t| get_embedding(weights, config, t))
         .collect();
 
     for (layer_idx, layer) in weights.layers.iter().enumerate() {
@@ -1266,12 +1400,27 @@ pub fn forward_batch_lora(
         // ── Attention ──────────────────────────────────────────────────────
         let normed: Vec<Tensor> = hidden
             .iter()
-            .map(|h| tensor::rms_norm(h, &layer.attn_norm, config.rms_norm_eps))
+            .map(|h| norm(h, &layer.attn_norm, config.rms_norm_eps, is_gemma))
             .collect();
         let inputs = data_refs(&normed);
         let mut q = batch_matvec(&layer.attn_q, &inputs, &mut scratch);
         let mut k = batch_matvec(&layer.attn_k, &inputs, &mut scratch);
         let mut v = batch_matvec(&layer.attn_v, &inputs, &mut scratch);
+        if let Some(bias) = &layer.attn_q_bias {
+            for q_s in q.iter_mut() {
+                tensor::add_in_place(q_s.data_mut(), bias.data());
+            }
+        }
+        if let Some(bias) = &layer.attn_k_bias {
+            for k_s in k.iter_mut() {
+                tensor::add_in_place(k_s.data_mut(), bias.data());
+            }
+        }
+        if let Some(bias) = &layer.attn_v_bias {
+            for v_s in v.iter_mut() {
+                tensor::add_in_place(v_s.data_mut(), bias.data());
+            }
+        }
         for (s, ll) in lora_layers.iter().enumerate() {
             if let Some(ll) = ll {
                 if let Some(a) = &ll.attn_q {
@@ -1300,11 +1449,15 @@ pub fn forward_batch_lora(
             let read_only: Vec<&dyn KvStore> = caches.iter().map(|c| &**c).collect();
             let attend = |s: usize| {
                 let pos = positions[s];
-                let window_start = config
-                    .sliding_window
-                    .map(|w| (pos as i64 - w as i64 + 1).max(0) as usize)
-                    .unwrap_or(0);
-                let mut out = vec![0.0f32; embed_dim];
+                let window_start = if config.sliding_window_alternating && !layer_idx.is_multiple_of(2) {
+                    0
+                } else {
+                    config
+                        .sliding_window
+                        .map(|w| (pos as i64 - w as i64 + 1).max(0) as usize)
+                        .unwrap_or(0)
+                };
+                let mut out = vec![0.0f32; q_dim];
                 attn_heads_cpu(
                     q[s].data(),
                     read_only[s],
@@ -1315,9 +1468,10 @@ pub fn forward_batch_lora(
                     kv_group_size,
                     head_dim,
                     scale,
+                    config.attn_logit_softcapping,
                     &mut out,
                 );
-                Tensor::from_vec(out, &[embed_dim])
+                Tensor::from_vec(out, &[q_dim])
             };
             #[cfg(feature = "rayon")]
             {
@@ -1336,6 +1490,11 @@ pub fn forward_batch_lora(
                 a.apply(attn_vecs[s].data(), proj[s].data_mut());
             }
         }
+        if let Some(post_norm) = &layer.post_attn_norm {
+            for p in proj.iter_mut() {
+                *p = norm(p, post_norm, config.rms_norm_eps, is_gemma);
+            }
+        }
         let after_attn: Vec<Tensor> = hidden
             .iter()
             .zip(&proj)
@@ -1345,7 +1504,7 @@ pub fn forward_batch_lora(
         // ── Feed-forward ───────────────────────────────────────────────────
         let normed_ffn: Vec<Tensor> = after_attn
             .iter()
-            .map(|h| tensor::rms_norm(h, &layer.ffn_norm, config.rms_norm_eps))
+            .map(|h| norm(h, &layer.ffn_norm, config.rms_norm_eps, is_gemma))
             .collect();
         let ffn_inputs = data_refs(&normed_ffn);
         let mut gate = batch_matvec(&layer.ffn_gate, &ffn_inputs, &mut scratch);
@@ -1363,13 +1522,25 @@ pub fn forward_batch_lora(
         let activated: Vec<Tensor> = gate
             .iter()
             .zip(&up)
-            .map(|(g, u)| tensor::mul(&tensor::silu(g), u))
+            .map(|(g, u)| {
+                let act = if is_gemma {
+                    tensor::gelu(g)
+                } else {
+                    tensor::silu(g)
+                };
+                tensor::mul(&act, u)
+            })
             .collect();
         let down_inputs = data_refs(&activated);
         let mut down = batch_matvec(&layer.ffn_down, &down_inputs, &mut scratch);
         for (s, ll) in lora_layers.iter().enumerate() {
             if let Some(a) = ll.and_then(|l| l.ffn_down.as_ref()) {
                 a.apply(activated[s].data(), down[s].data_mut());
+            }
+        }
+        if let Some(post_norm) = &layer.post_ffn_norm {
+            for d in down.iter_mut() {
+                *d = norm(d, post_norm, config.rms_norm_eps, is_gemma);
             }
         }
         hidden = after_attn
@@ -1387,10 +1558,16 @@ pub fn forward_batch_lora(
     // it is also where batching saves the most.
     let normed: Vec<Tensor> = hidden
         .iter()
-        .map(|h| tensor::rms_norm(h, &weights.output_norm, config.rms_norm_eps))
+        .map(|h| norm(h, &weights.output_norm, config.rms_norm_eps, is_gemma))
         .collect();
     let inputs = data_refs(&normed);
-    batch_matvec(&weights.output, &inputs, &mut scratch)
+    let mut logits = batch_matvec(&weights.output, &inputs, &mut scratch);
+    if let Some(cap) = config.final_logit_softcapping {
+        for logit in logits.iter_mut() {
+            tensor::logit_softcap_in_place(logit.data_mut(), cap);
+        }
+    }
+    logits
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -1417,6 +1594,11 @@ pub(crate) fn make_tiny_weights() -> (TransformerWeights, ModelConfig) {
         sliding_window: None,
         rope_scaling_factor: None,
         partial_rotary_factor: None,
+        head_dim_override: None,
+        attn_logit_softcapping: None,
+        final_logit_softcapping: None,
+        query_pre_attn_scalar: None,
+        sliding_window_alternating: false,
     };
     let weights = TransformerWeights {
         token_embedding: QuantizedTensor::from_f32(
@@ -1427,6 +1609,8 @@ pub(crate) fn make_tiny_weights() -> (TransformerWeights, ModelConfig) {
         layers: vec![LayerWeights {
             attn_norm: Tensor::from_vec(vec![1.0; 4], &[4]),
             ffn_norm: Tensor::from_vec(vec![1.0; 4], &[4]),
+            post_attn_norm: None,
+            post_ffn_norm: None,
             attn_q: QuantizedTensor::from_f32(
                 &(0..16).map(|i| i as f32 * 0.05 - 0.4).collect::<Vec<_>>(),
                 4,
@@ -1447,6 +1631,9 @@ pub(crate) fn make_tiny_weights() -> (TransformerWeights, ModelConfig) {
                 4,
                 4,
             ),
+            attn_q_bias: None,
+            attn_k_bias: None,
+            attn_v_bias: None,
             ffn_gate: QuantizedTensor::from_f32(
                 &(0..32).map(|i| i as f32 * 0.02 - 0.3).collect::<Vec<_>>(),
                 8,
@@ -1680,16 +1867,21 @@ mod tests {
         let layer = LayerWeights {
             attn_norm: Tensor::zeros(&[4]),
             ffn_norm: Tensor::zeros(&[4]),
-            attn_q: QuantizedTensor::from_f32(&vec![0.0f32; 16], 4, 4),
-            attn_k: QuantizedTensor::from_f32(&vec![0.0f32; 16], 4, 4),
-            attn_v: QuantizedTensor::from_f32(&vec![0.0f32; 16], 4, 4),
-            attn_output: QuantizedTensor::from_f32(&vec![0.0f32; 16], 4, 4),
-            ffn_gate: QuantizedTensor::from_f32(&vec![0.0f32; 32], 8, 4),
-            ffn_up: QuantizedTensor::from_f32(&vec![0.0f32; 32], 8, 4),
-            ffn_down: QuantizedTensor::from_f32(&vec![0.0f32; 32], 4, 8),
+            post_attn_norm: None,
+            post_ffn_norm: None,
+            attn_q: QuantizedTensor::from_f32(&[0.0f32; 16], 4, 4),
+            attn_k: QuantizedTensor::from_f32(&[0.0f32; 16], 4, 4),
+            attn_v: QuantizedTensor::from_f32(&[0.0f32; 16], 4, 4),
+            attn_output: QuantizedTensor::from_f32(&[0.0f32; 16], 4, 4),
+            attn_q_bias: None,
+            attn_k_bias: None,
+            attn_v_bias: None,
+            ffn_gate: QuantizedTensor::from_f32(&[0.0f32; 32], 8, 4),
+            ffn_up: QuantizedTensor::from_f32(&[0.0f32; 32], 8, 4),
+            ffn_down: QuantizedTensor::from_f32(&[0.0f32; 32], 4, 8),
         };
         let x = Tensor::from_vec(vec![1.0, 2.0, 3.0, 4.0], &[4]);
-        assert_eq!(feed_forward(&x, &layer, None, &mut None).shape(), &[4]);
+        assert_eq!(feed_forward(&x, &layer, None, &mut None, false).shape(), &[4]);
     }
 
     // ── Batched decode ───────────────────────────────────────────────────
@@ -1862,12 +2054,10 @@ mod tests {
             .map(|s| {
                 let (mut cache, mut logits) = prefill_for_test(&weights, &config, prompts[s]);
                 let mut produced = Vec::new();
-                let mut pos = prompts[s].len();
-                for _ in 0..steps {
+                for pos in (prompts[s].len()..).take(steps) {
                     let tok = argmax(&logits);
                     produced.push(tok);
                     logits = forward_one(&weights, &config, tok, pos, &mut cache, &mut None);
-                    pos += 1;
                 }
                 produced
             })
@@ -1952,6 +2142,11 @@ mod tests {
             sliding_window: None,
             rope_scaling_factor: None,
             partial_rotary_factor: None,
+            head_dim_override: None,
+            attn_logit_softcapping: None,
+            final_logit_softcapping: None,
+            query_pre_attn_scalar: None,
+            sliding_window_alternating: false,
         };
         let wave = |k: f32| move |r: usize, c: usize| ((r * 31 + c * 7) as f32 * 0.021).sin() * k;
         let weights = TransformerWeights {
@@ -1965,10 +2160,15 @@ mod tests {
                     (0..32).map(|i| 1.0 - i as f32 * 0.005).collect(),
                     &[32],
                 ),
+                post_attn_norm: None,
+                post_ffn_norm: None,
                 attn_q: q8_0_tensor(32, 32, wave(0.4)),
                 attn_k: q8_0_tensor(16, 32, wave(0.35)),
                 attn_v: q8_0_tensor(16, 32, wave(0.5)),
                 attn_output: q8_0_tensor(32, 32, wave(0.3)),
+                attn_q_bias: None,
+                attn_k_bias: None,
+                attn_v_bias: None,
                 ffn_gate: q8_0_tensor(64, 32, wave(0.25)),
                 ffn_up: q8_0_tensor(64, 32, wave(0.45)),
                 ffn_down: q8_0_tensor(32, 64, wave(0.2)),
@@ -2172,6 +2372,338 @@ mod tests {
                     "seq {seq_idx} index {i}: individual={a:.6}, batch={b:.6}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn test_gemma2_forward_features() {
+        let config = ModelConfig {
+            architecture: "gemma2".to_string(),
+            context_length: 32,
+            embedding_length: 4,
+            block_count: 2,
+            head_count: 2,
+            head_count_kv: 1,
+            vocab_size: 8,
+            feed_forward_length: Some(8),
+            rms_norm_eps: 1e-5,
+            rope_freq_base: Some(10000.0),
+            chat_template: None,
+            sliding_window: Some(2),
+            rope_scaling_factor: None,
+            partial_rotary_factor: None,
+            head_dim_override: Some(2),
+            attn_logit_softcapping: Some(10.0),
+            final_logit_softcapping: Some(15.0),
+            query_pre_attn_scalar: Some(1.0),
+            sliding_window_alternating: true,
+        };
+
+        let make_layer = || LayerWeights {
+            attn_norm: Tensor::from_vec(vec![1.0, 1.1, 0.9, 1.0], &[4]),
+            ffn_norm: Tensor::from_vec(vec![1.0, 0.9, 1.1, 1.0], &[4]),
+            post_attn_norm: Some(Tensor::from_vec(vec![1.05, 0.95, 1.0, 1.0], &[4])),
+            post_ffn_norm: Some(Tensor::from_vec(vec![0.95, 1.05, 1.0, 1.0], &[4])),
+            attn_q: QuantizedTensor::from_f32(
+                &(0..16).map(|i| i as f32 * 0.05 - 0.4).collect::<Vec<_>>(),
+                4,
+                4,
+            ),
+            attn_k: QuantizedTensor::from_f32(
+                &(0..8).map(|i| i as f32 * 0.1 - 0.3).collect::<Vec<_>>(),
+                2,
+                4,
+            ),
+            attn_v: QuantizedTensor::from_f32(
+                &(0..8).map(|i| i as f32 * 0.07 - 0.2).collect::<Vec<_>>(),
+                2,
+                4,
+            ),
+            attn_output: QuantizedTensor::from_f32(
+                &(0..16).map(|i| i as f32 * 0.03 - 0.2).collect::<Vec<_>>(),
+                4,
+                4,
+            ),
+            attn_q_bias: None,
+            attn_k_bias: None,
+            attn_v_bias: None,
+            ffn_gate: QuantizedTensor::from_f32(
+                &(0..32).map(|i| i as f32 * 0.02 - 0.3).collect::<Vec<_>>(),
+                8,
+                4,
+            ),
+            ffn_up: QuantizedTensor::from_f32(
+                &(0..32).map(|i| i as f32 * 0.015 - 0.2).collect::<Vec<_>>(),
+                8,
+                4,
+            ),
+            ffn_down: QuantizedTensor::from_f32(
+                &(0..32).map(|i| i as f32 * 0.025 - 0.4).collect::<Vec<_>>(),
+                4,
+                8,
+            ),
+        };
+
+        let weights = TransformerWeights {
+            token_embedding: QuantizedTensor::from_f32(
+                &(0..32).map(|i| i as f32 * 0.1).collect::<Vec<_>>(),
+                8,
+                4,
+            ),
+            layers: vec![make_layer(), make_layer()],
+            output_norm: Tensor::from_vec(vec![1.0; 4], &[4]),
+            output: QuantizedTensor::from_f32(
+                &(0..32).map(|i| i as f32 * 0.1 - 1.6).collect::<Vec<_>>(),
+                8,
+                4,
+            ),
+            lora: None,
+        };
+
+        let prompt = [1u32, 2, 3, 4];
+        let next = 5u32;
+        let mut cache = prefilled_cache(&weights, &config, &prompt);
+        let solo = forward_one(&weights, &config, next, prompt.len(), &mut cache, &mut None);
+
+        // Verify that logits are soft-capped (cannot exceed 15.0)
+        for &val in solo.data() {
+            assert!(val.abs() <= 15.0 + 1e-5, "val {val} exceeded softcap 15.0");
+        }
+
+        // Verify batched decode parity
+        let mut caches: Vec<KvCache> = vec![prefilled_cache(&weights, &config, &prompt)];
+        let mut cache_refs: Vec<&mut dyn KvStore> =
+            caches.iter_mut().map(|c| c as &mut dyn KvStore).collect();
+        let batched = forward_batch(
+            &weights,
+            &config,
+            &[next],
+            &[prompt.len()],
+            &mut cache_refs,
+            &mut None,
+        );
+        assert_same_logits(&solo, &batched[0], "gemma2 batch=1 parity");
+    }
+
+    #[test]
+    fn test_qwen2_forward_features() {
+        let config = ModelConfig {
+            architecture: "qwen2".to_string(),
+            context_length: 32,
+            embedding_length: 4,
+            block_count: 1,
+            head_count: 2,
+            head_count_kv: 1,
+            vocab_size: 8,
+            feed_forward_length: Some(8),
+            rms_norm_eps: 1e-5,
+            rope_freq_base: Some(10000.0),
+            chat_template: None,
+            sliding_window: None,
+            rope_scaling_factor: None,
+            partial_rotary_factor: None,
+            head_dim_override: None,
+            attn_logit_softcapping: None,
+            final_logit_softcapping: None,
+            query_pre_attn_scalar: None,
+            sliding_window_alternating: false,
+        };
+
+        let weights = TransformerWeights {
+            token_embedding: QuantizedTensor::from_f32(
+                &(0..32).map(|i| i as f32 * 0.1).collect::<Vec<_>>(),
+                8,
+                4,
+            ),
+            layers: vec![LayerWeights {
+                attn_norm: Tensor::from_vec(vec![1.0; 4], &[4]),
+                ffn_norm: Tensor::from_vec(vec![1.0; 4], &[4]),
+                post_attn_norm: None,
+                post_ffn_norm: None,
+                attn_q: QuantizedTensor::from_f32(
+                    &(0..16).map(|i| i as f32 * 0.05 - 0.4).collect::<Vec<_>>(),
+                    4,
+                    4,
+                ),
+                attn_k: QuantizedTensor::from_f32(
+                    &(0..8).map(|i| i as f32 * 0.1 - 0.3).collect::<Vec<_>>(),
+                    2,
+                    4,
+                ),
+                attn_v: QuantizedTensor::from_f32(
+                    &(0..8).map(|i| i as f32 * 0.07 - 0.2).collect::<Vec<_>>(),
+                    2,
+                    4,
+                ),
+                attn_output: QuantizedTensor::from_f32(
+                    &(0..16).map(|i| i as f32 * 0.03 - 0.2).collect::<Vec<_>>(),
+                    4,
+                    4,
+                ),
+                attn_q_bias: Some(Tensor::from_vec(vec![0.1, -0.1, 0.2, -0.2], &[4])),
+                attn_k_bias: Some(Tensor::from_vec(vec![0.05, -0.05], &[2])),
+                attn_v_bias: Some(Tensor::from_vec(vec![0.15, -0.15], &[2])),
+                ffn_gate: QuantizedTensor::from_f32(
+                    &(0..32).map(|i| i as f32 * 0.02 - 0.3).collect::<Vec<_>>(),
+                    8,
+                    4,
+                ),
+                ffn_up: QuantizedTensor::from_f32(
+                    &(0..32).map(|i| i as f32 * 0.015 - 0.2).collect::<Vec<_>>(),
+                    8,
+                    4,
+                ),
+                ffn_down: QuantizedTensor::from_f32(
+                    &(0..32).map(|i| i as f32 * 0.025 - 0.4).collect::<Vec<_>>(),
+                    4,
+                    8,
+                ),
+            }],
+            output_norm: Tensor::from_vec(vec![1.0; 4], &[4]),
+            output: QuantizedTensor::from_f32(
+                &(0..32).map(|i| i as f32 * 0.1 - 1.6).collect::<Vec<_>>(),
+                8,
+                4,
+            ),
+            lora: None,
+        };
+
+        let prompt = [1u32, 2, 3];
+        let next = 4u32;
+        let mut cache = prefilled_cache(&weights, &config, &prompt);
+        let solo = forward_one(&weights, &config, next, prompt.len(), &mut cache, &mut None);
+
+        let mut caches: Vec<KvCache> = vec![prefilled_cache(&weights, &config, &prompt)];
+        let mut cache_refs: Vec<&mut dyn KvStore> =
+            caches.iter_mut().map(|c| c as &mut dyn KvStore).collect();
+        let batched = forward_batch(
+            &weights,
+            &config,
+            &[next],
+            &[prompt.len()],
+            &mut cache_refs,
+            &mut None,
+        );
+        assert_same_logits(&solo, &batched[0], "qwen2 batch=1 parity");
+    }
+
+    #[test]
+    fn test_gemma2_head_dim_override_large_q_dim_no_panic() {
+        // Gemma-2-9B style shapes:
+        // embed_dim = 4, but head_count = 2, head_dim_override = 4 -> q_dim = 8 > embed_dim = 4.
+        let config = ModelConfig {
+            architecture: "gemma2".to_string(),
+            context_length: 32,
+            embedding_length: 4,
+            block_count: 1,
+            head_count: 2,
+            head_count_kv: 1,
+            vocab_size: 8,
+            feed_forward_length: Some(8),
+            rms_norm_eps: 1e-5,
+            rope_freq_base: Some(10000.0),
+            chat_template: None,
+            sliding_window: Some(16),
+            rope_scaling_factor: None,
+            partial_rotary_factor: None,
+            head_dim_override: Some(4),
+            attn_logit_softcapping: Some(50.0),
+            final_logit_softcapping: Some(30.0),
+            query_pre_attn_scalar: Some(1.0 / (4.0f32).sqrt()),
+            sliding_window_alternating: true,
+        };
+
+        let weights = TransformerWeights {
+            token_embedding: QuantizedTensor::from_f32(
+                &(0..32).map(|i| i as f32 * 0.1 - 1.5).collect::<Vec<_>>(),
+                8,
+                4,
+            ),
+            layers: vec![LayerWeights {
+                attn_norm: Tensor::from_vec(vec![0.0; 4], &[4]), // in Gemma, 1+0=1
+                ffn_norm: Tensor::from_vec(vec![0.0; 4], &[4]),
+                post_attn_norm: Some(Tensor::from_vec(vec![0.0; 4], &[4])),
+                post_ffn_norm: Some(Tensor::from_vec(vec![0.0; 4], &[4])),
+                // attn_q: out=q_dim(8), in=embed_dim(4)
+                attn_q: QuantizedTensor::from_f32(
+                    &(0..32).map(|i| i as f32 * 0.05 - 0.4).collect::<Vec<_>>(),
+                    8,
+                    4,
+                ),
+                // attn_k: out=kv_dim(4), in=embed_dim(4)
+                attn_k: QuantizedTensor::from_f32(
+                    &(0..16).map(|i| i as f32 * 0.1 - 0.3).collect::<Vec<_>>(),
+                    4,
+                    4,
+                ),
+                // attn_v: out=kv_dim(4), in=embed_dim(4)
+                attn_v: QuantizedTensor::from_f32(
+                    &(0..16).map(|i| i as f32 * 0.07 - 0.2).collect::<Vec<_>>(),
+                    4,
+                    4,
+                ),
+                // attn_output: out=embed_dim(4), in=q_dim(8)
+                attn_output: QuantizedTensor::from_f32(
+                    &(0..32).map(|i| i as f32 * 0.03 - 0.2).collect::<Vec<_>>(),
+                    4,
+                    8,
+                ),
+                attn_q_bias: None,
+                attn_k_bias: None,
+                attn_v_bias: None,
+                ffn_gate: QuantizedTensor::from_f32(
+                    &(0..32).map(|i| i as f32 * 0.02 - 0.3).collect::<Vec<_>>(),
+                    8,
+                    4,
+                ),
+                ffn_up: QuantizedTensor::from_f32(
+                    &(0..32).map(|i| i as f32 * 0.015 - 0.2).collect::<Vec<_>>(),
+                    8,
+                    4,
+                ),
+                ffn_down: QuantizedTensor::from_f32(
+                    &(0..32).map(|i| i as f32 * 0.025 - 0.4).collect::<Vec<_>>(),
+                    4,
+                    8,
+                ),
+            }],
+            output_norm: Tensor::from_vec(vec![0.0; 4], &[4]),
+            output: QuantizedTensor::from_f32(
+                &(0..32).map(|i| i as f32 * 0.1 - 1.6).collect::<Vec<_>>(),
+                8,
+                4,
+            ),
+            lora: None,
+        };
+
+        let prompt = [1u32, 2, 3];
+        let mut cache = KvCache::new(1, 32, 1, 4);
+        let prefill_logits = forward_prefill(&weights, &config, &prompt, &mut cache, 0, &mut None);
+        assert_eq!(prefill_logits.shape(), &[8]);
+        for v in prefill_logits.data() {
+            assert!(v.is_finite());
+        }
+
+        let decode_logits = forward_one(&weights, &config, 4, 3, &mut cache, &mut None);
+        assert_eq!(decode_logits.shape(), &[8]);
+        for v in decode_logits.data() {
+            assert!(v.is_finite());
+        }
+
+        let mut caches: Vec<KvCache> = vec![cache];
+        let mut cache_refs: Vec<&mut dyn KvStore> =
+            caches.iter_mut().map(|c| c as &mut dyn KvStore).collect();
+        let batch_logits = forward_batch(
+            &weights,
+            &config,
+            &[5],
+            &[4],
+            &mut cache_refs,
+            &mut None,
+        );
+        assert_eq!(batch_logits[0].shape(), &[8]);
+        for v in batch_logits[0].data() {
+            assert!(v.is_finite());
         }
     }
 }

@@ -437,7 +437,7 @@ mod tests {
         let mut rng = Xorshift64::new(12345);
         for _ in 0..10000 {
             let v = rng.next_f32();
-            assert!(v >= 0.0 && v < 1.0, "f32 out of range: {v}");
+            assert!((0.0..1.0).contains(&v), "f32 out of range: {v}");
         }
     }
 

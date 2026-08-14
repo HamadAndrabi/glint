@@ -551,7 +551,7 @@ fn inspect_model(path: &PathBuf, show_metadata: bool, show_tensors: bool) {
     }
     println!("\nTensors by type:");
     let mut types: Vec<_> = type_counts.into_iter().collect();
-    types.sort_by(|a, b| b.1 .1.cmp(&a.1 .1));
+    types.sort_by_key(|b| std::cmp::Reverse(b.1 .1));
     for (type_name, (count, bytes)) in types {
         println!(
             "  {type_name:>8}: {count:>4} tensors, {:.1} MB",
@@ -561,7 +561,7 @@ fn inspect_model(path: &PathBuf, show_metadata: bool, show_tensors: bool) {
 }
 
 /// `glint inspect` for a HuggingFace SafeTensors checkpoint.
-fn inspect_safetensors(path: &PathBuf, show_metadata: bool, show_tensors: bool) {
+fn inspect_safetensors(path: &Path, show_metadata: bool, show_tensors: bool) {
     println!("Loading SafeTensors model: {}", path.display());
     println!();
 
@@ -581,7 +581,7 @@ fn inspect_safetensors(path: &PathBuf, show_metadata: bool, show_tensors: bool) 
     // config.json sits next to the weights; show it when it is present and
     // parseable, but a bare `.safetensors` file is still inspectable.
     let root = if path.is_dir() {
-        path.clone()
+        path.to_path_buf()
     } else {
         path.parent().unwrap_or(Path::new(".")).to_path_buf()
     };
@@ -792,7 +792,7 @@ fn init_gpu(
 
 #[allow(clippy::too_many_arguments)]
 fn run_model(
-    path: &PathBuf,
+    path: &Path,
     prompt: &str,
     max_tokens: usize,
     temperature: f32,
@@ -900,7 +900,7 @@ fn run_model(
     println!("\n({n_gen} tokens in {secs:.2}s — {tok_per_sec:.1} tok/s)");
 }
 
-fn generate_tokens(path: &PathBuf, tokens_str: &str, max_tokens: usize) {
+fn generate_tokens(path: &Path, tokens_str: &str, max_tokens: usize) {
     let loaded = load_model(path);
     let (config, weights) = (loaded.config, loaded.weights);
     println!("Model: {} ({})", config.architecture, path.display());
@@ -977,7 +977,7 @@ fn summarize_messages(
 
 #[allow(clippy::too_many_arguments)]
 fn chat_model(
-    path: &PathBuf,
+    path: &Path,
     system_prompt: Option<&str>,
     max_tokens: usize,
     temperature: f32,
@@ -1145,7 +1145,7 @@ fn chat_model(
 
 #[cfg(feature = "server")]
 async fn serve_model(
-    path: &PathBuf,
+    path: &Path,
     host: &str,
     port: u16,
     use_gpu: bool,
@@ -1267,8 +1267,9 @@ async fn serve_model(
     glint::server::run_server(state, host, port).await;
 }
 
+#[allow(clippy::too_many_arguments)]
 fn bench_model(
-    path: &PathBuf,
+    path: &Path,
     mode: &str,
     prompt_len: usize,
     decode_tokens: usize,

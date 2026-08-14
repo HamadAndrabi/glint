@@ -21,13 +21,23 @@ pub struct ModelConfig {
     pub rope_freq_base: Option<f32>,
     /// Raw Jinja chat template from GGUF metadata (`tokenizer.chat_template`).
     pub chat_template: Option<String>,
-    /// Sliding window attention size (Mistral, some Qwen2 variants).
+    /// Sliding window attention size (Mistral, Gemma 2, some Qwen2 variants).
     /// When set, each token attends to at most this many past positions.
     pub sliding_window: Option<u32>,
     /// RoPE scaling factor for extended-context models (Phi-3, Qwen2-long).
     pub rope_scaling_factor: Option<f32>,
     /// Partial rotary factor — fraction of head_dim to apply RoPE to (Phi-3).
     pub partial_rotary_factor: Option<f32>,
+    /// Explicit head dimension override (e.g. Gemma 2).
+    pub head_dim_override: Option<u32>,
+    /// Attention score logit soft-capping (Gemma 2).
+    pub attn_logit_softcapping: Option<f32>,
+    /// Final logits soft-capping (Gemma 2).
+    pub final_logit_softcapping: Option<f32>,
+    /// Attention query pre-attention scaling (Gemma 2).
+    pub query_pre_attn_scalar: Option<f32>,
+    /// Whether sliding window attention alternates every layer (e.g. Gemma 2 even layers).
+    pub sliding_window_alternating: bool,
 }
 
 impl ModelConfig {
@@ -66,12 +76,24 @@ impl ModelConfig {
             .unwrap_or(0);
 
         let feed_forward_length = get_u32("feed_forward_length");
-        let rms_norm_eps = get_f32("attention.layer_norm_rms_epsilon").unwrap_or(1e-5);
+        let rms_norm_eps = get_f32("attention.layer_norm_rms_epsilon")
+            .or_else(|| get_f32("attention.layer_norm_epsilon"))
+            .unwrap_or(1e-5);
         let rope_freq_base = get_f32("rope.freq_base");
-        let sliding_window = get_u32("sliding_window");
+        let sliding_window = get_u32("sliding_window")
+            .or_else(|| get_u32("attention.sliding_window"));
         let rope_scaling_factor =
             get_f32("rope_scaling.factor").or_else(|| get_f32("rope.scaling.factor"));
         let partial_rotary_factor = get_f32("partial_rotary_factor");
+
+        let head_dim_override = get_u32("attention.key_length")
+            .or_else(|| get_u32("head_dim"));
+        let attn_logit_softcapping = get_f32("attention.logit_softcapping")
+            .or_else(|| get_f32("attn_logit_softcapping"));
+        let final_logit_softcapping = get_f32("final_logit_softcapping");
+        let query_pre_attn_scalar =
+            get_f32("attention.query_pre_attn_scalar").map(|s| 1.0 / s.sqrt());
+        let sliding_window_alternating = arch == "gemma2";
 
         let chat_template = metadata
             .get("tokenizer.chat_template")
@@ -93,12 +115,23 @@ impl ModelConfig {
             sliding_window,
             rope_scaling_factor,
             partial_rotary_factor,
+            head_dim_override,
+            attn_logit_softcapping,
+            final_logit_softcapping,
+            query_pre_attn_scalar,
+            sliding_window_alternating,
         })
     }
 
-    /// Dimension of each attention head: `embedding_length / head_count`.
+    /// True when this model uses the Gemma or Gemma 2 architecture family.
+    pub fn is_gemma(&self) -> bool {
+        self.architecture == "gemma" || self.architecture == "gemma2"
+    }
+
+    /// Dimension of each attention head: `head_dim_override` or `embedding_length / head_count`.
     pub fn head_dim(&self) -> u32 {
-        self.embedding_length / self.head_count
+        self.head_dim_override
+            .unwrap_or_else(|| self.embedding_length / self.head_count)
     }
 
     /// Map a HuggingFace `config.json` onto a [`ModelConfig`].
@@ -112,13 +145,11 @@ impl ModelConfig {
 
 // ── HuggingFace config.json ──────────────────────────────────────────────────
 
-/// Model families whose HF `config.json` maps cleanly onto Glint's LLaMA-style
-/// forward pass (RMSNorm + SwiGLU MLP + RoPE + optional GQA).
-///
-/// Anything outside this list is rejected rather than silently mis-run: a
-/// `gemma`/`gpt2`/`mixtral` checkpoint would load tensor-by-tensor but produce
-/// nonsense, which is much worse than a clear error.
-const SUPPORTED_HF_ARCHITECTURES: &[&str] = &["llama", "mistral", "phi3", "qwen2"];
+/// Model families whose HF `config.json` maps cleanly onto Glint's transformer
+/// forward pass (RMSNorm + SwiGLU MLP + RoPE + optional GQA / SWA / soft-capping).
+const SUPPORTED_HF_ARCHITECTURES: &[&str] = &[
+    "llama", "mistral", "phi3", "qwen2", "qwen2_moe", "gemma", "gemma2",
+];
 
 /// A parsed HuggingFace `config.json`.
 ///
@@ -211,17 +242,13 @@ impl HfConfig {
                  num_key_value_heads {head_count_kv}"
             )));
         }
-        // Glint derives head_dim as hidden_size / n_heads (see
-        // `ModelConfig::head_dim`). Newer configs may state it explicitly and
-        // decouple it from that ratio — which the forward pass cannot express.
-        if let Some(head_dim) = get_u32("head_dim") {
-            if head_dim != embedding_length / head_count {
-                return Err(GlintError::HfUnsupported(format!(
-                    "explicit head_dim {head_dim} != hidden_size / num_attention_heads \
-                     ({})",
-                    embedding_length / head_count
-                )));
-            }
+        // If explicit head_dim is specified (e.g. Gemma 2), keep it as head_dim_override.
+        let head_dim_override = get_u32("head_dim");
+        if head_dim_override.is_none() && embedding_length % head_count != 0 {
+            return Err(GlintError::HfUnsupported(format!(
+                "hidden_size {embedding_length} is not divisible by \
+                 num_attention_heads {head_count}"
+            )));
         }
 
         // Qwen2 sets `use_sliding_window: false` while still carrying a
@@ -256,6 +283,17 @@ impl HfConfig {
             }
         };
 
+        let attn_logit_softcapping = get_f32("attn_logit_softcapping");
+        let final_logit_softcapping = get_f32("final_logit_softcapping");
+        let query_pre_attn_scalar = get_f32("query_pre_attn_scalar").map(|s| {
+            if s > 1.0 {
+                1.0 / s.sqrt()
+            } else {
+                s
+            }
+        });
+        let sliding_window_alternating = architecture == "gemma2";
+
         let config = ModelConfig {
             architecture,
             context_length,
@@ -274,6 +312,11 @@ impl HfConfig {
             sliding_window,
             rope_scaling_factor,
             partial_rotary_factor: get_f32("partial_rotary_factor"),
+            head_dim_override,
+            attn_logit_softcapping,
+            final_logit_softcapping,
+            query_pre_attn_scalar,
+            sliding_window_alternating,
         };
 
         // `eos_token_id` is a list on some LLaMA-3 derivatives (EOS + EOT);
@@ -407,9 +450,9 @@ mod tests {
     }
 
     #[test]
-    fn test_hf_config_rejects_non_llama_architecture() {
+    fn test_hf_config_rejects_unsupported_architecture() {
         let json = r#"{
-            "model_type": "gemma2",
+            "model_type": "gpt2",
             "hidden_size": 8,
             "num_hidden_layers": 2,
             "num_attention_heads": 2,
@@ -417,7 +460,45 @@ mod tests {
             "max_position_embeddings": 32
         }"#;
         let err = HfConfig::from_json(json).unwrap_err();
-        assert!(err.to_string().contains("gemma2"), "got: {err}");
+        assert!(err.to_string().contains("gpt2"), "got: {err}");
+    }
+
+    #[test]
+    fn test_hf_config_parses_gemma2_and_qwen2() {
+        let gemma_json = r#"{
+            "model_type": "gemma2",
+            "hidden_size": 2304,
+            "num_hidden_layers": 26,
+            "num_attention_heads": 8,
+            "num_key_value_heads": 4,
+            "vocab_size": 256000,
+            "max_position_embeddings": 8192,
+            "head_dim": 256,
+            "attn_logit_softcapping": 50.0,
+            "final_logit_softcapping": 30.0,
+            "query_pre_attn_scalar": 256
+        }"#;
+        let gemma_cfg = HfConfig::from_json(gemma_json).unwrap().config;
+        assert_eq!(gemma_cfg.architecture, "gemma2");
+        assert_eq!(gemma_cfg.head_dim(), 256);
+        assert_eq!(gemma_cfg.attn_logit_softcapping, Some(50.0));
+        assert_eq!(gemma_cfg.final_logit_softcapping, Some(30.0));
+        assert_eq!(gemma_cfg.query_pre_attn_scalar, Some(1.0 / 16.0));
+        assert!(gemma_cfg.sliding_window_alternating);
+
+        let qwen_json = r#"{
+            "model_type": "qwen2",
+            "hidden_size": 1536,
+            "num_hidden_layers": 28,
+            "num_attention_heads": 12,
+            "num_key_value_heads": 2,
+            "vocab_size": 151936,
+            "max_position_embeddings": 32768
+        }"#;
+        let qwen_cfg = HfConfig::from_json(qwen_json).unwrap().config;
+        assert_eq!(qwen_cfg.architecture, "qwen2");
+        assert_eq!(qwen_cfg.head_dim(), 128);
+        assert!(!qwen_cfg.sliding_window_alternating);
     }
 
     #[test]

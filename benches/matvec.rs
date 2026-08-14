@@ -104,10 +104,11 @@ fn make_k_quant(
                     for j in 4..8 {
                         block[4 + j + 4] = ((i + sb + j) % 15 + 1) as u8;
                     }
-                    for k in 16..144 {
+                    for (k, b) in block[16..144].iter_mut().enumerate() {
+                        let k = k + 16;
                         let lo = ((i + sb + k) % 16) as u8;
                         let hi = ((i + sb + k + 5) % 16) as u8;
-                        block[k] = lo | (hi << 4);
+                        *b = lo | (hi << 4);
                     }
                 }
                 GgmlType::Q5K => {
@@ -123,25 +124,25 @@ fn make_k_quant(
                     for j in 4..8 {
                         block[4 + j + 4] = ((i + sb + j) % 15 + 1) as u8;
                     }
-                    for k in 0..32 {
-                        block[16 + k] = ((i + sb + k * 3) % 256) as u8;
+                    for (k, b) in block[16..48].iter_mut().enumerate() {
+                        *b = ((i + sb + k * 3) % 256) as u8;
                     }
-                    for k in 0..128 {
+                    for (k, b) in block[48..176].iter_mut().enumerate() {
                         let lo = ((i + sb + k) % 16) as u8;
                         let hi = ((i + sb + k + 5) % 16) as u8;
-                        block[48 + k] = lo | (hi << 4);
+                        *b = lo | (hi << 4);
                     }
                 }
                 GgmlType::Q6K => {
                     // [ql×128][qh×64][scales i8×16][f16 d]
-                    for k in 0..128 {
-                        block[k] = ((i + sb + k * 7) % 256) as u8;
+                    for (k, b) in block[..128].iter_mut().enumerate() {
+                        *b = ((i + sb + k * 7) % 256) as u8;
                     }
-                    for k in 0..64 {
-                        block[128 + k] = ((i + sb + k * 3) % 256) as u8;
+                    for (k, b) in block[128..192].iter_mut().enumerate() {
+                        *b = ((i + sb + k * 3) % 256) as u8;
                     }
-                    for k in 0..16 {
-                        block[192 + k] = ((i + sb + k + 1) % 127 + 1) as u8;
+                    for (k, b) in block[192..208].iter_mut().enumerate() {
+                        *b = ((i + sb + k + 1) % 127 + 1) as u8;
                     }
                     block[208..210].copy_from_slice(&half::f16::from_f32(0.01).to_le_bytes());
                 }
@@ -162,6 +163,9 @@ fn bench_format(c: &mut Criterion, name: &str, ggml_type: GgmlType) {
     let mut group = c.benchmark_group(name);
 
     for &(rows, cols) in SIZES {
+        if matches!(ggml_type, GgmlType::Q4K | GgmlType::Q5K | GgmlType::Q6K | GgmlType::Q2K | GgmlType::Q3K) && cols % 256 != 0 {
+            continue;
+        }
         let qt = make_matrix(rows, cols, ggml_type);
         let input = make_input(cols);
 

@@ -66,11 +66,40 @@ pub fn add(a: &Tensor, b: &Tensor) -> Tensor {
     Tensor::from_vec(data, a.shape())
 }
 
+/// Element-wise addition in place: `a[i] += b[i]`.
+pub fn add_in_place(a: &mut [f32], b: &[f32]) {
+    assert_eq!(a.len(), b.len(), "Lengths must match for add_in_place");
+    for (dst, &src) in a.iter_mut().zip(b) {
+        *dst += src;
+    }
+}
+
 /// Element-wise multiplication. Shapes must match.
 pub fn mul(a: &Tensor, b: &Tensor) -> Tensor {
     assert_eq!(a.shape(), b.shape(), "Shapes must match for mul");
     let data: Vec<f32> = a.data().iter().zip(b.data()).map(|(x, y)| x * y).collect();
     Tensor::from_vec(data, a.shape())
+}
+
+/// Logit soft-capping: `cap * tanh(x / cap)`.
+///
+/// Used in Gemma 2 for attention logits and final logits to bound logit dynamics.
+pub fn logit_softcap(x: &Tensor, cap: f32) -> Tensor {
+    let inv_cap = 1.0 / cap;
+    let data: Vec<f32> = x
+        .data()
+        .iter()
+        .map(|&v| cap * (v * inv_cap).tanh())
+        .collect();
+    Tensor::from_vec(data, x.shape())
+}
+
+/// Logit soft-capping in-place: `x[i] = cap * tanh(x[i] / cap)`.
+pub fn logit_softcap_in_place(x: &mut [f32], cap: f32) {
+    let inv_cap = 1.0 / cap;
+    for v in x.iter_mut() {
+        *v = cap * (*v * inv_cap).tanh();
+    }
 }
 
 /// RMSNorm: `x / sqrt(mean(x²) + eps) * weight`.
@@ -98,6 +127,30 @@ pub fn rms_norm(x: &Tensor, weight: &Tensor, eps: f32) -> Tensor {
     Tensor::from_vec(data, x.shape())
 }
 
+/// Gemma RMSNorm: `x / sqrt(mean(x²) + eps) * (1.0 + weight)`.
+///
+/// In Gemma models, the learned scale weights are stored as offsets (Δw) centered at 0,
+/// so the scaling factor is `(1.0 + weight)`.
+pub fn rms_norm_gemma(x: &Tensor, weight: &Tensor, eps: f32) -> Tensor {
+    assert_eq!(x.ndim(), 1);
+    assert_eq!(weight.ndim(), 1);
+    assert_eq!(x.shape()[0], weight.shape()[0]);
+
+    let x_data = x.data();
+    let w_data = weight.data();
+    let n = x_data.len();
+
+    let mean_sq: f32 = x_data.iter().map(|v| v * v).sum::<f32>() / n as f32;
+    let rsqrt = 1.0 / (mean_sq + eps).sqrt();
+
+    let data: Vec<f32> = x_data
+        .iter()
+        .zip(w_data)
+        .map(|(&x, &w)| x * rsqrt * (1.0 + w))
+        .collect();
+    Tensor::from_vec(data, x.shape())
+}
+
 /// SiLU activation: `x * sigmoid(x)`.
 ///
 /// Also called "swish". Used in LLaMA's feed-forward network (SwiGLU variant).
@@ -106,6 +159,22 @@ pub fn silu(x: &Tensor) -> Tensor {
         .data()
         .iter()
         .map(|&v| v * (1.0 / (1.0 + (-v).exp())))
+        .collect();
+    Tensor::from_vec(data, x.shape())
+}
+
+/// GeLU activation (tanh approximation): `0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))`.
+///
+/// Used in Gemma / Gemma 2 feed-forward networks (GeGLU variant).
+pub fn gelu(x: &Tensor) -> Tensor {
+    const SQRT_2_OVER_PI: f32 = 0.797_884_6; // sqrt(2.0 / PI)
+    const COEF: f32 = 0.044715;
+    let data: Vec<f32> = x
+        .data()
+        .iter()
+        .map(|&v| {
+            0.5 * v * (1.0 + (SQRT_2_OVER_PI * (v + COEF * v * v * v)).tanh())
+        })
         .collect();
     Tensor::from_vec(data, x.shape())
 }
@@ -156,8 +225,9 @@ pub fn rope(
     let mut out = data.to_vec();
 
     let pos_scaled = pos as f32 / scaling_factor;
+    let rot = (rot_dim.min(head_dim)) & !1;
 
-    for i in (0..rot_dim).step_by(2) {
+    for i in (0..rot).step_by(2) {
         let freq = 1.0 / freq_base.powf(i as f32 / head_dim as f32);
         let angle = pos_scaled * freq;
         let cos_val = angle.cos();
@@ -376,5 +446,29 @@ mod tests {
         assert_eq!(result.shape(), &[2, 3]);
         approx_eq(&result.data()[0..3], &[0.7, 0.8, 0.9], 1e-6);
         approx_eq(&result.data()[3..6], &[0.1, 0.2, 0.3], 1e-6);
+    }
+
+    #[test]
+    fn test_add_in_place() {
+        let mut a = vec![1.0, 2.0, 3.0];
+        let b = vec![4.0, 5.0, 6.0];
+        add_in_place(&mut a, &b);
+        approx_eq(&a, &[5.0, 7.0, 9.0], 1e-6);
+    }
+
+    #[test]
+    fn test_logit_softcap() {
+        let x = Tensor::from_vec(vec![0.0, 50.0, -50.0, 1000.0, -1000.0], &[5]);
+        let capped = logit_softcap(&x, 50.0);
+        // 50 * tanh(0) = 0
+        // 50 * tanh(1) ≈ 50 * 0.761594156 = 38.0797
+        // 50 * tanh(-1) ≈ -38.0797
+        // 50 * tanh(20) ≈ 50.0
+        // 50 * tanh(-20) ≈ -50.0
+        approx_eq(&[capped.data()[0]], &[0.0], 1e-6);
+        approx_eq(&[capped.data()[1]], &[50.0 * 1.0f32.tanh()], 1e-6);
+        approx_eq(&[capped.data()[2]], &[-50.0 * 1.0f32.tanh()], 1e-6);
+        assert!((capped.data()[3] - 50.0).abs() < 1e-5);
+        assert!((capped.data()[4] + 50.0).abs() < 1e-5);
     }
 }

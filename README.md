@@ -33,7 +33,7 @@ Glint is a focused inference engine for GGUF-based LLaMA-family models. It is de
 | Inference | Full LLaMA-family transformer: RMSNorm, RoPE, SwiGLU, grouped-query attention, flash attention, batched prefill |
 | Generation | Greedy, sampling (temperature/top-k/top-p/min-p/repetition-penalty/seed), streaming, speculative decoding, JSON object mode |
 | Quantization | Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q4_K, Q5_K, Q6_K, Q2_K, Q3_K, IQ4_NL — weights stay compressed in memory |
-| Performance | AVX2+FMA kernels, scalar fallback, Rayon row-parallel matvec, optional GPU backend (wgpu/Vulkan/Metal/DX12) |
+| Performance | AVX2+FMA (x86_64) & ARM NEON (aarch64/Apple Silicon) SIMD kernels, scalar fallback, Rayon row-parallel matvec, optional GPU backend (wgpu/Vulkan/Metal/DX12) |
 | KV Cache | f32, Q8_0-quantized, and PagedAttention-style paged variants (`--kv-cache paged`, refcounted page sharing); prefix caching across requests (`--prefix-cache`); `KvStore` trait abstraction |
 | Sessions | First-class `Session` API, deterministic RNG state, snapshot export/import, cache-format-aware resume |
 | LoRA | Load and apply LoRA adapters at inference time via `--lora` |
@@ -64,7 +64,7 @@ CI validates these build surfaces on every push and pull request:
 ### Quantization
 
 - Eleven GGUF quantization formats: `Q8_0`, `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, `Q4_K`, `Q5_K`, `Q6_K`, `Q2_K`, `Q3_K`, `IQ4_NL`
-- AVX2+FMA SIMD kernels for eight formats (`Q8_0`, `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, `Q4_K`, `Q5_K`, `Q6_K`); `Q2_K`, `Q3_K`, and `IQ4_NL` use the scalar path
+- Hardware SIMD kernels for eight formats (`Q8_0`, `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, `Q4_K`, `Q5_K`, `Q6_K`) on both x86_64 (AVX2+FMA) and aarch64 (ARM NEON / Apple Silicon); `Q2_K`, `Q3_K`, and `IQ4_NL` use the scalar path
 - Nibble layouts anchored to ggml golden vectors, so real llama.cpp-produced files decode identically
 - Compressed weights stay compressed in memory
 - Example footprint: a 135M-parameter `Q8_0` model is about 140 MB in memory versus about 540 MB dequantized

@@ -517,6 +517,11 @@ mod tests {
             sliding_window: None,
             rope_scaling_factor: None,
             partial_rotary_factor: None,
+            head_dim_override: None,
+            attn_logit_softcapping: None,
+            final_logit_softcapping: None,
+            query_pre_attn_scalar: None,
+            sliding_window_alternating: false,
         };
         let weights = TransformerWeights {
             token_embedding: QuantizedTensor::from_f32(
@@ -527,6 +532,8 @@ mod tests {
             layers: vec![LayerWeights {
                 attn_norm: Tensor::from_vec(vec![1.0; 4], &[4]),
                 ffn_norm: Tensor::from_vec(vec![1.0; 4], &[4]),
+                post_attn_norm: None,
+                post_ffn_norm: None,
                 attn_q: QuantizedTensor::from_f32(
                     &(0..16).map(|i| i as f32 * 0.05 - 0.4).collect::<Vec<_>>(),
                     4,
@@ -547,6 +554,9 @@ mod tests {
                     4,
                     4,
                 ),
+                attn_q_bias: None,
+                attn_k_bias: None,
+                attn_v_bias: None,
                 ffn_gate: QuantizedTensor::from_f32(
                     &(0..32).map(|i| i as f32 * 0.02 - 0.3).collect::<Vec<_>>(),
                     8,
