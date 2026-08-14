@@ -190,4 +190,83 @@ impl GlintModel {
 
         Ok(())
     }
+
+    /// Generate output constrained to a valid JSON object (`{...}`).
+    pub fn generate_json_object(
+        &self,
+        prompt: &str,
+        max_tokens: usize,
+        temperature: f32,
+    ) -> Result<String, JsValue> {
+        let opts = GenerationOptions {
+            max_new_tokens: max_tokens,
+            sampler_cfg: SamplerConfig {
+                temperature,
+                ..Default::default()
+            },
+            cache_format: CacheFormat::F32,
+            constraint: Some(crate::constrained::ConstraintSpec::JsonObject),
+            lora_adapter: None,
+        };
+        let new_tokens = self
+            .model
+            .generate(prompt, &opts, &mut None)
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        Ok(self.model.decode(&new_tokens))
+    }
+
+    /// Generate output strictly conforming to a JSON Schema string.
+    pub fn generate_json_schema(
+        &self,
+        prompt: &str,
+        json_schema_str: &str,
+        max_tokens: usize,
+        temperature: f32,
+    ) -> Result<String, JsValue> {
+        let schema_val: serde_json::Value = serde_json::from_str(json_schema_str)
+            .map_err(|e| JsValue::from_str(&format!("invalid JSON schema: {e}")))?;
+
+        let opts = GenerationOptions {
+            max_new_tokens: max_tokens,
+            sampler_cfg: SamplerConfig {
+                temperature,
+                ..Default::default()
+            },
+            cache_format: CacheFormat::F32,
+            constraint: Some(crate::constrained::ConstraintSpec::JsonSchema(schema_val)),
+            lora_adapter: None,
+        };
+        let new_tokens = self
+            .model
+            .generate(prompt, &opts, &mut None)
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        Ok(self.model.decode(&new_tokens))
+    }
+
+    /// Generate output strictly conforming to a GBNF grammar string.
+    pub fn generate_grammar(
+        &self,
+        prompt: &str,
+        grammar_str: &str,
+        max_tokens: usize,
+        temperature: f32,
+    ) -> Result<String, JsValue> {
+        let opts = GenerationOptions {
+            max_new_tokens: max_tokens,
+            sampler_cfg: SamplerConfig {
+                temperature,
+                ..Default::default()
+            },
+            cache_format: CacheFormat::F32,
+            constraint: Some(crate::constrained::ConstraintSpec::Grammar(
+                grammar_str.to_string(),
+            )),
+            lora_adapter: None,
+        };
+        let new_tokens = self
+            .model
+            .generate(prompt, &opts, &mut None)
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        Ok(self.model.decode(&new_tokens))
+    }
 }
