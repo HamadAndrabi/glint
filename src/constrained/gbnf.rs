@@ -79,7 +79,9 @@ impl std::str::FromStr for GbnfGrammar {
             } else if current_rule_name.is_some() {
                 current_rule_lines.push(line.to_string());
             } else {
-                return Err(format!("expected rule definition ('name ::= ...'), got: {line}"));
+                return Err(format!(
+                    "expected rule definition ('name ::= ...'), got: {line}"
+                ));
             }
         }
 
@@ -165,7 +167,10 @@ fn parse_expression(input: &str) -> Result<GbnfExpr, String> {
     let mut pos = 0;
     let expr = parse_choice(&tokens, &mut pos)?;
     if pos < tokens.len() {
-        return Err(format!("unexpected token at end of rule: {:?}", tokens[pos]));
+        return Err(format!(
+            "unexpected token at end of rule: {:?}",
+            tokens[pos]
+        ));
     }
     Ok(expr.simplify())
 }
@@ -174,13 +179,16 @@ fn parse_expression(input: &str) -> Result<GbnfExpr, String> {
 enum GbnfToken {
     Ident(String),
     Literal(String),
-    CharClass { ranges: Vec<(char, char)>, negated: bool },
-    Pipe,       // |
-    LParen,     // (
-    RParen,     // )
-    Question,   // ?
-    Star,       // *
-    Plus,       // +
+    CharClass {
+        ranges: Vec<(char, char)>,
+        negated: bool,
+    },
+    Pipe,     // |
+    LParen,   // (
+    RParen,   // )
+    Question, // ?
+    Star,     // *
+    Plus,     // +
 }
 
 fn tokenize_gbnf(input: &str) -> Result<Vec<GbnfToken>, String> {
@@ -308,7 +316,8 @@ fn tokenize_gbnf(input: &str) -> Result<Vec<GbnfToken>, String> {
             _ if c.is_alphanumeric() || c == '_' || c == '-' => {
                 // Identifier
                 let start = i;
-                while i < len && (chars[i].is_alphanumeric() || chars[i] == '_' || chars[i] == '-') {
+                while i < len && (chars[i].is_alphanumeric() || chars[i] == '_' || chars[i] == '-')
+                {
                     i += 1;
                 }
                 let ident: String = chars[start..i].iter().collect();
@@ -642,7 +651,8 @@ impl GbnfExpr {
 
                 // branch 2: if first is nullable, derivative of rest
                 if first.nullable(grammar) && !rest.is_empty() {
-                    let d_rest = Self::Sequence(rest.to_vec()).derivative_inner(ch, grammar, visited);
+                    let d_rest =
+                        Self::Sequence(rest.to_vec()).derivative_inner(ch, grammar, visited);
                     if d_rest != Self::Reject {
                         branches.push(d_rest);
                     }
@@ -712,10 +722,7 @@ impl GbnfMatcher {
 
     /// Advance the match state by consuming the characters in token string `s`.
     pub fn advance_str(&mut self, s: &str) {
-        self.current_state = self
-            .current_state
-            .clone()
-            .step_str(s, &self.grammar.rules);
+        self.current_state = self.current_state.clone().step_str(s, &self.grammar.rules);
     }
 
     /// Check if the current state accepts completion (e.g. EOS).
@@ -915,4 +922,3 @@ mod tests {
         assert_eq!(grammar.root_rule, "entry");
     }
 }
-

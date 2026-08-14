@@ -637,6 +637,9 @@ mod tests {
 
         let req: ChatCompletionRequest = serde_json::from_str(req_json).unwrap();
         assert_eq!(req.tools.as_ref().unwrap().len(), 1);
-        assert_eq!(req.tools.as_ref().unwrap()[0].function.name, "get_current_weather");
+        assert_eq!(
+            req.tools.as_ref().unwrap()[0].function.name,
+            "get_current_weather"
+        );
     }
 }

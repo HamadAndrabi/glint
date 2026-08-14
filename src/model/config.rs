@@ -80,16 +80,15 @@ impl ModelConfig {
             .or_else(|| get_f32("attention.layer_norm_epsilon"))
             .unwrap_or(1e-5);
         let rope_freq_base = get_f32("rope.freq_base");
-        let sliding_window = get_u32("sliding_window")
-            .or_else(|| get_u32("attention.sliding_window"));
+        let sliding_window =
+            get_u32("sliding_window").or_else(|| get_u32("attention.sliding_window"));
         let rope_scaling_factor =
             get_f32("rope_scaling.factor").or_else(|| get_f32("rope.scaling.factor"));
         let partial_rotary_factor = get_f32("partial_rotary_factor");
 
-        let head_dim_override = get_u32("attention.key_length")
-            .or_else(|| get_u32("head_dim"));
-        let attn_logit_softcapping = get_f32("attention.logit_softcapping")
-            .or_else(|| get_f32("attn_logit_softcapping"));
+        let head_dim_override = get_u32("attention.key_length").or_else(|| get_u32("head_dim"));
+        let attn_logit_softcapping =
+            get_f32("attention.logit_softcapping").or_else(|| get_f32("attn_logit_softcapping"));
         let final_logit_softcapping = get_f32("final_logit_softcapping");
         let query_pre_attn_scalar =
             get_f32("attention.query_pre_attn_scalar").map(|s| 1.0 / s.sqrt());
@@ -148,7 +147,13 @@ impl ModelConfig {
 /// Model families whose HF `config.json` maps cleanly onto Glint's transformer
 /// forward pass (RMSNorm + SwiGLU MLP + RoPE + optional GQA / SWA / soft-capping).
 const SUPPORTED_HF_ARCHITECTURES: &[&str] = &[
-    "llama", "mistral", "phi3", "qwen2", "qwen2_moe", "gemma", "gemma2",
+    "llama",
+    "mistral",
+    "phi3",
+    "qwen2",
+    "qwen2_moe",
+    "gemma",
+    "gemma2",
 ];
 
 /// A parsed HuggingFace `config.json`.
@@ -285,13 +290,8 @@ impl HfConfig {
 
         let attn_logit_softcapping = get_f32("attn_logit_softcapping");
         let final_logit_softcapping = get_f32("final_logit_softcapping");
-        let query_pre_attn_scalar = get_f32("query_pre_attn_scalar").map(|s| {
-            if s > 1.0 {
-                1.0 / s.sqrt()
-            } else {
-                s
-            }
-        });
+        let query_pre_attn_scalar =
+            get_f32("query_pre_attn_scalar").map(|s| if s > 1.0 { 1.0 / s.sqrt() } else { s });
         let sliding_window_alternating = architecture == "gemma2";
 
         let config = ModelConfig {

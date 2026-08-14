@@ -1144,7 +1144,8 @@ fn dispatch_q5_0_batch(data: &[u8], rows: usize, cols: usize, inputs: &[&[f32]],
     {
         let batch = inputs.len();
         for (s, input) in inputs.iter().enumerate() {
-            let col = unsafe { crate::tensor::simd_neon::matvec_q5_0_neon(data, rows, cols, input) };
+            let col =
+                unsafe { crate::tensor::simd_neon::matvec_q5_0_neon(data, rows, cols, input) };
             scatter_lane(col, s, batch, out);
         }
     }
@@ -1170,7 +1171,8 @@ fn dispatch_q5_1_batch(data: &[u8], rows: usize, cols: usize, inputs: &[&[f32]],
     {
         let batch = inputs.len();
         for (s, input) in inputs.iter().enumerate() {
-            let col = unsafe { crate::tensor::simd_neon::matvec_q5_1_neon(data, rows, cols, input) };
+            let col =
+                unsafe { crate::tensor::simd_neon::matvec_q5_1_neon(data, rows, cols, input) };
             scatter_lane(col, s, batch, out);
         }
     }
@@ -2527,7 +2529,10 @@ mod tests {
     }
 
     /// Assert two kernels agree row-by-row.
-    #[cfg(any(all(target_arch = "x86_64", feature = "rayon"), target_arch = "aarch64"))]
+    #[cfg(any(
+        all(target_arch = "x86_64", feature = "rayon"),
+        target_arch = "aarch64"
+    ))]
     fn assert_rows_close(fmt: &str, scalar: &[f32], simd: &[f32]) {
         for (i, (&s, &v)) in scalar.iter().zip(simd).enumerate() {
             assert!((s - v).abs() < 1e-3, "{fmt} row {i}: scalar={s}, simd={v}");
