@@ -32,7 +32,14 @@ pub struct ChatTurn {
 
 #[derive(Clone, Debug)]
 pub enum InferenceEvent {
-    FirstToken { ttft_ms: u64 },
+    /// Emitted once the prompt is tokenized, before prefill, so the UI can
+    /// report actual KV-cache residency instead of guessing.
+    Prefill {
+        prompt_tokens: usize,
+    },
+    FirstToken {
+        ttft_ms: u64,
+    },
     Token(String),
     Done {
         total_tokens: usize,
@@ -51,6 +58,8 @@ pub struct App {
     pub embedding_length: usize,
     pub block_count: usize,
     pub head_count: usize,
+    pub head_count_kv: usize,
+    pub head_dim: usize,
 
     // Navigation & View
     pub active_tab: ActiveTab,
@@ -131,7 +140,14 @@ impl App {
         let tok_clone = Arc::clone(&tokenizer);
         let w_clone = Arc::clone(&weights);
         thread::spawn(move || {
-            run_inference_worker(cfg_clone, tok_clone, w_clone, prompt_rx, event_tx, cancel_clone);
+            run_inference_worker(
+                cfg_clone,
+                tok_clone,
+                w_clone,
+                prompt_rx,
+                event_tx,
+                cancel_clone,
+            );
         });
 
         let mut app = Self {
@@ -142,6 +158,8 @@ impl App {
             embedding_length: config.embedding_length as usize,
             block_count: config.block_count as usize,
             head_count: config.head_count as usize,
+            head_count_kv: config.head_count_kv as usize,
+            head_dim: config.head_dim() as usize,
 
             active_tab: ActiveTab::Chat,
             settings_open: false,
@@ -195,6 +213,19 @@ ws   ::= [ \t\n]*"#.to_string(),
         }
 
         Ok(app)
+    }
+
+    /// Bytes currently resident in the KV cache.
+    ///
+    /// The TUI worker uses the f32 `KvCache`, which stores a K and a V entry of
+    /// `head_count_kv * head_dim` floats per layer per token.
+    pub fn kv_bytes_used(&self) -> usize {
+        self.kv_used_tokens
+            * 2
+            * self.block_count
+            * self.head_count_kv
+            * self.head_dim
+            * std::mem::size_of::<f32>()
     }
 
     /// Submit current user input for generation.
@@ -294,11 +325,17 @@ ws   ::= [ \t\n]*"#.to_string(),
         if let Some(rx) = &self.event_rx {
             while let Ok(event) = rx.try_recv() {
                 match event {
+                    InferenceEvent::Prefill { prompt_tokens } => {
+                        // The worker allocates a fresh cache per request.
+                        self.kv_used_tokens = prompt_tokens.min(self.context_length);
+                    }
                     InferenceEvent::FirstToken { ttft_ms } => {
                         self.current_ttft_ms = ttft_ms;
                         final_ttft = ttft_ms;
                     }
                     InferenceEvent::Token(tok) => {
+                        // Each decoded token appends one more position to the cache.
+                        self.kv_used_tokens = (self.kv_used_tokens + 1).min(self.context_length);
                         if self.active_tab == ActiveTab::StructuredLab {
                             self.lab_output.push_str(&tok);
                         } else {
@@ -322,7 +359,8 @@ ws   ::= [ \t\n]*"#.to_string(),
                         if self.active_tab == ActiveTab::StructuredLab {
                             self.lab_output.push_str(&format!("\n[Error: {err}]"));
                         } else {
-                            self.streaming_response.push_str(&format!("\n[Error: {err}]"));
+                            self.streaming_response
+                                .push_str(&format!("\n[Error: {err}]"));
                         }
                     }
                 }
@@ -337,7 +375,11 @@ ws   ::= [ \t\n]*"#.to_string(),
                     role: "assistant".to_string(),
                     content,
                     tok_per_sec: Some(final_tok_s),
-                    ttft_ms: Some(if final_ttft > 0 { final_ttft } else { self.current_ttft_ms }),
+                    ttft_ms: Some(if final_ttft > 0 {
+                        final_ttft
+                    } else {
+                        self.current_ttft_ms
+                    }),
                     token_count: Some(final_tokens),
                 });
             }
@@ -347,9 +389,7 @@ ws   ::= [ \t\n]*"#.to_string(),
 
 type LoadedModelParts = (Arc<ModelConfig>, Arc<Tokenizer>, Arc<TransformerWeights>);
 
-fn load_raw_model(
-    path: &Path,
-) -> Result<LoadedModelParts, Box<dyn std::error::Error>> {
+fn load_raw_model(path: &Path) -> Result<LoadedModelParts, Box<dyn std::error::Error>> {
     let model = GlintModel::load(path)?;
     Ok((model.config, model.tokenizer, model.weights))
 }
@@ -381,6 +421,9 @@ fn run_inference_worker(
             .collect();
         let prompt_str = chat_template.apply(&msgs);
         let prompt_tokens = tokenizer.encode_prompt(&prompt_str);
+        let _ = tx.send(InferenceEvent::Prefill {
+            prompt_tokens: prompt_tokens.len(),
+        });
 
         let mut constraint = req.constraint.as_ref().and_then(|spec| {
             crate::constrained::build_constraint(spec, Arc::clone(&vocab_index)).ok()
@@ -405,14 +448,8 @@ fn run_inference_worker(
         let mut first_token_sent = false;
 
         // Prefill
-        let prefill_logits = forward_prefill(
-            &weights,
-            &config,
-            &prompt_tokens,
-            &mut cache,
-            0,
-            &mut None,
-        );
+        let prefill_logits =
+            forward_prefill(&weights, &config, &prompt_tokens, &mut cache, 0, &mut None);
 
         let mut generated_tokens = Vec::new();
         let mut all_history = prompt_tokens.clone();

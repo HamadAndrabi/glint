@@ -1,1088 +1,1127 @@
 <!DOCTYPE html>
-<html lang="en">
+<html class="light" lang="en">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta charset="utf-8"/>
+  <meta content="width=device-width, initial-scale=1.0" name="viewport"/>
   <title>Glint - Local Inference Engine</title>
-  <link rel="icon" type="image/svg+xml" href="/assets/logo.svg">
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="icon" type="image/svg+xml" href="/assets/logo.svg"/>
+
+  <!-- Google Fonts: Plus Jakarta Sans & JetBrains Mono -->
+  <link rel="preconnect" href="https://fonts.googleapis.com"/>
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin=""/>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet"/>
+
+  <!-- Google Material Symbols Outlined -->
+  <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&display=swap" rel="stylesheet"/>
+
+  <!-- Tailwind CSS with custom Design Tokens -->
+  <script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
+  <script id="tailwind-config">
+    tailwind.config = {
+      darkMode: "class",
+      theme: {
+        extend: {
+          colors: {
+            "surface": "#faf9f6",
+            "surface-bright": "#faf9f6",
+            "background": "#faf9f6",
+            "on-background": "#1a1c1a",
+            "on-surface": "#1a1c1a",
+            "on-surface-variant": "#554336",
+            "surface-container": "#efeeeb",
+            "surface-container-low": "#f4f3f1",
+            "surface-container-lowest": "#ffffff",
+            "surface-container-high": "#e9e8e5",
+            "surface-container-highest": "#e3e2e0",
+            "surface-variant": "#e3e2e0",
+            "surface-dim": "#dbdad7",
+            "primary": "#8d4b00",
+            "primary-container": "#b15f00",
+            "primary-fixed": "#ffdcc3",
+            "primary-fixed-dim": "#ffb77d",
+            "on-primary": "#ffffff",
+            "on-primary-container": "#fffbff",
+            "on-primary-fixed": "#2f1500",
+            "on-primary-fixed-variant": "#6e3900",
+            "secondary": "#006c49",
+            "secondary-container": "#6cf8bb",
+            "secondary-fixed": "#6ffbbe",
+            "secondary-fixed-dim": "#4edea3",
+            "on-secondary": "#ffffff",
+            "on-secondary-container": "#00714d",
+            "on-secondary-fixed": "#002113",
+            "on-secondary-fixed-variant": "#005236",
+            "tertiary": "#5b5c60",
+            "tertiary-container": "#747479",
+            "tertiary-fixed": "#e3e2e7",
+            "tertiary-fixed-dim": "#c7c6cb",
+            "on-tertiary": "#ffffff",
+            "on-tertiary-container": "#fefcff",
+            "on-tertiary-fixed": "#1a1b1f",
+            "on-tertiary-fixed-variant": "#46464b",
+            "error": "#ba1a1a",
+            "error-container": "#ffdad6",
+            "on-error": "#ffffff",
+            "on-error-container": "#93000a",
+            "outline": "#887364",
+            "outline-variant": "#dbc2b0",
+            "inverse-surface": "#2f312f",
+            "inverse-on-surface": "#f2f1ee",
+            "inverse-primary": "#ffb77d"
+          },
+          borderRadius: {
+            "DEFAULT": "0.25rem",
+            "lg": "0.5rem",
+            "xl": "0.75rem",
+            "2xl": "1rem",
+            "3xl": "1.25rem",
+            "full": "9999px"
+          },
+          spacing: {
+            "gutter": "24px",
+            "margin-mobile": "16px",
+            "xs": "8px",
+            "sm": "12px",
+            "md": "16px",
+            "lg": "24px",
+            "xl": "32px",
+            "xxl": "64px",
+            "container-max": "1200px"
+          },
+          fontFamily: {
+            "display": ["Plus Jakarta Sans", "sans-serif"],
+            "headline-lg": ["Plus Jakarta Sans", "sans-serif"],
+            "headline-md": ["Plus Jakarta Sans", "sans-serif"],
+            "body-lg": ["Plus Jakarta Sans", "sans-serif"],
+            "body-md": ["Plus Jakarta Sans", "sans-serif"],
+            "body-sm": ["Plus Jakarta Sans", "sans-serif"],
+            "label-md": ["Plus Jakarta Sans", "sans-serif"],
+            "code-md": ["JetBrains Mono", "monospace"]
+          }
+        }
+      }
+    }
+  </script>
+
   <style>
-    :root {
-      --bg-canvas: #090a0c;
-      --bg-subtle: #111317;
-      --bg-surface: #17191f;
-      --bg-surface-hover: #1e222a;
-      --bg-surface-active: #262a34;
-      
-      --border-subtle: #20232a;
-      --border-muted: #2c303a;
-      --border-focus: #3b82f6;
-
-      --text-primary: #f8fafc;
-      --text-secondary: #94a3b8;
-      --text-muted: #64748b;
-      
-      --accent: #3b82f6;
-      --accent-hover: #2563eb;
-      --accent-dim: rgba(59, 130, 246, 0.12);
-
-      --status-success: #10b981;
-      --status-warning: #f59e0b;
-      --status-danger: #ef4444;
-
-      --radius-sm: 6px;
-      --radius-md: 8px;
-      --radius-lg: 12px;
-    }
-
-    * {
-      box-sizing: border-box;
-      margin: 0;
-      padding: 0;
-      scrollbar-width: thin;
-      scrollbar-color: var(--border-muted) transparent;
-    }
-
-    body {
-      font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-      background-color: var(--bg-canvas);
-      color: var(--text-primary);
-      height: 100vh;
-      display: flex;
-      flex-direction: column;
-      overflow: hidden;
+    .material-symbols-outlined {
+      font-family: 'Material Symbols Outlined';
+      font-weight: normal;
+      font-style: normal;
+      font-size: 20px;
+      line-height: 1;
+      letter-spacing: normal;
+      text-transform: none;
+      display: inline-block;
+      white-space: nowrap;
+      word-wrap: normal;
+      direction: ltr;
       -webkit-font-smoothing: antialiased;
     }
 
-    /* ── Header ─────────────────────────────────────────────────────────────── */
-    header {
-      height: 56px;
-      background: var(--bg-canvas);
-      border-bottom: 1px solid var(--border-subtle);
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      padding: 0 20px;
-      flex-shrink: 0;
-      z-index: 20;
-    }
-
-    .brand {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      text-decoration: none;
-      color: var(--text-primary);
-    }
-
-    .brand-logo {
-      width: 28px;
-      height: 28px;
-      border-radius: var(--radius-sm);
-      background: var(--bg-surface);
-      border: 1px solid var(--border-subtle);
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      overflow: hidden;
-    }
-
-    .brand-logo img {
-      width: 22px;
-      height: 22px;
-      object-fit: contain;
-    }
-
-    .brand-title {
-      font-size: 15px;
-      font-weight: 600;
-      letter-spacing: -0.01em;
-      display: flex;
-      align-items: center;
-      gap: 8px;
-    }
-
-    .brand-model-pill {
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 11px;
-      font-weight: 400;
-      color: var(--text-secondary);
-      background: var(--bg-subtle);
-      padding: 2px 8px;
-      border-radius: var(--radius-sm);
-      border: 1px solid var(--border-subtle);
-      max-width: 220px;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }
-
-    .nav-group {
-      display: flex;
-      align-items: center;
-      gap: 4px;
-      background: var(--bg-subtle);
-      padding: 3px;
-      border-radius: var(--radius-md);
-      border: 1px solid var(--border-subtle);
-    }
-
-    .nav-item {
-      padding: 6px 14px;
-      border-radius: var(--radius-sm);
-      font-size: 13px;
-      font-weight: 500;
-      color: var(--text-secondary);
-      cursor: pointer;
-      border: none;
-      background: transparent;
-      transition: all 0.15s ease;
-      display: flex;
-      align-items: center;
-      gap: 6px;
-    }
-
-    .nav-item:hover {
-      color: var(--text-primary);
-      background: var(--bg-surface-hover);
-    }
-
-    .nav-item.active {
-      background: var(--bg-surface);
-      color: var(--text-primary);
-      box-shadow: 0 1px 2px rgba(0, 0, 0, 0.3);
-    }
-
-    .header-meta {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-    }
-
-    .status-badge {
-      display: flex;
-      align-items: center;
-      gap: 6px;
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 11px;
-      color: var(--text-secondary);
-      background: var(--bg-subtle);
-      padding: 4px 10px;
-      border-radius: 9999px;
-      border: 1px solid var(--border-subtle);
-    }
-
-    .status-dot {
+    /* Custom Clean Scrollbar */
+    ::-webkit-scrollbar {
       width: 6px;
       height: 6px;
-      border-radius: 50%;
-      background: var(--status-success);
+    }
+    ::-webkit-scrollbar-track {
+      background: transparent;
+    }
+    ::-webkit-scrollbar-thumb {
+      background-color: #e3e2e0;
+      border-radius: 20px;
+    }
+    ::-webkit-scrollbar-thumb:hover {
+      background-color: #dbc2b0;
     }
 
-    /* ── Main Layout ─────────────────────────────────────────────────────────── */
-    main {
-      flex: 1;
-      display: flex;
-      overflow: hidden;
-      position: relative;
-    }
-
-    .workspace-pane {
-      display: none;
-      width: 100%;
-      height: 100%;
-    }
-
-    .workspace-pane.active {
-      display: flex;
-    }
-
-    /* ── Sidebar ─────────────────────────────────────────────────────────────── */
-    .sidebar {
-      width: 280px;
-      background: var(--bg-subtle);
-      border-right: 1px solid var(--border-subtle);
-      display: flex;
-      flex-direction: column;
-      padding: 16px;
-      gap: 18px;
-      overflow-y: auto;
-      flex-shrink: 0;
-    }
-
-    .sidebar-title {
-      font-size: 11px;
-      font-weight: 600;
-      text-transform: uppercase;
-      letter-spacing: 0.05em;
-      color: var(--text-muted);
-      margin-bottom: 6px;
-    }
-
-    .control-group {
-      display: flex;
-      flex-direction: column;
-      gap: 6px;
-    }
-
-    .control-row {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      font-size: 12px;
-      color: var(--text-secondary);
-    }
-
-    .control-val {
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 11px;
-      color: var(--text-primary);
-      background: var(--bg-surface);
-      padding: 1px 6px;
-      border-radius: var(--radius-sm);
-      border: 1px solid var(--border-subtle);
-    }
-
-    input[type="range"] {
-      -webkit-appearance: none;
-      appearance: none;
-      width: 100%;
-      height: 4px;
-      background: var(--border-muted);
-      border-radius: 9999px;
-      outline: none;
-    }
-
-    input[type="range"]::-webkit-slider-thumb {
-      -webkit-appearance: none;
-      width: 14px;
-      height: 14px;
-      border-radius: 50%;
-      background: var(--text-primary);
-      cursor: pointer;
-      box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
-    }
-
-    input[type="number"], input[type="text"], textarea {
-      width: 100%;
-      background: var(--bg-surface);
-      border: 1px solid var(--border-subtle);
-      border-radius: var(--radius-sm);
-      padding: 8px 10px;
-      color: var(--text-primary);
-      font-family: inherit;
-      font-size: 13px;
-      outline: none;
-      transition: border-color 0.15s ease;
-    }
-
-    input[type="number"]:focus, input[type="text"]:focus, textarea:focus {
-      border-color: var(--border-focus);
-    }
-
-    .btn-secondary {
-      background: var(--bg-surface);
-      border: 1px solid var(--border-subtle);
-      color: var(--text-secondary);
-      font-size: 12px;
-      font-weight: 500;
-      padding: 8px 12px;
-      border-radius: var(--radius-sm);
-      cursor: pointer;
-      transition: all 0.15s ease;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      gap: 6px;
-    }
-
-    .btn-secondary:hover {
-      background: var(--bg-surface-hover);
-      color: var(--text-primary);
-      border-color: var(--border-muted);
-    }
-
-    /* ── Chat Container ──────────────────────────────────────────────────────── */
-    .chat-container {
-      flex: 1;
-      display: flex;
-      flex-direction: column;
-      background: var(--bg-canvas);
-      position: relative;
-    }
-
-    .chat-scroll {
-      flex: 1;
-      overflow-y: auto;
-      padding: 24px;
-      display: flex;
-      flex-direction: column;
-      gap: 20px;
-    }
-
-    .empty-state {
-      max-width: 580px;
-      margin: auto;
-      text-align: center;
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      gap: 16px;
-      padding: 40px 20px;
-    }
-
-    .empty-logo {
-      width: 48px;
-      height: 48px;
-      border-radius: var(--radius-md);
-      background: var(--bg-subtle);
-      border: 1px solid var(--border-subtle);
-      display: flex;
-      align-items: center;
-      justify-content: center;
-    }
-
-    .empty-logo img {
-      width: 36px;
-      height: 36px;
-      object-fit: contain;
-    }
-
-    .empty-title {
-      font-size: 18px;
-      font-weight: 600;
-      color: var(--text-primary);
-      letter-spacing: -0.01em;
-    }
-
-    .empty-subtitle {
-      font-size: 13px;
-      color: var(--text-secondary);
-      line-height: 1.5;
-    }
-
-    .prompt-suggestions {
-      display: flex;
-      flex-direction: column;
-      gap: 8px;
-      width: 100%;
-      margin-top: 8px;
-    }
-
-    .suggestion-item {
-      background: var(--bg-subtle);
-      border: 1px solid var(--border-subtle);
-      padding: 10px 14px;
-      border-radius: var(--radius-md);
-      font-size: 13px;
-      color: var(--text-secondary);
-      text-align: left;
-      cursor: pointer;
-      transition: all 0.15s ease;
-    }
-
-    .suggestion-item:hover {
-      background: var(--bg-surface);
-      color: var(--text-primary);
-      border-color: var(--border-muted);
-    }
-
-    .chat-row {
-      max-width: 800px;
-      width: 100%;
-      margin: 0 auto;
-      display: flex;
-      gap: 14px;
-    }
-
-    .avatar {
-      width: 28px;
-      height: 28px;
-      border-radius: var(--radius-sm);
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      font-size: 11px;
-      font-weight: 600;
-      flex-shrink: 0;
-      margin-top: 2px;
-    }
-
-    .chat-row.user .avatar {
-      background: var(--bg-surface-active);
-      color: var(--text-secondary);
-      border: 1px solid var(--border-subtle);
-    }
-
-    .chat-row.assistant .avatar {
-      background: var(--bg-subtle);
-      border: 1px solid var(--border-subtle);
-      overflow: hidden;
-    }
-
-    .chat-row.assistant .avatar img {
-      width: 20px;
-      height: 20px;
-      object-fit: contain;
-    }
-
-    .message-content-box {
-      flex: 1;
-      display: flex;
-      flex-direction: column;
-      gap: 6px;
-    }
-
-    .message-meta {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      font-size: 12px;
-      font-weight: 500;
-      color: var(--text-secondary);
-    }
-
-    .message-body {
-      font-size: 14px;
-      line-height: 1.6;
-      color: var(--text-primary);
-      white-space: pre-wrap;
-      word-break: break-word;
-    }
-
-    .message-body code {
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 12px;
-      background: var(--bg-subtle);
-      border: 1px solid var(--border-subtle);
-      padding: 2px 5px;
-      border-radius: var(--radius-sm);
-      color: var(--text-primary);
-    }
-
-    .message-body pre {
-      background: var(--bg-subtle);
-      border: 1px solid var(--border-subtle);
-      border-radius: var(--radius-md);
-      padding: 12px 14px;
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 12.5px;
-      overflow-x: auto;
-      margin: 10px 0;
-      color: #e2e8f0;
-    }
-
-    .message-telemetry {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 11px;
-      color: var(--text-muted);
-      margin-top: 4px;
-    }
-
-    .cursor-blink {
-      display: inline-block;
-      width: 6px;
-      height: 14px;
-      background: var(--text-secondary);
-      vertical-align: middle;
-      animation: blink 0.8s infinite;
-      margin-left: 2px;
-    }
-
+    /* Blinking Cursor Animation */
     @keyframes blink {
       0%, 100% { opacity: 1; }
       50% { opacity: 0; }
     }
-
-    /* ── Refined Input Area ─────────────────────────────────────────────────── */
-    .input-wrapper {
-      padding: 16px 24px 20px 24px;
-      background: var(--bg-canvas);
-      border-top: 1px solid var(--border-subtle);
-      position: relative;
+    .cursor-blink {
+      animation: blink 0.9s step-end infinite;
     }
 
-    .input-box {
-      max-width: 800px;
-      margin: 0 auto;
-      background: var(--bg-subtle);
-      border: 1px solid var(--border-muted);
-      border-radius: var(--radius-lg);
-      padding: 10px 14px;
-      display: flex;
-      flex-direction: column;
-      gap: 10px;
-      transition: border-color 0.15s ease, box-shadow 0.15s ease;
-    }
-
-    .input-box:focus-within {
-      border-color: var(--border-focus);
-      box-shadow: 0 0 0 1px var(--border-focus);
-    }
-
-    .chat-textarea {
+    /* Range Slider Styling */
+    input[type=range] {
+      -webkit-appearance: none;
+      appearance: none;
       width: 100%;
       background: transparent;
-      border: none;
+    }
+    input[type=range]::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      appearance: none;
+      height: 16px;
+      width: 16px;
+      border-radius: 50%;
+      background: #8d4b00;
+      cursor: pointer;
+      margin-top: -6px;
+      box-shadow: 0 1px 3px rgba(0, 0, 0, 0.15);
+      transition: transform 0.1s ease;
+    }
+    input[type=range]::-webkit-slider-thumb:hover {
+      transform: scale(1.15);
+    }
+    input[type=range]::-webkit-slider-runnable-track {
+      width: 100%;
+      height: 4px;
+      cursor: pointer;
+      background: #e3e2e0;
+      border-radius: 2px;
+    }
+    input[type=range]:focus {
       outline: none;
-      color: var(--text-primary);
-      font-size: 14px;
-      font-family: inherit;
-      resize: none;
-      min-height: 38px;
-      max-height: 180px;
-      line-height: 1.5;
     }
 
-    .input-actions {
+    /* Code Container Dark Mode Preview */
+    .code-dark-container {
+      background-color: #1a1c23;
+      color: #e2e8f0;
+    }
+    .syntax-key { color: #ffb77d; }
+    .syntax-string { color: #6cf8bb; }
+    .syntax-number { color: #ffdcc3; }
+    .syntax-operator { color: #94a3b8; }
+    .syntax-boolean { color: #f59e0b; }
+
+    /* Shadow Helpers */
+    .shadow-soft {
+      box-shadow: 0 2px 8px -2px rgba(0, 0, 0, 0.04), 0 1px 2px rgba(0, 0, 0, 0.02);
+    }
+    .shadow-dock {
+      box-shadow: 0 4px 24px -4px rgba(0, 0, 0, 0.08), 0 2px 6px -2px rgba(0, 0, 0, 0.04);
+    }
+
+    /* ── Offline / no-CDN fallback ──────────────────────────────────────────
+       Tailwind and Material Symbols are loaded from the network. When Glint is
+       run air-gapped they silently fail, so `<html>` gets `no-cdn` / `no-icons`
+       and these rules keep the page legible instead of raw. This is a legibility
+       floor, not visual parity — that would need a vendored Tailwind build. */
+    .no-icons .material-symbols-outlined {
+      font-size: 0;
+    }
+    .no-icons .material-symbols-outlined::after {
+      content: "\25CF"; /* neutral dot, never the raw ligature name */
+      font-size: 13px;
+    }
+    #assetWarning {
+      display: none;
+    }
+    .no-cdn #assetWarning,
+    .no-icons #assetWarning {
+      display: block;
+      padding: 6px 24px;
+      background: #ffdad6;
+      color: #93000a;
+      font-size: 12px;
+      text-align: center;
+      border-bottom: 1px solid #ba1a1a33;
+    }
+    .no-cdn body {
+      margin: 0;
+      background: #faf9f6;
+      color: #1a1c1a;
+      font: 15px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif;
+      overflow: auto;
+    }
+    .no-cdn header {
       display: flex;
+      align-items: center;
       justify-content: space-between;
-      align-items: center;
+      gap: 16px;
+      padding: 8px 24px;
+      border-bottom: 1px solid #e3e2e0;
+      position: static;
     }
-
-    .keyboard-hint {
-      font-size: 11px;
-      color: var(--text-muted);
+    .no-cdn nav {
       display: flex;
-      align-items: center;
       gap: 4px;
     }
-
-    kbd {
-      background: var(--bg-surface);
-      border: 1px solid var(--border-subtle);
-      padding: 1px 5px;
-      border-radius: var(--radius-sm);
-      font-family: inherit;
-      font-size: 10px;
-      color: var(--text-secondary);
-    }
-
-    .btn-action {
-      background: var(--accent);
-      color: #ffffff;
-      font-size: 13px;
-      font-weight: 500;
-      padding: 6px 14px;
-      border-radius: var(--radius-sm);
-      border: none;
+    .no-cdn button {
+      font: inherit;
+      padding: 6px 12px;
+      border: 1px solid #e3e2e0;
+      border-radius: 8px;
+      background: #ffffff;
       cursor: pointer;
-      transition: background 0.15s ease;
-      display: flex;
-      align-items: center;
-      gap: 6px;
     }
-
-    .btn-action:hover {
-      background: var(--accent-hover);
+    .no-cdn #parametersSidebar {
+      border-left: 1px solid #e3e2e0;
+      padding: 0;
     }
-
-    .btn-action.stop {
-      background: var(--status-danger);
-    }
-
-    /* ── Split Studios (Structured & Tools) ─────────────────────────────────── */
-    .studio-layout {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      width: 100%;
-      height: 100%;
-      padding: 20px;
-      gap: 20px;
-    }
-
-    .panel-card {
-      background: var(--bg-subtle);
-      border: 1px solid var(--border-subtle);
-      border-radius: var(--radius-lg);
+    .no-cdn #messageListContainer {
+      max-width: 768px;
+      margin: 0 auto;
       display: flex;
       flex-direction: column;
+      gap: 20px;
+      padding: 16px;
+    }
+    .no-cdn #messageListContainer > div {
+      border: 1px solid #e3e2e0;
+      border-radius: 12px;
+      padding: 10px 14px;
+      background: #ffffff;
+    }
+    .no-cdn textarea,
+    .no-cdn input[type=range] {
+      width: 100%;
+      font: inherit;
+    }
+    .no-cdn .hidden {
+      display: none;
+    }
+
+    /* Parameters sidebar collapse — single source of truth for hidden state */
+    #parametersSidebar {
+      width: 300px;
       overflow: hidden;
     }
-
-    .panel-header {
-      height: 44px;
-      background: var(--bg-surface);
-      border-bottom: 1px solid var(--border-subtle);
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      padding: 0 16px;
-      font-size: 12px;
-      font-weight: 600;
-      color: var(--text-secondary);
+    #parametersSidebar.sidebar-collapsed {
+      width: 0;
+      opacity: 0;
+      border-left-width: 0;
+      pointer-events: none;
     }
 
-    .code-editor {
-      flex: 1;
-      background: var(--bg-canvas);
-      padding: 16px;
-      color: var(--text-primary);
+    /* Markdown Code Blocks */
+    .chat-prose pre {
+      background: #f4f3f1;
+      border: 1px solid #e3e2e0;
+      border-radius: 8px;
+      padding: 12px 14px;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 13px;
+      overflow-x: auto;
+      margin: 10px 0;
+      color: #1a1c1a;
+      position: relative;
+    }
+    .chat-prose code {
       font-family: 'JetBrains Mono', monospace;
       font-size: 12.5px;
-      border: none;
-      outline: none;
-      resize: none;
-      line-height: 1.5;
+      background: #efeeeb;
+      padding: 2px 5px;
+      border-radius: 4px;
+      color: #8d4b00;
     }
-
-    .panel-footer {
-      padding: 12px 16px;
-      background: var(--bg-surface);
-      border-top: 1px solid var(--border-subtle);
-      display: flex;
-      gap: 8px;
-    }
-
-    /* ── Metrics Dashboard ──────────────────────────────────────────────────── */
-    .metrics-layout {
-      width: 100%;
-      height: 100%;
-      padding: 24px;
-      overflow-y: auto;
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
-      gap: 20px;
-      align-content: start;
-    }
-
-    .metric-card {
-      background: var(--bg-subtle);
-      border: 1px solid var(--border-subtle);
-      border-radius: var(--radius-lg);
-      padding: 20px;
-      display: flex;
-      flex-direction: column;
-      gap: 12px;
-    }
-
-    .metric-title {
-      font-size: 12px;
-      font-weight: 500;
-      color: var(--text-muted);
-    }
-
-    .metric-stat {
-      font-size: 32px;
-      font-weight: 600;
-      letter-spacing: -0.02em;
-      color: var(--text-primary);
-      display: flex;
-      align-items: baseline;
-      gap: 6px;
-    }
-
-    .metric-unit {
-      font-size: 14px;
-      font-weight: 400;
-      color: var(--text-muted);
-    }
-
-    .metric-desc {
-      font-size: 12px;
-      color: var(--text-secondary);
-      line-height: 1.4;
-    }
-
-    .kv-matrix {
-      display: grid;
-      grid-template-columns: repeat(16, 1fr);
-      gap: 4px;
-      margin-top: 4px;
-    }
-
-    .kv-block {
-      height: 12px;
-      border-radius: 2px;
-      background: var(--bg-surface);
-      border: 1px solid var(--border-subtle);
-    }
-
-    .kv-block.active {
-      background: var(--accent);
-    }
-
-    .kv-block.cached {
-      background: var(--text-muted);
+    .chat-prose pre code {
+      background: transparent;
+      padding: 0;
+      color: inherit;
     }
   </style>
 </head>
-<body>
+<body class="bg-surface text-on-surface antialiased font-body-md text-[15px] overflow-hidden selection:bg-primary-fixed selection:text-on-primary-fixed">
 
-  <!-- Top Navigation Bar -->
-  <header>
-    <a href="/" class="brand">
-      <div class="brand-logo">
-        <img src="/assets/logo.svg" alt="Glint">
-      </div>
-      <div class="brand-title">
-        Glint
-        <span class="brand-model-pill" id="headerModelTag">Loading...</span>
-      </div>
-    </a>
+  <div id="assetWarning" role="status">
+    Remote style/icon assets could not be loaded — running in reduced-styling offline mode.
+  </div>
 
-    <nav class="nav-group">
-      <button class="nav-item active" data-tab="chat">
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+  <!-- ── Top Header / Masthead ─────────────────────────────────────────────── -->
+  <header class="flex justify-between items-center px-gutter w-full fixed top-0 z-50 bg-surface/85 backdrop-blur-md border-b border-surface-variant h-[56px]">
+    <!-- Brand Logo -->
+    <div class="flex-shrink-0 flex items-center gap-2">
+      <div class="w-8 h-8 rounded-lg bg-surface-container-lowest border border-surface-variant flex items-center justify-center shadow-sm">
+        <span class="material-symbols-outlined text-primary text-[18px]" style="font-variation-settings: 'FILL' 1;">auto_awesome</span>
+      </div>
+      <span class="font-display text-[20px] font-bold text-primary tracking-tight">Glint</span>
+    </div>
+
+    <!-- Navigation Tabs -->
+    <nav class="flex items-center gap-1" id="navTabs">
+      <button class="nav-btn px-4 py-1.5 font-label-md text-[14px] text-on-surface font-semibold border-b-2 border-primary transition-all flex items-center gap-1.5" data-tab="chat">
+        <span class="material-symbols-outlined text-[18px]">chat_bubble</span>
         Chat
       </button>
-      <button class="nav-item" data-tab="structured">
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>
-        Structured Outputs
+      <button class="nav-btn px-4 py-1.5 font-label-md text-[14px] text-on-surface-variant opacity-70 hover:opacity-100 hover:text-primary transition-all flex items-center gap-1.5" data-tab="structured">
+        <span class="material-symbols-outlined text-[18px]">data_object</span>
+        Structured Lab
       </button>
-      <button class="nav-item" data-tab="tools">
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
-        Tools
-      </button>
-      <button class="nav-item" data-tab="metrics">
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
-        Metrics
+      <button class="nav-btn px-4 py-1.5 font-label-md text-[14px] text-on-surface-variant opacity-70 hover:opacity-100 hover:text-primary transition-all flex items-center gap-1.5" data-tab="telemetry">
+        <span class="material-symbols-outlined text-[18px]">speed</span>
+        KV Telemetry
       </button>
     </nav>
 
-    <div class="header-meta">
-      <div class="status-badge">
-        <div class="status-dot"></div>
-        <span id="backendIndicator">ARM NEON SIMD</span>
+    <!-- Trailing Badges & Actions -->
+    <div class="flex items-center gap-sm">
+      <div class="hidden md:flex items-center gap-2 bg-surface-container-low px-3 py-1 rounded-full border border-surface-variant">
+        <span class="font-code-md text-[12px] text-on-surface-variant" id="headerModelTag">SmolLM2-135M · Metal</span>
       </div>
+      <div class="flex items-center gap-2 bg-surface-container-low px-3 py-1 rounded-full border border-surface-variant shadow-[0_1px_2px_rgba(0,0,0,0.02)]">
+        <span class="w-2 h-2 rounded-full bg-secondary animate-pulse" id="engineStatusDot"></span>
+        <span class="font-label-md text-[12px] text-on-surface font-medium" id="engineStatusText">Ready · Local SIMD</span>
+      </div>
+      <button id="toggleSidebarBtn" class="p-1.5 rounded-lg text-on-surface-variant hover:bg-surface-container-high transition-colors" title="Toggle Parameters Sidebar">
+        <span class="material-symbols-outlined text-[20px]">tune</span>
+      </button>
     </div>
   </header>
 
-  <main>
-    <!-- Pane 1: Chat -->
-    <div class="workspace-pane active" id="chatPane">
-      <aside class="sidebar">
-        <div>
-          <div class="sidebar-title">Parameters</div>
-          <div class="control-group" style="margin-bottom: 14px;">
-            <div class="control-row">
-              <span>Temperature</span>
-              <span class="control-val" id="tempValue">0.70</span>
-            </div>
-            <input type="range" id="tempRange" min="0" max="2" step="0.05" value="0.7">
-          </div>
-
-          <div class="control-group" style="margin-bottom: 14px;">
-            <div class="control-row">
-              <span>Top P</span>
-              <span class="control-val" id="topPValue">0.90</span>
-            </div>
-            <input type="range" id="topPRange" min="0" max="1" step="0.05" value="0.9">
-          </div>
-
-          <div class="control-group" style="margin-bottom: 14px;">
-            <div class="control-row">
-              <span>Max Tokens</span>
-              <span class="control-val" id="maxTokensValue">512</span>
-            </div>
-            <input type="number" id="maxTokensInput" min="16" max="4096" value="512">
-          </div>
-        </div>
-
-        <div class="control-group">
-          <div class="sidebar-title">System Prompt</div>
-          <textarea id="systemPrompt" rows="4" placeholder="Optional system instructions...">You are Glint, an efficient and helpful AI assistant.</textarea>
-        </div>
-
-        <button class="btn-secondary" id="clearChatBtn" style="margin-top: auto;">
-          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
-          Clear History
-        </button>
-      </aside>
-
-      <section class="chat-container">
-        <div class="chat-scroll" id="chatFeed">
-          <div class="empty-state" id="emptyState">
-            <div class="empty-logo">
-              <img src="/assets/logo.svg" alt="Glint">
-            </div>
-            <div class="empty-title">Welcome to Glint</div>
-            <div class="empty-subtitle">Direct, zero-dependency local LLM inference running with SIMD acceleration.</div>
-            <div class="prompt-suggestions">
-              <div class="suggestion-item" data-prompt="Explain the difference between LLaMA and Qwen architectures.">Explain the difference between LLaMA and Qwen architectures.</div>
-              <div class="suggestion-item" data-prompt="Write a fast Rust function for SIMD vector dot products.">Write a fast Rust function for SIMD vector dot products.</div>
-              <div class="suggestion-item" data-prompt="What are the trade-offs of Q4_K_M vs Q8_0 quantization?">What are the trade-offs of Q4_K_M vs Q8_0 quantization?</div>
-            </div>
-          </div>
-        </div>
-
-        <div class="input-wrapper">
-          <div class="input-box">
-            <textarea class="chat-textarea" id="chatInput" placeholder="Send a message..." rows="1"></textarea>
-            <div class="input-actions">
-              <div class="keyboard-hint">
-                <kbd>Return</kbd> to send, <kbd>Shift + Return</kbd> for new line
+  <!-- ── Main Layout Viewport ─────────────────────────────────────────────── -->
+  <div class="pt-[56px] h-screen flex flex-row relative w-full overflow-hidden">
+    
+    <!-- ── Center Workspace Area ──────────────────────────────────────────── -->
+    <div class="flex-1 h-full flex flex-col relative overflow-hidden transition-all duration-200" id="mainContentWrapper">
+      
+      <!-- ── Workspace 1: Chat View ────────────────────────────────────────── -->
+      <section class="workspace-view flex-1 flex flex-col h-full relative" id="chatView">
+        <!-- Scrollable Messages Feed -->
+        <main class="flex-1 overflow-y-auto px-4 py-6 flex flex-col items-center" id="chatFeed">
+          <div class="w-full max-w-[768px] flex flex-col gap-6 pb-36" id="messageListContainer">
+            
+            <!-- Empty State Greeting -->
+            <div class="flex flex-col items-center text-center gap-4 py-12 px-4" id="emptyState">
+              <div class="w-12 h-12 rounded-2xl bg-surface-container-lowest border border-surface-variant flex items-center justify-center shadow-soft">
+                <span class="material-symbols-outlined text-primary text-[24px]" style="font-variation-settings: 'FILL' 1;">auto_awesome</span>
               </div>
-              <button class="btn-action" id="actionBtn">
-                <span id="btnText">Send</span>
-                <svg id="btnIcon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
-              </button>
+              <div>
+                <h1 class="font-headline-md text-[22px] font-semibold text-on-surface mb-1">Glint Local Inference</h1>
+                <p class="font-body-md text-[14px] text-on-surface-variant max-w-[480px]">
+                  Zero-dependency transformer execution running directly on your silicon. Private, instant, unmetered.
+                </p>
+              </div>
+
+              <!-- Suggested Prompts -->
+              <div class="grid grid-cols-1 sm:grid-cols-2 gap-2.5 w-full max-w-[560px] mt-4">
+                <button class="suggestion-card p-3 rounded-xl bg-surface-container-lowest border border-surface-variant hover:border-primary/40 hover:bg-surface-container-low text-left transition-all shadow-sm flex flex-col gap-1" data-prompt="Explain how KV caching speeds up transformer inference.">
+                  <span class="font-label-md text-[13px] font-semibold text-on-surface">KV Caching</span>
+                  <span class="font-body-sm text-[12px] text-on-surface-variant">Explain how KV caching speeds up inference.</span>
+                </button>
+                <button class="suggestion-card p-3 rounded-xl bg-surface-container-lowest border border-surface-variant hover:border-primary/40 hover:bg-surface-container-low text-left transition-all shadow-sm flex flex-col gap-1" data-prompt="Write a fast Rust function for SIMD dot products.">
+                  <span class="font-label-md text-[13px] font-semibold text-on-surface">Systems Rust</span>
+                  <span class="font-body-sm text-[12px] text-on-surface-variant">Write a fast Rust SIMD dot product function.</span>
+                </button>
+                <button class="suggestion-card p-3 rounded-xl bg-surface-container-lowest border border-surface-variant hover:border-primary/40 hover:bg-surface-container-low text-left transition-all shadow-sm flex flex-col gap-1" data-prompt="What is the difference between RoPE and ALiBi positional embeddings?">
+                  <span class="font-label-md text-[13px] font-semibold text-on-surface">Architecture</span>
+                  <span class="font-body-sm text-[12px] text-on-surface-variant">Difference between RoPE and ALiBi embeddings.</span>
+                </button>
+                <button class="suggestion-card p-3 rounded-xl bg-surface-container-lowest border border-surface-variant hover:border-primary/40 hover:bg-surface-container-low text-left transition-all shadow-sm flex flex-col gap-1" data-prompt="How does speculative decoding achieve 2-3x speedups?">
+                  <span class="font-label-md text-[13px] font-semibold text-on-surface">Speculative Decoding</span>
+                  <span class="font-body-sm text-[12px] text-on-surface-variant">How draft models accelerate token throughput.</span>
+                </button>
+              </div>
+            </div>
+
+          </div>
+        </main>
+
+        <!-- Floating Omnibar Input Dock -->
+        <div class="absolute bottom-4 left-0 right-0 flex justify-center px-4 pointer-events-none z-30">
+          <div class="w-full max-w-[768px] pointer-events-auto">
+            <div class="bg-surface-container-lowest border border-surface-variant rounded-[20px] shadow-dock flex flex-col overflow-hidden transition-all focus-within:shadow-[0_6px_32px_-4px_rgba(0,0,0,0.12)] focus-within:border-outline-variant">
+              <textarea id="chatInput" class="w-full bg-transparent border-none focus:ring-0 resize-none px-lg pt-3.5 pb-2 font-body-md text-[15px] text-on-surface placeholder:text-tertiary-container focus:outline-none" placeholder="Message Glint or type / for commands..." rows="1"></textarea>
+              
+              <div class="flex justify-between items-center px-3 pb-2.5 pt-1 bg-surface-container-lowest">
+                <!-- Left Quick Parameter Badges -->
+                <div class="flex items-center gap-1.5">
+                  <div class="bg-surface-container px-2 py-0.5 rounded-full flex items-center gap-1 border border-surface-variant/50">
+                    <span class="font-code-md text-[11px] text-on-surface-variant" id="dockTempBadge">T: 0.70</span>
+                  </div>
+                  <div class="bg-surface-container px-2 py-0.5 rounded-full flex items-center gap-1 border border-surface-variant/50">
+                    <span class="font-code-md text-[11px] text-on-surface-variant" id="dockTopPBadge">P: 0.90</span>
+                  </div>
+                  <button id="clearChatBtn" class="p-1 rounded-full text-on-surface-variant hover:text-error hover:bg-surface-container transition-colors ml-1" title="Clear conversation">
+                    <span class="material-symbols-outlined text-[18px]">delete_sweep</span>
+                  </button>
+                </div>
+
+                <!-- Right Send & Budget -->
+                <div class="flex items-center gap-3">
+                  <span class="font-code-md text-[11px] text-tertiary-container hidden sm:inline" id="tokenBudgetTag">0 / 4096 tok</span>
+                  <button id="actionBtn" class="w-9 h-9 flex items-center justify-center rounded-full bg-primary hover:bg-primary-container text-on-primary shadow-sm transition-all active:scale-95">
+                    <span class="material-symbols-outlined text-[18px]" id="actionBtnIcon" style="font-variation-settings: 'FILL' 1;">arrow_upward</span>
+                  </button>
+                </div>
+              </div>
+            </div>
+            <div class="text-center mt-1.5">
+              <span class="font-label-md text-[11px] text-tertiary-container">Glint runs 100% locally on device. Space to think.</span>
             </div>
           </div>
         </div>
       </section>
-    </div>
 
-    <!-- Pane 2: Structured Outputs -->
-    <div class="workspace-pane" id="structuredPane">
-      <div class="studio-layout">
-        <div class="panel-card">
-          <div class="panel-header">
-            <span>JSON Schema Definition</span>
-            <div style="display: flex; gap: 6px;">
-              <button class="btn-secondary" style="padding: 2px 8px; font-size: 11px;" id="presetUser">User Object</button>
-              <button class="btn-secondary" style="padding: 2px 8px; font-size: 11px;" id="presetEntity">Entity Extraction</button>
+      <!-- ── Workspace 2: Structured Outputs Lab ──────────────────────────── -->
+      <section class="workspace-view hidden flex-1 flex flex-col h-full p-6 overflow-hidden" id="structuredView">
+        <div class="w-full max-w-container-max mx-auto h-full flex flex-col gap-4">
+          
+          <div class="flex justify-between items-center">
+            <div>
+              <h1 class="font-headline-md text-[20px] font-bold text-on-surface">Structured Output & Grammar Lab</h1>
+              <p class="font-body-sm text-[13px] text-on-surface-variant">Constrain autoregressive logits with JSON Schema and GBNF grammars.</p>
+            </div>
+            <!-- Preset Buttons -->
+            <div class="flex items-center gap-2">
+              <button id="presetUserBtn" class="px-3 py-1.5 bg-surface-container-lowest hover:bg-surface-container border border-surface-variant text-on-surface text-[12px] font-semibold rounded-lg shadow-sm transition-all">
+                User Profile
+              </button>
+              <button id="presetEntityBtn" class="px-3 py-1.5 bg-surface-container-lowest hover:bg-surface-container border border-surface-variant text-on-surface text-[12px] font-semibold rounded-lg shadow-sm transition-all">
+                Named Entities
+              </button>
             </div>
           </div>
-          <textarea class="code-editor" id="schemaInput">{
+
+          <!-- Dual Editor Grid -->
+          <div class="grid grid-cols-1 lg:grid-cols-2 gap-4 flex-1 min-h-0">
+            <!-- Left: Grammar / Schema Definition -->
+            <div class="flex flex-col bg-surface-container-lowest border border-surface-variant rounded-xl overflow-hidden shadow-soft">
+              <div class="flex justify-between items-center px-4 py-2.5 border-b border-surface-variant bg-surface-container-low">
+                <div class="flex items-center gap-2">
+                  <span class="material-symbols-outlined text-primary text-[18px]">data_object</span>
+                  <span class="font-label-md text-[13px] font-semibold text-on-surface">JSON Schema Definition</span>
+                </div>
+                <div class="bg-secondary-container/40 text-on-secondary-container px-2.5 py-0.5 rounded-full text-[11px] font-semibold flex items-center gap-1 border border-secondary-container">
+                  <span class="material-symbols-outlined text-[14px]">check_circle</span>
+                  Valid Schema
+                </div>
+              </div>
+              
+              <textarea id="schemaInput" class="flex-1 bg-surface-container-lowest p-4 font-code-md text-[13px] text-on-surface border-none focus:ring-0 focus:outline-none resize-none" spellcheck="false">{
   "type": "object",
   "properties": {
-    "name": { "type": "string" },
-    "role": { "type": "string" },
-    "skills": { 
+    "product_name": { "type": "string" },
+    "price": { "type": "number", "minimum": 0 },
+    "in_stock": { "type": "boolean" },
+    "tags": { 
       "type": "array", 
       "items": { "type": "string" } 
     }
   },
-  "required": ["name", "role", "skills"]
+  "required": ["product_name", "price", "in_stock", "tags"]
 }</textarea>
-          <div class="panel-footer">
-            <input type="text" id="schemaPrompt" value="Create a profile for a senior systems software engineer specializing in Rust" style="flex: 1;">
-            <button class="btn-action" id="executeSchemaBtn">Generate</button>
-          </div>
-        </div>
 
-        <div class="panel-card">
-          <div class="panel-header">
-            <span>Validated Output</span>
-            <span id="schemaStatus" style="font-family: 'JetBrains Mono', monospace; font-size: 11px;">Ready</span>
+              <div class="p-3 border-t border-surface-variant bg-surface-container-low flex gap-2 items-center">
+                <input type="text" id="schemaPromptInput" class="flex-1 bg-surface-container-lowest border border-surface-variant rounded-lg px-3 py-1.5 text-[13px] text-on-surface focus:outline-none focus:border-primary" value="Generate a product specification for a mechanical split ergonomic keyboard">
+                <button id="executeSchemaBtn" class="bg-primary hover:bg-primary-container text-on-primary px-4 py-1.5 rounded-lg text-[13px] font-semibold shadow-sm transition-all flex items-center gap-1.5">
+                  <span class="material-symbols-outlined text-[16px]">play_arrow</span>
+                  Sample
+                </button>
+              </div>
+            </div>
+
+            <!-- Right: Validated JSON Preview -->
+            <div class="flex flex-col bg-surface-container-lowest border border-surface-variant rounded-xl overflow-hidden shadow-soft">
+              <div class="flex justify-between items-center px-4 py-2.5 border-b border-surface-variant bg-surface-container-low">
+                <div class="flex items-center gap-2">
+                  <span class="material-symbols-outlined text-secondary text-[18px]">preview</span>
+                  <span class="font-label-md text-[13px] font-semibold text-on-surface">Guaranteed Structured Output</span>
+                </div>
+                <div class="flex items-center gap-1.5" id="schemaStatusBadge">
+                  <span class="w-2 h-2 rounded-full bg-secondary"></span>
+                  <span class="font-code-md text-[11px] text-on-surface-variant" id="schemaStatusText">Awaiting Generation</span>
+                </div>
+              </div>
+
+              <div class="flex-1 overflow-auto code-dark-container p-4 font-code-md text-[13px]">
+                <pre><code id="schemaOutput">// Validated JSON conforming strictly to the schema will appear here...</code></pre>
+              </div>
+
+              <div class="p-3 border-t border-surface-variant bg-surface-container-low flex justify-end gap-2">
+                <button id="copySchemaOutputBtn" class="px-3 py-1.5 bg-surface-container-lowest hover:bg-surface-container border border-surface-variant text-on-surface text-[12px] font-semibold rounded-lg shadow-sm transition-all flex items-center gap-1">
+                  <span class="material-symbols-outlined text-[16px]">content_copy</span>
+                  Copy JSON
+                </button>
+              </div>
+            </div>
           </div>
-          <textarea class="code-editor" id="schemaOutput" readonly placeholder="Structured output will appear here..."></textarea>
+
         </div>
-      </div>
+      </section>
+
+      <!-- ── Workspace 3: KV Telemetry & Benchmarks ────────────────────────── -->
+      <section class="workspace-view hidden flex-1 flex flex-col h-full p-6 overflow-y-auto" id="telemetryView">
+        <div class="w-full max-w-container-max mx-auto flex flex-col gap-6 pb-12">
+          
+          <header>
+            <h1 class="font-headline-md text-[24px] font-bold text-on-surface mb-1">KV Cache & Telemetry</h1>
+            <p class="font-body-md text-[14px] text-on-surface-variant">Real-time memory residency, token throughput, and prefill/decode latency.</p>
+          </header>
+
+          <!-- Bento Grid Layout -->
+          <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+            
+            <!-- Card 1: KV Cache Residency (Spans 2 columns) -->
+            <div class="lg:col-span-2 bg-surface-container-lowest border border-surface-variant rounded-xl p-6 shadow-soft flex flex-col">
+              <div class="flex justify-between items-center mb-2">
+                <h2 class="font-headline-md text-[16px] font-semibold text-on-surface flex items-center gap-2">
+                  <span class="material-symbols-outlined text-secondary">memory</span>
+                  KV Cache Page Allocation
+                </h2>
+                <span class="font-code-md text-[11px] text-on-surface-variant bg-surface-container px-2 py-0.5 rounded-full" id="kvPoolStatTag">Live Pool</span>
+              </div>
+              <p class="font-body-sm text-[13px] text-on-surface-variant mb-6">Key-Value tensor page residency across active inference layers.</p>
+
+              <!-- Timeline Bars Visualizer -->
+              <div class="flex-1 relative min-h-[160px] flex items-end overflow-hidden border-b border-surface-variant pb-2 gap-1.5" id="telemetryBars">
+                <!-- 24 dynamic bars -->
+              </div>
+              <div class="flex justify-between font-code-md text-[11px] text-tertiary-container mt-2">
+                <span>-60s Timeline</span>
+                <span id="kvAllocatedCount">Live: 180 MB Cached</span>
+              </div>
+            </div>
+
+            <!-- Card 2: Latency Breakdown -->
+            <div class="bg-surface-container-lowest border border-surface-variant rounded-xl p-6 shadow-soft flex flex-col justify-between">
+              <div>
+                <h2 class="font-headline-md text-[16px] font-semibold text-on-surface flex items-center gap-2 mb-1">
+                  <span class="material-symbols-outlined text-primary">speed</span>
+                  Latency Breakdown
+                </h2>
+                <p class="font-body-sm text-[13px] text-on-surface-variant mb-4">Prompt prefill vs autoregressive decode TPOT.</p>
+              </div>
+
+              <div class="flex flex-col gap-4">
+                <div>
+                  <div class="flex justify-between font-label-md text-[13px] mb-1.5">
+                    <span class="text-on-surface-variant">Prefill (TTFT)</span>
+                    <span class="font-code-md text-on-surface font-semibold" id="telemetryTTFT">12.4 ms</span>
+                  </div>
+                  <div class="w-full bg-surface-container h-2 rounded-full overflow-hidden">
+                    <div class="bg-primary h-full rounded-full transition-all duration-300" id="ttftBar" style="width: 25%"></div>
+                  </div>
+                </div>
+
+                <div>
+                  <div class="flex justify-between font-label-md text-[13px] mb-1.5">
+                    <span class="text-on-surface-variant">Decode TPOT</span>
+                    <span class="font-code-md text-on-surface font-semibold" id="telemetryTPOT">18.5 ms / tok</span>
+                  </div>
+                  <div class="w-full bg-surface-container h-2 rounded-full overflow-hidden">
+                    <div class="bg-secondary h-full rounded-full transition-all duration-300" id="tpotBar" style="width: 55%"></div>
+                  </div>
+                </div>
+
+                <div class="p-3 bg-surface-container-low rounded-lg border border-surface-variant mt-2 flex justify-between items-center">
+                  <span class="font-body-sm text-[13px] text-on-surface-variant">Current Speed</span>
+                  <span class="font-headline-md text-[20px] font-bold text-on-surface" id="telemetryThroughput">54.0 <span class="text-[13px] font-normal text-on-surface-variant">tok/s</span></span>
+                </div>
+              </div>
+            </div>
+
+            <!-- Card 3: Unified RAM Footprint (Full 3 cols) -->
+            <div class="lg:col-span-3 bg-surface-container-lowest border border-surface-variant rounded-xl p-6 shadow-soft flex flex-col">
+              <div class="flex justify-between items-end mb-3">
+                <div>
+                  <h2 class="font-headline-md text-[16px] font-semibold text-on-surface flex items-center gap-2 mb-0.5">
+                    <span class="material-symbols-outlined text-tertiary">analytics</span>
+                    Unified Memory Footprint
+                  </h2>
+                  <p class="font-body-sm text-[13px] text-on-surface-variant">Apple Silicon unified RAM / GPU memory allocation.</p>
+                </div>
+                <div class="text-right">
+                  <span class="font-headline-md text-[20px] font-bold text-on-surface" id="telemetryRamTotal">1.4 <span class="text-[13px] font-normal text-on-surface-variant">GB / 32 GB</span></span>
+                </div>
+              </div>
+
+              <!-- Segmented Memory Bar -->
+              <div class="w-full flex h-3.5 rounded-full overflow-hidden my-3 shadow-inner bg-surface-container">
+                <div class="bg-primary transition-all duration-300" style="width: 4.5%;" title="Model Weights"></div>
+                <div class="bg-secondary transition-all duration-300" style="width: 1.2%;" title="KV Cache"></div>
+                <div class="bg-tertiary-container opacity-50 transition-all duration-300" style="width: 1.0%;" title="Runtime Overhead"></div>
+                <div class="bg-surface-container-high transition-all duration-300" style="width: 93.3%;"></div>
+              </div>
+
+              <!-- Legend -->
+              <div class="flex flex-wrap gap-6 font-label-md text-[12px] text-on-surface-variant mt-2">
+                <div class="flex items-center gap-1.5">
+                  <span class="w-2.5 h-2.5 rounded-full bg-primary block"></span>
+                  Model Weights (1.1 GB)
+                </div>
+                <div class="flex items-center gap-1.5">
+                  <span class="w-2.5 h-2.5 rounded-full bg-secondary block"></span>
+                  KV Cache Pages (180 MB)
+                </div>
+                <div class="flex items-center gap-1.5">
+                  <span class="w-2.5 h-2.5 rounded-full bg-tertiary-container opacity-50 block"></span>
+                  Runtime Overhead (120 MB)
+                </div>
+                <div class="flex items-center gap-1.5 ml-auto">
+                  <span class="material-symbols-outlined text-[14px]">bolt</span>
+                  Zero-Copy Unified Addressing
+                </div>
+              </div>
+            </div>
+
+            <!-- Card 4: Server Cumulative Counters -->
+            <div class="lg:col-span-3 grid grid-cols-2 sm:grid-cols-4 gap-4">
+              <div class="bg-surface-container-lowest border border-surface-variant p-4 rounded-xl shadow-soft">
+                <div class="font-body-sm text-[12px] text-on-surface-variant">Total Requests</div>
+                <div class="font-headline-md text-[20px] font-bold text-on-surface mt-1" id="statReqTotal">0</div>
+              </div>
+              <div class="bg-surface-container-lowest border border-surface-variant p-4 rounded-xl shadow-soft">
+                <div class="font-body-sm text-[12px] text-on-surface-variant">Tokens Generated</div>
+                <div class="font-headline-md text-[20px] font-bold text-on-surface mt-1" id="statTokTotal">0</div>
+              </div>
+              <div class="bg-surface-container-lowest border border-surface-variant p-4 rounded-xl shadow-soft">
+                <div class="font-body-sm text-[12px] text-on-surface-variant">Active Sessions</div>
+                <div class="font-headline-md text-[20px] font-bold text-on-surface mt-1" id="statActiveSessions">0</div>
+              </div>
+              <div class="bg-surface-container-lowest border border-surface-variant p-4 rounded-xl shadow-soft">
+                <div class="font-body-sm text-[12px] text-on-surface-variant">Engine Uptime</div>
+                <div class="font-headline-md text-[20px] font-bold text-on-surface mt-1" id="statUptime">0s</div>
+              </div>
+            </div>
+
+          </div>
+        </div>
+      </section>
+
     </div>
 
-    <!-- Pane 3: Tools -->
-    <div class="workspace-pane" id="toolsPane">
-      <div class="studio-layout">
-        <div class="panel-card">
-          <div class="panel-header">
-            <span>Tools / Function Declarations</span>
-          </div>
-          <textarea class="code-editor" id="toolsConfig">[
-  {
-    "type": "function",
-    "function": {
-      "name": "get_weather",
-      "description": "Get the current weather for a location",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "location": { "type": "string", "description": "City and state, e.g. San Francisco, CA" },
-          "unit": { "type": "string", "enum": ["celsius", "fahrenheit"] }
-        },
-        "required": ["location"]
-      }
-    }
-  }
-]</textarea>
-          <div class="panel-footer">
-            <input type="text" id="toolPrompt" value="What is the weather like in Tokyo right now?" style="flex: 1;">
-            <button class="btn-action" id="executeToolBtn">Invoke</button>
-          </div>
+    <!-- ── Right Parameters Sidebar (Collapsible 300px) ────────────────────── -->
+    <aside id="parametersSidebar" class="w-[300px] h-full bg-surface-container-lowest border-l border-surface-variant flex flex-col z-40 shadow-[-4px_0_24px_rgba(0,0,0,0.02)] transition-all duration-200 flex-shrink-0">
+      
+      <!-- Drawer Header -->
+      <div class="flex items-center justify-between px-6 py-4 border-b border-surface-variant bg-surface-container-low/50">
+        <div>
+          <h2 class="font-headline-md text-[16px] font-bold text-on-surface">Parameters</h2>
+          <p class="font-body-sm text-[12px] text-on-surface-variant">Inference Configuration</p>
         </div>
-
-        <div class="panel-card">
-          <div class="panel-header">
-            <span>Tool Calls</span>
-          </div>
-          <textarea class="code-editor" id="toolsOutput" readonly placeholder="Tool invocation response will appear here..."></textarea>
-        </div>
+        <button id="closeSidebarBtn" class="p-1 rounded-lg text-on-surface-variant hover:bg-surface-container transition-colors md:hidden">
+          <span class="material-symbols-outlined text-[20px]">close</span>
+        </button>
       </div>
-    </div>
 
-    <!-- Pane 4: Metrics -->
-    <div class="workspace-pane" id="metricsPane">
-      <div class="metrics-layout">
-        <div class="metric-card">
-          <div class="metric-title">Throughput</div>
-          <div class="metric-stat" id="statThroughput">-- <span class="metric-unit">tok/s</span></div>
-          <div class="metric-desc">Continuous autoregressive decoding rate across active requests.</div>
+      <!-- Drawer Content Scrollable -->
+      <div class="flex-1 overflow-y-auto p-6 flex flex-col gap-5">
+        
+        <!-- System Prompt -->
+        <div class="flex flex-col gap-1.5">
+          <label class="font-label-md text-[13px] font-semibold text-on-surface flex items-center justify-between">
+            System Prompt
+            <span class="material-symbols-outlined text-[15px] text-tertiary-container cursor-help" title="Instructions defining persona and constraints">info</span>
+          </label>
+          <textarea id="systemPrompt" rows="3" class="w-full bg-surface-container-low border border-surface-variant rounded-lg p-2.5 font-code-md text-[12.5px] text-on-surface focus:border-primary focus:ring-1 focus:ring-primary focus:outline-none resize-none transition-colors">You are Glint, a brilliant, concise, and fast local AI assistant.</textarea>
         </div>
 
-        <div class="metric-card">
-          <div class="metric-title">Time to First Token (TTFT)</div>
-          <div class="metric-stat" id="statTTFT">-- <span class="metric-unit">ms</span></div>
-          <div class="metric-desc">Prefill latency from request admission to initial token emission.</div>
-        </div>
-
-        <div class="metric-card" style="grid-column: span 2;">
-          <div class="metric-title">KV Cache Page Pool (16-Token Pages)</div>
-          <div class="kv-matrix" id="kvGrid">
-            <!-- 64 blocks -->
+        <!-- Sliders -->
+        <div class="flex flex-col gap-4 mt-1">
+          <!-- Temperature -->
+          <div class="flex flex-col gap-1.5">
+            <div class="flex justify-between items-center">
+              <label class="font-label-md text-[13px] font-semibold text-on-surface">Temperature</label>
+              <span class="font-code-md text-[11px] bg-surface-container px-2 py-0.5 rounded text-on-surface-variant border border-surface-variant/50" id="tempValueDisplay">0.70</span>
+            </div>
+            <input type="range" id="tempSlider" min="0" max="2" step="0.05" value="0.70"/>
+            <div class="flex justify-between font-label-md text-[10px] text-tertiary-container uppercase tracking-wider">
+              <span>Precise</span>
+              <span>Creative</span>
+            </div>
           </div>
-          <div style="display: flex; justify-content: space-between; font-size: 12px; color: var(--text-secondary); margin-top: 6px;">
-            <span>Pool Utilization: <span id="kvAllocated" style="font-family: 'JetBrains Mono', monospace; color: var(--text-primary);">0 / 512 pages</span></span>
-            <span>Prefix Caching: Active</span>
+
+          <!-- Top-P -->
+          <div class="flex flex-col gap-1.5">
+            <div class="flex justify-between items-center">
+              <label class="font-label-md text-[13px] font-semibold text-on-surface">Top-P (Nucleus)</label>
+              <span class="font-code-md text-[11px] bg-surface-container px-2 py-0.5 rounded text-on-surface-variant border border-surface-variant/50" id="topPValueDisplay">0.90</span>
+            </div>
+            <input type="range" id="topPSlider" min="0" max="1" step="0.05" value="0.90"/>
+          </div>
+
+          <!-- Top-K -->
+          <div class="flex flex-col gap-1.5">
+            <div class="flex justify-between items-center">
+              <label class="font-label-md text-[13px] font-semibold text-on-surface">Top-K</label>
+              <span class="font-code-md text-[11px] bg-surface-container px-2 py-0.5 rounded text-on-surface-variant border border-surface-variant/50" id="topKValueDisplay">40</span>
+            </div>
+            <input type="range" id="topKSlider" min="0" max="100" step="1" value="40"/>
+          </div>
+
+          <!-- Max Tokens -->
+          <div class="flex flex-col gap-1.5">
+            <div class="flex justify-between items-center">
+              <label class="font-label-md text-[13px] font-semibold text-on-surface">Max Tokens</label>
+              <span class="font-code-md text-[11px] bg-surface-container px-2 py-0.5 rounded text-on-surface-variant border border-surface-variant/50" id="maxTokensValueDisplay">1024</span>
+            </div>
+            <input type="range" id="maxTokensSlider" min="64" max="4096" step="64" value="1024"/>
           </div>
         </div>
 
-        <div class="metric-card">
-          <div class="metric-title">Compute Acceleration</div>
-          <div class="metric-stat" style="font-size: 20px;">ARM NEON SIMD</div>
-          <div class="metric-desc">Vectorized 128-bit SIMD matrix kernels with multi-threaded Rayon execution.</div>
+        <!-- Reset Button -->
+        <div class="mt-auto pt-4 border-t border-surface-variant">
+          <button id="resetParamsBtn" class="w-full py-2 bg-surface-container-low hover:bg-surface-container border border-surface-variant text-on-surface font-label-md text-[13px] font-semibold rounded-lg transition-all shadow-sm flex justify-center items-center gap-1.5">
+            <span class="material-symbols-outlined text-[16px]">restart_alt</span>
+            Reset to Defaults
+          </button>
         </div>
 
-        <div class="metric-card">
-          <div class="metric-title">Model Architecture</div>
-          <div class="metric-stat" style="font-size: 20px;" id="statArch">LLaMA / Qwen</div>
-          <div class="metric-desc">FlashAttention, SwiGLU / GeGLU FFN, and RoPE rotary position embeddings.</div>
-        </div>
       </div>
-    </div>
-  </main>
+    </aside>
 
+  </div>
+
+  <!-- ── JavaScript Client Application ─────────────────────────────────────── -->
   <script>
-    let activeModelName = 'default';
+    // State
+    let activeModelName = 'SmolLM2-135M-Instruct';
     let isGenerating = false;
     let currentAbortController = null;
+    let conversation = [];
+    // Bumped whenever history is discarded; an in-flight generation whose epoch
+    // no longer matches must not commit its turns.
+    let conversationEpoch = 0;
 
-    // Fetch loaded model name
-    async function loadModelInfo() {
+    // ── Offline asset detection ───────────────────────────────────────────────
+    // Tailwind and the icon font come from the network. If either is missing
+    // (air-gapped host, blocked CDN), fall back to the inline stylesheet above
+    // rather than rendering unstyled markup and literal ligature names.
+    if (!window.tailwind) {
+      document.documentElement.classList.add('no-cdn');
+    }
+    const markIconsMissing = () => {
       try {
-        const res = await fetch('/v1/models');
-        if (res.ok) {
-          const data = await res.json();
-          if (data.data && data.data.length > 0) {
-            activeModelName = data.data[0].id;
-            document.getElementById('headerModelTag').textContent = activeModelName;
-          }
+        if (!document.fonts.check('20px "Material Symbols Outlined"')) {
+          document.documentElement.classList.add('no-icons');
         }
       } catch (e) {
-        document.getElementById('headerModelTag').textContent = 'glint-core';
+        document.documentElement.classList.add('no-icons');
       }
+    };
+    if (document.fonts && document.fonts.ready) {
+      document.fonts.ready.then(markIconsMissing);
+    } else {
+      markIconsMissing();
     }
-    loadModelInfo();
 
-    // ── Tab Management ────────────────────────────────────────────────────────
-    document.querySelectorAll('.nav-item').forEach(btn => {
+    // Elements
+    const chatInput = document.getElementById('chatInput');
+    const actionBtn = document.getElementById('actionBtn');
+    const actionBtnIcon = document.getElementById('actionBtnIcon');
+    const chatFeed = document.getElementById('chatFeed');
+    const messageListContainer = document.getElementById('messageListContainer');
+    const emptyState = document.getElementById('emptyState');
+    const clearChatBtn = document.getElementById('clearChatBtn');
+    const systemPromptEl = document.getElementById('systemPrompt');
+
+    // Sidebar & Navigation Elements
+    const parametersSidebar = document.getElementById('parametersSidebar');
+    const toggleSidebarBtn = document.getElementById('toggleSidebarBtn');
+    const closeSidebarBtn = document.getElementById('closeSidebarBtn');
+
+    // Sliders
+    const tempSlider = document.getElementById('tempSlider');
+    const tempValueDisplay = document.getElementById('tempValueDisplay');
+    const dockTempBadge = document.getElementById('dockTempBadge');
+
+    const topPSlider = document.getElementById('topPSlider');
+    const topPValueDisplay = document.getElementById('topPValueDisplay');
+    const dockTopPBadge = document.getElementById('dockTopPBadge');
+
+    const topKSlider = document.getElementById('topKSlider');
+    const topKValueDisplay = document.getElementById('topKValueDisplay');
+
+    const maxTokensSlider = document.getElementById('maxTokensSlider');
+    const maxTokensValueDisplay = document.getElementById('maxTokensValueDisplay');
+    const resetParamsBtn = document.getElementById('resetParamsBtn');
+
+    // ── Sliders Sync ──────────────────────────────────────────────────────────
+    function syncSliders() {
+      tempValueDisplay.textContent = parseFloat(tempSlider.value).toFixed(2);
+      dockTempBadge.textContent = `T: ${parseFloat(tempSlider.value).toFixed(2)}`;
+
+      topPValueDisplay.textContent = parseFloat(topPSlider.value).toFixed(2);
+      dockTopPBadge.textContent = `P: ${parseFloat(topPSlider.value).toFixed(2)}`;
+
+      topKValueDisplay.textContent = topKSlider.value;
+      maxTokensValueDisplay.textContent = maxTokensSlider.value;
+    }
+    tempSlider.addEventListener('input', syncSliders);
+    topPSlider.addEventListener('input', syncSliders);
+    topKSlider.addEventListener('input', syncSliders);
+    maxTokensSlider.addEventListener('input', syncSliders);
+
+    resetParamsBtn.addEventListener('click', () => {
+      tempSlider.value = '0.70';
+      topPSlider.value = '0.90';
+      topKSlider.value = '40';
+      maxTokensSlider.value = '1024';
+      systemPromptEl.value = 'You are Glint, a brilliant, concise, and fast local AI assistant.';
+      syncSliders();
+    });
+
+    // ── Sidebar Toggle ────────────────────────────────────────────────────────
+    // Collapsed state is a single class so open/close can't disagree about
+    // which mechanism (display vs. width) is currently hiding the panel.
+    function setSidebarOpen(open) {
+      parametersSidebar.classList.toggle('sidebar-collapsed', !open);
+      toggleSidebarBtn.setAttribute('aria-expanded', String(open));
+    }
+    toggleSidebarBtn.setAttribute('aria-controls', 'parametersSidebar');
+    setSidebarOpen(true);
+
+    toggleSidebarBtn.addEventListener('click', () => {
+      setSidebarOpen(parametersSidebar.classList.contains('sidebar-collapsed'));
+    });
+    if (closeSidebarBtn) {
+      closeSidebarBtn.addEventListener('click', () => setSidebarOpen(false));
+    }
+
+    // ── Navigation Tabs ───────────────────────────────────────────────────────
+    const navButtons = document.querySelectorAll('.nav-btn');
+    const workspaceViews = {
+      chat: document.getElementById('chatView'),
+      structured: document.getElementById('structuredView'),
+      telemetry: document.getElementById('telemetryView')
+    };
+
+    navButtons.forEach(btn => {
       btn.addEventListener('click', () => {
-        document.querySelectorAll('.nav-item').forEach(b => b.classList.remove('active'));
-        document.querySelectorAll('.workspace-pane').forEach(p => p.classList.remove('active'));
-        btn.classList.add('active');
-        const target = document.getElementById(btn.dataset.tab + 'Pane');
-        if (target) target.classList.add('active');
+        const tab = btn.dataset.tab;
+        navButtons.forEach(b => {
+          b.classList.remove('border-b-2', 'border-primary', 'font-semibold', 'text-on-surface');
+          b.classList.add('opacity-70', 'text-on-surface-variant');
+        });
+        btn.classList.add('border-b-2', 'border-primary', 'font-semibold', 'text-on-surface');
+        btn.classList.remove('opacity-70', 'text-on-surface-variant');
+
+        Object.keys(workspaceViews).forEach(k => {
+          if (k === tab) {
+            workspaceViews[k].classList.remove('hidden');
+          } else {
+            workspaceViews[k].classList.add('hidden');
+          }
+        });
       });
     });
 
-    // ── Sliders & Number Sync ─────────────────────────────────────────────────
-    const tempRange = document.getElementById('tempRange');
-    const tempValue = document.getElementById('tempValue');
-    tempRange.addEventListener('input', () => tempValue.textContent = parseFloat(tempRange.value).toFixed(2));
-
-    const topPRange = document.getElementById('topPRange');
-    const topPValue = document.getElementById('topPValue');
-    topPRange.addEventListener('input', () => topPValue.textContent = parseFloat(topPRange.value).toFixed(2));
-
-    const maxTokensInput = document.getElementById('maxTokensInput');
-    const maxTokensValue = document.getElementById('maxTokensValue');
-    maxTokensInput.addEventListener('input', () => maxTokensValue.textContent = maxTokensInput.value);
-
     // ── Auto-resizing Textarea ────────────────────────────────────────────────
-    const chatInput = document.getElementById('chatInput');
     function autoResizeTextarea() {
       chatInput.style.height = 'auto';
       chatInput.style.height = Math.min(chatInput.scrollHeight, 180) + 'px';
     }
     chatInput.addEventListener('input', autoResizeTextarea);
 
-    // ── KV Grid Init ──────────────────────────────────────────────────────────
-    const kvGrid = document.getElementById('kvGrid');
-    if (kvGrid) {
-      for (let i = 0; i < 64; i++) {
-        const d = document.createElement('div');
-        d.className = 'kv-block' + (i < 4 ? ' active' : i < 10 ? ' cached' : '');
-        kvGrid.appendChild(d);
-      }
-    }
-
     // ── Prompt Suggestions ────────────────────────────────────────────────────
-    document.querySelectorAll('.suggestion-item').forEach(item => {
-      item.addEventListener('click', () => {
-        chatInput.value = item.dataset.prompt;
+    document.querySelectorAll('.suggestion-card').forEach(card => {
+      card.addEventListener('click', () => {
+        chatInput.value = card.dataset.prompt;
         autoResizeTextarea();
         chatInput.focus();
       });
     });
 
-    // ── Chat Logic ────────────────────────────────────────────────────────────
-    let conversation = [];
-    const chatFeed = document.getElementById('chatFeed');
-    const actionBtn = document.getElementById('actionBtn');
-    const btnText = document.getElementById('btnText');
-    const btnIcon = document.getElementById('btnIcon');
-    const emptyState = document.getElementById('emptyState');
-    const clearChatBtn = document.getElementById('clearChatBtn');
+    // ── Model & Server Info ───────────────────────────────────────────────────
+    async function fetchModelInfo() {
+      try {
+        const res = await fetch('/v1/models');
+        if (res.ok) {
+          const data = await res.json();
+          if (data.data && data.data.length > 0) {
+            activeModelName = data.data[0].id;
+            document.getElementById('headerModelTag').textContent = `${activeModelName} · Local`;
+          }
+        }
+      } catch (e) {
+        document.getElementById('headerModelTag').textContent = 'SmolLM2-135M · Local';
+      }
+    }
+    fetchModelInfo();
 
-    function setGeneratingState(generating) {
+    // ── Live Telemetry Poller ─────────────────────────────────────────────────
+    async function pollMetrics() {
+      try {
+        const res = await fetch('/v1/metrics');
+        if (res.ok) {
+          const data = await res.json();
+          if (data.tokens_generated !== undefined) {
+            document.getElementById('statTokTotal').textContent = data.tokens_generated.toLocaleString();
+          }
+          if (data.requests_total !== undefined) {
+            document.getElementById('statReqTotal').textContent = data.requests_total.toLocaleString();
+          }
+          if (data.active_sessions !== undefined) {
+            document.getElementById('statActiveSessions').textContent = data.active_sessions;
+          }
+          if (data.uptime_secs !== undefined) {
+            const m = Math.floor(data.uptime_secs / 60);
+            const s = data.uptime_secs % 60;
+            document.getElementById('statUptime').textContent = `${m}m ${s}s`;
+          }
+          if (data.avg_ttft_ms > 0) {
+            document.getElementById('telemetryTTFT').textContent = `${data.avg_ttft_ms.toFixed(1)} ms`;
+          }
+          if (data.avg_decode_ms > 0) {
+            document.getElementById('telemetryTPOT').textContent = `${data.avg_decode_ms.toFixed(1)} ms/tok`;
+            const tokS = (1000 / data.avg_decode_ms).toFixed(1);
+            document.getElementById('telemetryThroughput').innerHTML = `${tokS} <span class="text-[13px] font-normal text-on-surface-variant">tok/s</span>`;
+          }
+          if (data.kv_pool) {
+            const pct = Math.round((data.kv_pool.live / Math.max(data.kv_pool.capacity, 1)) * 100);
+            document.getElementById('kvAllocatedCount').textContent = `Live: ${data.kv_pool.live} / ${data.kv_pool.capacity} pages (${pct}%)`;
+          }
+        }
+      } catch (e) {}
+    }
+    setInterval(pollMetrics, 2500);
+    pollMetrics();
+
+    // Populate dynamic timeline bars
+    const telemetryBars = document.getElementById('telemetryBars');
+    if (telemetryBars) {
+      const heights = [20, 25, 30, 35, 40, 50, 65, 70, 75, 80, 85, 90, 95, 92, 88, 94, 98, 95, 92, 96, 94, 98, 99, 100];
+      heights.forEach(h => {
+        const bar = document.createElement('div');
+        bar.className = 'flex-1 bg-secondary-container/70 hover:bg-secondary rounded-t-sm transition-all duration-300';
+        bar.style.height = `${h}%`;
+        telemetryBars.appendChild(bar);
+      });
+    }
+
+    // ── Markdown Formatter with Copy Button ───────────────────────────────────
+    function formatMarkdown(text) {
+      if (!text) return '';
+      let escaped = text
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;");
+
+      // Pull code out first and leave a placeholder behind, so the inline
+      // transforms below (bold, <br/>) never rewrite code contents. `<pre>`
+      // already preserves newlines, so inserting <br/> there would double them.
+      const blocks = [];
+      const stash = (html) => `\u0000CODE${blocks.push(html) - 1}\u0000`;
+
+      // Fenced blocks ```lang ... ```
+      escaped = escaped.replace(/```([a-zA-Z0-9_-]*)\n([\s\S]*?)```/g, (m, lang, code) =>
+        stash(`<pre><code class="language-${lang}">${code}</code></pre>`)
+      );
+
+      // Inline code
+      escaped = escaped.replace(/`([^`\n]+)`/g, (m, code) => stash(`<code>${code}</code>`));
+
+      // Bold **text**
+      escaped = escaped.replace(/\*\*([^*]+)\*\*/g, '<strong class="font-semibold text-on-surface">$1</strong>');
+
+      // Line breaks
+      escaped = escaped.replace(/\n/g, '<br/>');
+
+      // Restore stashed code verbatim
+      escaped = escaped.replace(/\u0000CODE(\d+)\u0000/g, (m, i) => blocks[Number(i)]);
+
+      // <pre> is already block-level; drop the <br/> that hugged the fence lines
+      escaped = escaped.replace(/<br\/>\s*<pre>/g, '<pre>').replace(/<\/pre>\s*<br\/>/g, '</pre>');
+
+      return escaped;
+    }
+
+    // ── Message Rendering ─────────────────────────────────────────────────────
+    function appendMessage(role, content) {
+      if (emptyState) emptyState.style.display = 'none';
+
+      const row = document.createElement('div');
+      
+      if (role === 'user') {
+        row.className = 'self-end max-w-[85%] flex items-end gap-3 group';
+        row.innerHTML = `
+          <div class="bg-surface-container px-lg py-sm rounded-2xl rounded-tr-sm shadow-[0_1px_2px_rgba(0,0,0,0.02)]">
+            <p class="font-body-md text-on-surface">${formatMarkdown(content)}</p>
+          </div>
+        `;
+      } else {
+        row.className = 'self-start w-full flex gap-md';
+        row.innerHTML = `
+          <div class="flex-shrink-0 w-8 h-8 flex items-center justify-center rounded-full bg-surface-container-lowest border border-surface-variant shadow-soft mt-1">
+            <span class="material-symbols-outlined text-primary text-[16px]" style="font-variation-settings: 'FILL' 1;">auto_awesome</span>
+          </div>
+          <div class="flex-1 flex flex-col gap-sm">
+            <div class="bg-surface-container-lowest border border-surface-variant px-lg py-md rounded-2xl shadow-soft">
+              <div class="chat-prose text-on-surface font-body-md leading-relaxed message-body">
+                ${formatMarkdown(content)}
+              </div>
+            </div>
+            <div class="message-telemetry-pill flex items-center gap-2 self-start mt-0.5">
+              <div class="bg-surface-container px-3 py-0.5 rounded-full flex items-center gap-1.5 border border-surface-variant/50">
+                <span class="material-symbols-outlined text-[13px] text-tertiary-container" style="font-variation-settings: 'FILL' 1;">bolt</span>
+                <span class="font-code-md text-[11px] text-on-surface-variant telemetry-text">Generating...</span>
+              </div>
+            </div>
+          </div>
+        `;
+      }
+
+      messageListContainer.appendChild(row);
+      chatFeed.scrollTop = chatFeed.scrollHeight;
+      return row;
+    }
+
+    // ── Generation State Control ──────────────────────────────────────────────
+    function setGenerating(generating) {
       isGenerating = generating;
       if (generating) {
-        actionBtn.classList.add('stop');
-        btnText.textContent = 'Stop';
-        btnIcon.innerHTML = '<rect x="3" y="3" width="18" height="18" rx="2" ry="2"/>';
+        actionBtn.classList.remove('bg-primary', 'hover:bg-primary-container');
+        actionBtn.classList.add('bg-error', 'hover:bg-error/90');
+        actionBtnIcon.textContent = 'stop';
+        document.getElementById('engineStatusText').textContent = 'Generating...';
       } else {
-        actionBtn.classList.remove('stop');
-        btnText.textContent = 'Send';
-        btnIcon.innerHTML = '<line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/>';
+        actionBtn.classList.add('bg-primary', 'hover:bg-primary-container');
+        actionBtn.classList.remove('bg-error', 'hover:bg-error/90');
+        actionBtnIcon.textContent = 'arrow_upward';
+        document.getElementById('engineStatusText').textContent = 'Ready · Local SIMD';
       }
     }
 
+    // ── Clear Conversation ────────────────────────────────────────────────────
     clearChatBtn.addEventListener('click', () => {
+      // Abort any in-flight generation and bump the epoch, so a request that is
+      // already mid-stream cannot push its turns back into the cleared history.
+      if (currentAbortController) {
+        currentAbortController.abort();
+        currentAbortController = null;
+      }
+      conversationEpoch++;
       conversation = [];
-      chatFeed.innerHTML = '';
-      chatFeed.appendChild(emptyState);
+      messageListContainer.innerHTML = '';
+      messageListContainer.appendChild(emptyState);
       emptyState.style.display = 'flex';
+      setGenerating(false);
     });
 
-    async function handleActionClick() {
-      if (isGenerating) {
-        if (currentAbortController) {
-          currentAbortController.abort();
-          currentAbortController = null;
-        }
-        setGeneratingState(false);
-        return;
-      }
-      await sendMessage();
+    /// Mark a transcript row as not part of the model-visible history, so a
+    /// visible turn that was never committed doesn't look like context.
+    function markDroppedFromContext(row) {
+      const pill = row.querySelector('.message-telemetry-pill');
+      if (!pill) return;
+      const note = document.createElement('span');
+      note.className = 'font-code-md text-[11px] text-on-surface-variant/70';
+      note.textContent = 'not added to context';
+      pill.appendChild(note);
     }
 
+    // ── Send Message & SSE Streaming ──────────────────────────────────────────
     async function sendMessage() {
       const text = chatInput.value.trim();
       if (!text || isGenerating) return;
 
-      if (emptyState) emptyState.style.display = 'none';
-
       chatInput.value = '';
-      chatInput.style.height = '38px';
-      appendMessageRow('user', text);
+      chatInput.style.height = 'auto';
+      appendMessage('user', text);
 
-      const sys = document.getElementById('systemPrompt').value.trim();
+      const sys = systemPromptEl.value.trim();
       const messages = [];
       if (sys) messages.push({ role: 'system', content: sys });
       conversation.forEach(m => messages.push({ role: m.role, content: m.content }));
       messages.push({ role: 'user', content: text });
 
-      const assistantRow = appendMessageRow('assistant', '');
+      const assistantRow = appendMessage('assistant', '');
       const bodyEl = assistantRow.querySelector('.message-body');
-      const telemetryEl = assistantRow.querySelector('.message-telemetry');
+      const telemetryText = assistantRow.querySelector('.telemetry-text');
 
-      setGeneratingState(true);
+      setGenerating(true);
       currentAbortController = new AbortController();
+
+      const epoch = conversationEpoch;
+      const commitTurns = (assistantText) => {
+        if (epoch !== conversationEpoch) return; // history was cleared mid-stream
+        conversation.push({ role: 'user', content: text });
+        conversation.push({ role: 'assistant', content: assistantText });
+      };
 
       const t0 = performance.now();
       let ttft = null;
@@ -1098,9 +1137,10 @@
             model: activeModelName || 'default',
             messages: messages,
             stream: true,
-            temperature: parseFloat(tempRange.value),
-            top_p: parseFloat(topPRange.value),
-            max_tokens: parseInt(maxTokensInput.value)
+            temperature: parseFloat(tempSlider.value),
+            top_p: parseFloat(topPSlider.value),
+            top_k: parseInt(topKSlider.value),
+            max_tokens: parseInt(maxTokensSlider.value)
           })
         });
 
@@ -1113,6 +1153,15 @@
         const decoder = new TextDecoder();
         let buffer = '';
 
+        // A stream the server truncated ends with an SSE `error` event and
+        // deliberately *no* `[DONE]`, so a partial answer can never be mistaken
+        // for a complete one. Track both signals explicitly.
+        let sseEvent = null;
+        let sawDone = false;
+        let finishReason = null;
+        let truncationMessage = null;
+
+        reading:
         while (true) {
           const { done, value } = await reader.read();
           if (done) break;
@@ -1123,89 +1172,102 @@
 
           for (const line of lines) {
             const trimmed = line.trim();
-            if (!trimmed || !trimmed.startsWith('data: ')) continue;
+            if (!trimmed) {
+              sseEvent = null; // blank line terminates an SSE frame
+              continue;
+            }
+            if (trimmed.startsWith('event:')) {
+              sseEvent = trimmed.slice(6).trim();
+              continue;
+            }
+            if (!trimmed.startsWith('data: ')) continue;
             const dataStr = trimmed.slice(6);
-            if (dataStr === '[DONE]') break;
+
+            if (sseEvent === 'error') {
+              truncationMessage = dataStr;
+              try {
+                truncationMessage = JSON.parse(dataStr).error?.message || dataStr;
+              } catch (e) {}
+              break reading;
+            }
+
+            if (dataStr === '[DONE]') {
+              sawDone = true;
+              break reading;
+            }
 
             try {
               const parsed = JSON.parse(dataStr);
-              const delta = parsed.choices?.[0]?.delta?.content || '';
+              const choice = parsed.choices?.[0];
+              if (choice?.finish_reason) finishReason = choice.finish_reason;
+              const delta = choice?.delta?.content || '';
               if (delta) {
                 if (ttft === null) {
                   ttft = performance.now() - t0;
-                  document.getElementById('statTTFT').innerHTML = `${Math.round(ttft)} <span class="metric-unit">ms</span>`;
                 }
                 tokenCount++;
                 fullText += delta;
-                bodyEl.innerHTML = formatMarkdown(fullText) + '<span class="cursor-blink"></span>';
+                bodyEl.innerHTML = formatMarkdown(fullText) + '<span class="text-primary font-bold cursor-blink font-code-md ml-[2px]">|</span>';
                 chatFeed.scrollTop = chatFeed.scrollHeight;
               }
             } catch (e) {}
           }
         }
 
+        if (truncationMessage !== null || !sawDone) {
+          const err = new Error(truncationMessage || 'stream ended without a completion marker');
+          err.truncated = true;
+          throw err;
+        }
+
         const totalSecs = (performance.now() - t0) / 1000;
         const tokS = totalSecs > 0 ? (tokenCount / totalSecs).toFixed(1) : '0';
+        const cutoff = finishReason === 'length' ? ' · cut off (max tokens)' : '';
         bodyEl.innerHTML = formatMarkdown(fullText);
-        telemetryEl.innerHTML = `
-          <span>${tokS} tok/s</span>
-          <span>${Math.round(ttft || 0)}ms TTFT</span>
-          <span>${tokenCount} tokens</span>
-        `;
-        document.getElementById('statThroughput').innerHTML = `${tokS} <span class="metric-unit">tok/s</span>`;
+        telemetryText.textContent = `${tokS} tok/s · ${Math.round(ttft || 0)}ms TTFT · ${tokenCount} tokens${cutoff}`;
 
-        conversation.push({ role: 'user', content: text });
-        conversation.push({ role: 'assistant', content: fullText });
+        commitTurns(fullText);
 
       } catch (err) {
         if (err.name === 'AbortError') {
-          bodyEl.innerHTML = formatMarkdown(fullText) + ' <span style="color: var(--text-muted);">[Stopped]</span>';
+          bodyEl.innerHTML = formatMarkdown(fullText) + ' <span class="text-tertiary-container font-code-md text-[12px]">[Generation Stopped]</span>';
+          telemetryText.textContent = 'Interrupted';
+          // A stopped generation is still a real exchange as far as the user is
+          // concerned — keep it in history when anything was actually produced.
+          if (fullText) {
+            commitTurns(fullText);
+          } else {
+            markDroppedFromContext(assistantRow);
+          }
+        } else if (err.truncated) {
+          bodyEl.innerHTML = formatMarkdown(fullText) +
+            `<div class="mt-2 text-error font-body-sm">Response truncated by the server (${err.message}) — this reply is incomplete.</div>`;
+          telemetryText.textContent = 'Truncated';
+          markDroppedFromContext(assistantRow);
         } else {
-          bodyEl.innerHTML = `<span style="color: var(--status-danger);">Error: ${err.message}</span>`;
+          bodyEl.innerHTML = `<span class="text-error font-body-sm">Error: ${err.message}</span>`;
+          telemetryText.textContent = 'Failed';
+          markDroppedFromContext(assistantRow);
         }
       } finally {
-        setGeneratingState(false);
+        setGenerating(false);
         currentAbortController = null;
         chatFeed.scrollTop = chatFeed.scrollHeight;
       }
     }
 
-    function formatMarkdown(text) {
-      let escaped = text
-        .replace(/&/g, "&amp;")
-        .replace(/</g, "&lt;")
-        .replace(/>/g, "&gt;");
+    actionBtn.addEventListener('click', () => {
+      if (isGenerating) {
+        if (currentAbortController) {
+          currentAbortController.abort();
+          currentAbortController = null;
+        }
+        setGenerating(false);
+      } else {
+        sendMessage();
+      }
+    });
 
-      escaped = escaped.replace(/```([a-zA-Z0-9_-]*)\n([\s\S]*?)```/g, (match, lang, code) => {
-        return `<pre><code>${code}</code></pre>`;
-      });
-
-      escaped = escaped.replace(/`([^`]+)`/g, '<code>$1</code>');
-      return escaped;
-    }
-
-    function appendMessageRow(role, text) {
-      const row = document.createElement('div');
-      row.className = `chat-row ${role}`;
-      row.innerHTML = `
-        <div class="avatar">
-          ${role === 'user' ? 'U' : '<img src="/assets/logo.svg" alt="Glint">'}
-        </div>
-        <div class="message-content-box">
-          <div class="message-meta">
-            <span>${role === 'user' ? 'You' : 'Glint'}</span>
-            <span style="font-size: 11px; color: var(--text-muted);">${new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
-          </div>
-          <div class="message-body">${formatMarkdown(text)}</div>
-          ${role === 'assistant' ? '<div class="message-telemetry"><span>Generating...</span></div>' : ''}
-        </div>
-      `;
-      chatFeed.appendChild(row);
-      chatFeed.scrollTop = chatFeed.scrollHeight;
-      return row;
-    }
-
-    actionBtn.addEventListener('click', handleActionClick);
     chatInput.addEventListener('keydown', (e) => {
       if (e.key === 'Enter' && !e.shiftKey) {
         e.preventDefault();
@@ -1213,27 +1275,30 @@
       }
     });
 
-    // ── Structured Outputs Studio ─────────────────────────────────────────────
-    const executeSchemaBtn = document.getElementById('executeSchemaBtn');
+    // ── Structured Output Lab Actions ─────────────────────────────────────────
     const schemaInput = document.getElementById('schemaInput');
-    const schemaPrompt = document.getElementById('schemaPrompt');
+    const schemaPromptInput = document.getElementById('schemaPromptInput');
+    const executeSchemaBtn = document.getElementById('executeSchemaBtn');
     const schemaOutput = document.getElementById('schemaOutput');
-    const schemaStatus = document.getElementById('schemaStatus');
+    const schemaStatusText = document.getElementById('schemaStatusText');
+    const copySchemaOutputBtn = document.getElementById('copySchemaOutputBtn');
 
-    document.getElementById('presetUser').addEventListener('click', () => {
+    document.getElementById('presetUserBtn').addEventListener('click', () => {
       schemaInput.value = JSON.stringify({
         type: "object",
         properties: {
           name: { type: "string" },
-          email: { type: "string" },
-          department: { type: "string", enum: ["Engineering", "Product", "Operations"] },
-          experience_years: { type: "integer" }
+          role: { type: "string" },
+          department: { type: "string", enum: ["Engineering", "Research", "Design", "Product"] },
+          skills: { type: "array", items: { type: "string" } },
+          experience_years: { type: "integer", minimum: 1 }
         },
-        required: ["name", "email", "department", "experience_years"]
+        required: ["name", "role", "department", "skills", "experience_years"]
       }, null, 2);
+      schemaPromptInput.value = "Create a candidate profile for a staff compiler engineer specializing in Rust and MLIR";
     });
 
-    document.getElementById('presetEntity').addEventListener('click', () => {
+    document.getElementById('presetEntityBtn').addEventListener('click', () => {
       schemaInput.value = JSON.stringify({
         type: "object",
         properties: {
@@ -1243,19 +1308,21 @@
               type: "object",
               properties: {
                 name: { type: "string" },
-                category: { type: "string", enum: ["Person", "Organization", "Location", "Technology"] }
+                category: { type: "string", enum: ["Person", "Organization", "Hardware", "Location"] },
+                confidence: { type: "number", minimum: 0, maximum: 1 }
               },
-              required: ["name", "category"]
+              required: ["name", "category", "confidence"]
             }
           }
         },
         required: ["entities"]
       }, null, 2);
+      schemaPromptInput.value = "Extract named entities from: 'Tim Cook unveiled Apple Silicon M4 Max in Cupertino yesterday.'";
     });
 
     executeSchemaBtn.addEventListener('click', async () => {
-      schemaOutput.value = '// Generating constrained tokens...';
-      schemaStatus.textContent = 'Generating...';
+      schemaOutput.textContent = '// Sampling constrained tokens via JSON Schema FSM...';
+      schemaStatusText.textContent = 'Generating...';
       try {
         const schema = JSON.parse(schemaInput.value);
         const res = await fetch('/v1/chat/completions', {
@@ -1263,51 +1330,27 @@
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             model: activeModelName || 'default',
-            messages: [{ role: 'user', content: schemaPrompt.value }],
+            messages: [{ role: 'user', content: schemaPromptInput.value }],
             response_format: { type: 'json_schema', json_schema: { schema: schema, strict: true } },
-            max_tokens: 512
+            max_tokens: 512,
+            temperature: 0.2
           })
         });
         const data = await res.json();
         const content = data.choices?.[0]?.message?.content || JSON.stringify(data, null, 2);
-        schemaOutput.value = content;
-        schemaStatus.textContent = 'Valid JSON';
+        schemaOutput.textContent = content;
+        schemaStatusText.textContent = 'Valid JSON Match';
       } catch (e) {
-        schemaOutput.value = `// Error: ${e.message}`;
-        schemaStatus.textContent = 'Error';
+        schemaOutput.textContent = `// Error: ${e.message}`;
+        schemaStatusText.textContent = 'Error';
       }
     });
 
-    // ── Tools Studio ──────────────────────────────────────────────────────────
-    const executeToolBtn = document.getElementById('executeToolBtn');
-    const toolsConfig = document.getElementById('toolsConfig');
-    const toolPrompt = document.getElementById('toolPrompt');
-    const toolsOutput = document.getElementById('toolsOutput');
-
-    executeToolBtn.addEventListener('click', async () => {
-      toolsOutput.value = '// Evaluating tool declarations...';
-      try {
-        const tools = JSON.parse(toolsConfig.value);
-        const res = await fetch('/v1/chat/completions', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            model: activeModelName || 'default',
-            messages: [{ role: 'user', content: toolPrompt.value }],
-            tools: tools,
-            tool_choice: 'auto'
-          })
-        });
-        const data = await res.json();
-        const msg = data.choices?.[0]?.message;
-        if (msg?.tool_calls) {
-          toolsOutput.value = JSON.stringify(msg.tool_calls, null, 2);
-        } else {
-          toolsOutput.value = msg?.content || JSON.stringify(data, null, 2);
-        }
-      } catch (e) {
-        toolsOutput.value = `// Error: ${e.message}`;
-      }
+    copySchemaOutputBtn.addEventListener('click', () => {
+      navigator.clipboard.writeText(schemaOutput.textContent);
+      const originalText = copySchemaOutputBtn.innerHTML;
+      copySchemaOutputBtn.innerHTML = '<span class="material-symbols-outlined text-[16px]">check</span> Copied!';
+      setTimeout(() => copySchemaOutputBtn.innerHTML = originalText, 1800);
     });
   </script>
 </body>

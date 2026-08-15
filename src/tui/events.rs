@@ -1,7 +1,7 @@
 //! Event handling and crossterm keybinding loop for the TUI.
 
-use std::time::Duration;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use std::time::Duration;
 
 use super::app::{ActiveTab, App};
 
@@ -38,8 +38,10 @@ fn handle_key_event(app: &mut App, key: KeyEvent) -> AppAction {
         }
     }
 
-    // Toggle Settings Drawer
-    if key.code == KeyCode::Tab {
+    // Toggle Settings Drawer (Tab or Ctrl+S)
+    if key.code == KeyCode::Tab
+        || (key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s'))
+    {
         app.settings_open = !app.settings_open;
         return AppAction::Continue;
     }
