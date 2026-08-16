@@ -16,15 +16,37 @@ The model name is derived from the file stem. Use this name in API requests.
 
 ---
 
-## Output Constraints
+## Output Constraints & Structured Output
 
-`POST /v1/completions` and `POST /v1/chat/completions` support OpenAI-style:
+`POST /v1/completions` and `POST /v1/chat/completions` support:
 
-```json
-{ "response_format": { "type": "json_object" } }
-```
+1. **JSON Object Mode**:
+   ```json
+   { "response_format": { "type": "json_object" } }
+   ```
+2. **JSON Schema Enforcement**:
+   ```json
+   {
+     "response_format": {
+       "type": "json_schema",
+       "json_schema": {
+         "name": "schema_name",
+         "schema": { ... }
+       }
+     }
+   }
+   ```
+3. **OpenAI Tool / Function Calling**:
+   ```json
+   {
+     "tools": [{
+       "type": "function",
+       "function": { "name": "tool_name", "parameters": { ... } }
+     }]
+   }
+   ```
 
-When present, Glint constrains decoding so the response is a valid JSON object. The `text` format is the default when `response_format` is omitted.
+When structured output or tools are specified, Glint compiles the schema into GBNF grammar ASTs and strictly masks logits at each step. See [Structured Output & Tool Calling](./structured-output.md) for full details.
 
 ---
 

@@ -123,6 +123,10 @@ SafeTensors (HuggingFace) loading is the second, optional entry point — a dire
 | `src/server/engine.rs` | Background inference engine and request queue |
 | `src/server/routes.rs` | `/health`, `/v1/models`, `/v1/metrics`, completions, chat, embeddings |
 | `src/server/types.rs` | OpenAI-compatible request and response shapes |
+| `src/constrained/` | GBNF grammar parser, JSON schema compiler, token logit masking |
+| `src/tui/` | Interactive Ratatui Terminal UI (`app.rs`, `ui.rs`, `events.rs`) |
+| `src/server/web/index.html` | Embedded single-page Web Chat Dashboard |
+| `src/ffi/` | C ABI implementation and structured output FFI export |
 | `src/backend/` | Optional GPU backend and pipeline setup |
 | `src/python.rs` | Optional PyO3 bindings |
 | `src/wasm.rs` | Optional browser bindings |

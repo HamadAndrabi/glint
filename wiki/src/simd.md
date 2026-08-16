@@ -1,8 +1,10 @@
 # SIMD Optimizations
 
-Glint uses AVX2 and FMA SIMD intrinsics for the hot-path quantized matvec operations, achieving 4–8× speedups over scalar code on modern x86_64 CPUs.
+Glint uses AVX2+FMA SIMD intrinsics on x86_64 CPUs and ARM NEON intrinsics on aarch64 (Apple Silicon / ARM servers) for hot-path quantized matvec operations, achieving 4–8× speedups over scalar code.
 
-Source: `src/tensor/simd.rs`
+Sources:
+- `src/tensor/simd.rs` (x86_64 AVX2 + FMA)
+- `src/tensor/simd_neon.rs` (aarch64 NEON)
 
 ---
 
@@ -10,32 +12,29 @@ Source: `src/tensor/simd.rs`
 
 LLM inference at batch size 1 is **memory-bandwidth bound**, not compute bound. The bottleneck is loading weight bytes from RAM. SIMD helps by:
 
-1. Processing 8 f32 values or 32 int8 values per instruction
+1. Processing 8 f32 values or 32 int8 values per instruction (AVX2), or 4 f32 / 16 int8 values (NEON)
 2. Keeping the arithmetic pipeline full while data is in flight
 3. Using FMA (fused multiply-add) to avoid intermediate rounding
 
-For a Q4_0 matvec on a 4096×4096 matrix, the scalar path touches ~8 MB of weight data per call. The AVX2 path processes this with 256-bit registers, effectively 8× wider memory access patterns.
-
 ---
 
-## Compilation Guard
+## Compilation & Dispatch Guards
 
-SIMD code is only compiled when both conditions hold:
-- Architecture is `x86_64`
-- The `rayon` feature is active
+SIMD code is compiled conditionally based on architecture and features:
 
 ```rust
-#[cfg(all(target_arch = "x86_64", feature = "rayon"))]
-```
-
-At runtime, dispatch checks CPU capabilities:
-
-```rust
+// x86_64: AVX2 + FMA
 #[cfg(all(target_arch = "x86_64", feature = "rayon"))]
 if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
     return unsafe { simd::matvec_q8_0_avx2(weights, x, out) };
 }
-matvec_q8_0_scalar(weights, x, out)  // always available
+
+// aarch64: ARM NEON
+#[cfg(all(target_arch = "aarch64", feature = "rayon"))]
+return unsafe { simd_neon::matvec_q8_0_neon(weights, x, out) };
+
+// Portable scalar fallback
+matvec_q8_0_scalar(weights, x, out)
 ```
 
 This means a binary built on x86_64 with `rayon` will use AVX2 when run on a supporting CPU (virtually all CPUs since ~2013), and fall back to scalar on older hardware or other architectures.
@@ -100,17 +99,14 @@ The extra bookkeeping makes K-quant kernels about 20–30% slower than Q8_0 per 
 
 ## Coverage
 
-AVX2+FMA kernels exist for eight formats: `Q8_0`, `Q4_0`, `Q4_1`, `Q5_0`,
+AVX2+FMA (x86_64) and ARM NEON (aarch64) SIMD kernels exist for eight formats: `Q8_0`, `Q4_0`, `Q4_1`, `Q5_0`,
 `Q5_1`, `Q4_K`, `Q5_K`, `Q6_K`. The 5-bit formats assemble their fifth bit
-from the shared `qh` word with a broadcast + `shuffle_epi8` bit-spread
-(`qh_fifth_bits`), and all the simple 4/5-bit formats share the split-plane
-nibble expansion (`split_plane_nibbles`). `Q2_K`, `Q3_K`, and `IQ4_NL` use the
-scalar path.
+from the shared `qh` word, and all the simple 4/5-bit formats share the split-plane
+nibble expansion. `Q2_K`, `Q3_K`, and `IQ4_NL` use the scalar path.
 
-Continuous batching adds *batched* AVX2 kernels (`matvec_*_batch_avx2`) for
-`Q8_0`, `Q4_0`, `Q4_K`, `Q5_K`, `Q6_K` that walk each weight row once for up
-to 16 input vectors. Formats whose only AVX2 kernel is single-vector
-(`Q4_1`/`Q5_0`/`Q5_1`) are batched by delegating per lane to that same kernel,
+Continuous batching adds *batched* SIMD kernels for `Q8_0`, `Q4_0`, `Q4_K`, `Q5_K`, `Q6_K`
+that walk each weight row once for up to 16 input vectors. Formats whose only SIMD kernel
+is single-vector (`Q4_1`/`Q5_0`/`Q5_1`) are batched by delegating per lane to that same kernel,
 keeping batched output bit-identical to the single path.
 
 ---

@@ -30,15 +30,15 @@ Glint is a focused inference engine for GGUF-based LLaMA-family models. It is de
 
 | Area | What you get |
 | --- | --- |
-| Inference | Full LLaMA-family transformer: RMSNorm, RoPE, SwiGLU, grouped-query attention, flash attention, batched prefill |
-| Generation | Greedy, sampling (temperature/top-k/top-p/min-p/repetition-penalty/seed), streaming, speculative decoding, JSON object mode |
+| Inference | Full LLaMA-family, Gemma 2, and Qwen 2.5 transformers: RMSNorm (including 1+w), RoPE, SwiGLU/GeGLU, logit soft-capping, sliding-window attention, grouped-query attention, flash attention, batched prefill |
+| Generation | Greedy, sampling (temperature/top-k/top-p/min-p/repetition-penalty/seed), streaming, speculative decoding, GBNF grammar constraints, JSON schema enforcement, OpenAI tool/function calling |
 | Quantization | Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q4_K, Q5_K, Q6_K, Q2_K, Q3_K, IQ4_NL — weights stay compressed in memory |
 | Performance | AVX2+FMA (x86_64) & ARM NEON (aarch64/Apple Silicon) SIMD kernels, scalar fallback, Rayon row-parallel matvec, optional GPU backend (wgpu/Vulkan/Metal/DX12) |
 | KV Cache | f32, Q8_0-quantized, and PagedAttention-style paged variants (`--kv-cache paged`, refcounted page sharing); prefix caching across requests (`--prefix-cache`); `KvStore` trait abstraction |
 | Sessions | First-class `Session` API, deterministic RNG state, snapshot export/import, cache-format-aware resume |
 | LoRA | Load and apply LoRA adapters at inference time via `--lora` |
-| Server | OpenAI-compatible `/v1/completions`, `/v1/chat/completions`, `/v1/embeddings`, `GET /v1/metrics`, SSE streaming, continuously batched concurrent serving |
-| CLI | `run`, `chat`, `serve`, `inspect`, `generate`, `pull`, `bench` |
+| Server & UI | OpenAI-compatible HTTP API (`/v1/completions`, `/v1/chat/completions`, `/v1/embeddings`, `GET /v1/metrics`), SSE streaming, continuous batching, embedded Web Chat Dashboard at `http://localhost:8080`, and interactive Ratatui Terminal UI (`--tui`) |
+| CLI | `run`, `chat` (interactive terminal & `--tui`), `serve` (HTTP + Web UI), `inspect`, `generate`, `pull`, `bench` |
 | Bindings | Python (`pyo3`), browser WASM (`wasm-bindgen`), C FFI (`include/glint.h`), native CLI |
 
 ## Build Profiles
@@ -183,8 +183,16 @@ glint run -f model.gguf -p "Hello" --seed 42 -m 100
 
 ### Interactive chat
 
+Standard terminal REPL:
+
 ```bash
 glint chat -f model.gguf --system "You are a helpful assistant"
+```
+
+Interactive full-screen Terminal UI (Ratatui):
+
+```bash
+glint chat -f model.gguf --tui
 ```
 
 With custom sampling:
@@ -193,7 +201,9 @@ With custom sampling:
 glint chat -f model.gguf --temperature 0.8 --top-k 40 --top-p 0.95 -m 512
 ```
 
-### Run the server
+### Run the server & Web Dashboard
+
+Launch the server (which embeds a complete web chat interface at `http://localhost:8080`):
 
 ```bash
 glint serve -f model.Q4_K_M.gguf -p 8080
@@ -230,6 +240,56 @@ curl http://localhost:8080/v1/chat/completions \
     "messages": [{"role": "user", "content": "Hello!"}],
     "max_tokens": 50,
     "temperature": 0.7
+  }'
+```
+
+### Tool / Function calling
+
+```bash
+curl http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "model",
+    "messages": [{"role": "user", "content": "What is the weather in Tokyo?"}],
+    "tools": [{
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "description": "Get current weather in a location",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "location": {"type": "string"}
+          },
+          "required": ["location"]
+        }
+      }
+    }]
+  }'
+```
+
+### Structured Output / JSON Object mode
+
+```bash
+curl http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "model",
+    "messages": [{"role": "user", "content": "Extract user info: Alice is 30 years old"}],
+    "response_format": {
+      "type": "json_schema",
+      "json_schema": {
+        "name": "user_info",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "name": {"type": "string"},
+            "age": {"type": "integer"}
+          },
+          "required": ["name", "age"]
+        }
+      }
+    }
   }'
 ```
 

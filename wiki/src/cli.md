@@ -85,7 +85,7 @@ glint run -f llama-3-8b.gguf \
 
 ## `chat`
 
-Interactive multi-turn conversation. Streams tokens to stdout as they are generated.
+Interactive multi-turn conversation. Streams tokens to stdout or launches an interactive full-screen terminal UI.
 
 ```bash
 glint chat -f <MODEL> [OPTIONS]
@@ -94,6 +94,7 @@ glint chat -f <MODEL> [OPTIONS]
 | Flag | Default | Description |
 |------|---------|-------------|
 | `-f, --file <PATH>` | required | Model file |
+| `--tui` | false | Launch interactive full-screen Terminal UI (Ratatui) |
 | `--system <TEXT>` | — | System prompt |
 | `-m, --max-tokens <N>` | 256 | Max tokens per response |
 | `--temperature <F>` | 0.8 | Sampling temperature |
@@ -104,22 +105,25 @@ glint chat -f <MODEL> [OPTIONS]
 | `--lora <PATH>` | — | LoRA adapter |
 | `--gpu` | false | GPU backend |
 
-Type your message and press Enter. Press Ctrl+D (EOF) to exit.
+In standard CLI mode, type your message and press Enter. Press Ctrl+D (EOF) to exit.
+In `--tui` mode, a full split-screen terminal workspace opens with live telemetry and settings.
 
 When the context window fills up, the chat mode automatically summarizes old messages to free space.
 
 **Example:**
 ```bash
-glint chat -f mistral-7b.gguf \
-  --system "You are an expert Rust programmer." \
-  --temperature 0.5
+# Standard terminal chat
+glint chat -f mistral-7b.gguf --system "You are an expert Rust programmer."
+
+# Full interactive TUI
+glint chat -f mistral-7b.gguf --tui
 ```
 
 ---
 
 ## `serve`
 
-Start an OpenAI-compatible HTTP inference server.
+Start an OpenAI-compatible HTTP inference server with an embedded Web Dashboard.
 
 ```bash
 glint serve -f <MODEL> [OPTIONS]
@@ -134,6 +138,8 @@ glint serve -f <MODEL> [OPTIONS]
 | `--kv-cache <FMT>` | `f32` | KV storage: `f32`, `q8` (~3.8× smaller), or `paged` (f32 in on-demand 16-token pages shared by all requests) |
 | `--prefix-cache` | false | Reuse KV pages of a shared prompt prefix instead of re-prefilling it per request; requires `--kv-cache paged` |
 
+The server automatically hosts the embedded Web Chat Dashboard at `http://localhost:<port>`, providing a browser interface with streaming responses, cancellation, and parameter controls.
+
 The model name is derived from the file stem (e.g. `smollm-135m-instruct.Q8_0` → `smollm-135m-instruct.Q8_0`). Use this name in API requests.
 
 Runs a background inference engine with a request queue and continuous batching: every active request advances in a single shared forward pass per step, so each weight matrix streams from memory once per step instead of once per sequence, and new requests join mid-generation as slots free up. Batching is bit-identical to decoding each request alone — see [Continuous batching](./server-api.md#continuous-batching).
@@ -143,7 +149,7 @@ Runs a background inference engine with a request queue and continuous batching:
 glint serve -f llama-3-8b-q4_k.gguf -p 8080 --host 0.0.0.0
 ```
 
-See [HTTP Server API](./server-api.md) for endpoint documentation.
+See [HTTP Server API](./server-api.md) for endpoint documentation and [User Interfaces](./ui.md) for web UI details.
 
 ---
 

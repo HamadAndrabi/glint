@@ -28,11 +28,13 @@
 
 - [SIMD Optimizations](./simd.md)
 - [Speculative Decoding](./speculative-decoding.md)
+- [Structured Output & Tool Calling](./structured-output.md)
 - [LoRA Adapters](./lora.md)
 
 # Surfaces
 
 - [CLI Reference](./cli.md)
+- [User Interfaces (TUI & Web)](./ui.md)
 - [HTTP Server API](./server-api.md)
 - [GPU Backend (Vulkan)](./gpu-backend.md)
 - [C FFI](./c-ffi.md)
