@@ -232,6 +232,13 @@ enum Commands {
         /// `--kv-cache paged`. Off by default.
         #[arg(long, default_value_t = false)]
         prefix_cache: bool,
+
+        /// Maximum prompt tokens prefilled per engine step. Prefill shares the
+        /// engine thread with decoding, so this caps how long a newly arrived
+        /// prompt can interrupt the requests already streaming. Use 0 to
+        /// prefill each prompt in a single pass.
+        #[arg(long, default_value_t = glint::server::DEFAULT_PREFILL_CHUNK)]
+        prefill_chunk: usize,
     },
 
     /// Download a GGUF model from HuggingFace Hub.
@@ -410,9 +417,19 @@ async fn main() {
             gpu,
             kv_cache,
             prefix_cache,
+            prefill_chunk,
         } => {
             let file = maybe_download(&file).await;
-            serve_model(&file, &host, port, gpu, &kv_cache, prefix_cache).await;
+            serve_model(
+                &file,
+                &host,
+                port,
+                gpu,
+                &kv_cache,
+                prefix_cache,
+                prefill_chunk,
+            )
+            .await;
         }
         #[cfg(feature = "server")]
         Commands::Pull { repo, file, dir } => {
@@ -1266,6 +1283,7 @@ async fn serve_model(
     use_gpu: bool,
     kv_cache: &str,
     prefix_cache: bool,
+    prefill_chunk: usize,
 ) {
     let (config, tokenizer, weights) = load_model(path).into_parts();
     eprintln!("Weights loaded.");
@@ -1342,6 +1360,19 @@ async fn serve_model(
             ),
         }
     }
+
+    // Prefill shares the engine thread with decoding, so the chunk size is the
+    // bound on how long an arriving prompt can interrupt requests already
+    // streaming. 0 means "one pass", which minimises overhead on an idle server
+    // and lets a long prompt stall a busy one.
+    limits.prefill_chunk = (prefill_chunk > 0).then_some(prefill_chunk);
+    eprintln!(
+        "Prefill:         {}",
+        match limits.prefill_chunk {
+            Some(n) => format!("chunked ({n} tokens per step)"),
+            None => "single pass (unchunked)".to_string(),
+        }
+    );
 
     // Start the concurrent round-robin inference engine on a dedicated OS
     // thread. The engine owns the GPU backend (if any) and all active KV

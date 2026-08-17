@@ -113,9 +113,29 @@ Batching is bit-identical to decoding each sequence alone, so a response never
 depends on how busy the server was. See
 [Inference Engine → Continuous batching](./server-api.md#continuous-batching).
 
-Still open here: batching the *prefill* of newly admitted requests (today each
-admitted prompt is prefilled on its own), and chunked prefill so a long prompt
-cannot delay a step for the sequences already decoding.
+### Chunked Prefill — ✅ shipped
+
+Prefill shares the engine thread with decoding, so a long prompt prefilled in
+one pass stopped every sequence already generating for as long as that whole
+prompt took. Admission now reserves a sequence's cache without computing any of
+its prompt, and each step advances one waiting prompt by at most
+`EngineLimits::prefill_chunk` tokens before decoding as usual:
+
+- A decoding sequence waits one chunk, not one prompt — and one chunk total,
+  not one per queued newcomer ✅
+- A prompt whose final chunk lands emits its first token in that same step, so
+  an idle engine is as prompt as it was before ✅
+- Bit-identical at every chunk size: same logits, same K/V in every cache row of
+  every layer, including on top of a reused prefix ✅
+
+Tune with `glint serve --prefill-chunk N` (default 256; `0` restores the
+single-pass behaviour), or `EngineLimits::prefill_chunk` in library code. See
+[Inference Engine → Chunked prefill](./server-api.md#chunked-prefill).
+
+Still open here: batching the *prefill* of newly admitted requests, so several
+queued prompts share one pass instead of being advanced one at a time; and
+fusing prefill chunks into the decode batch itself, so a step carries both
+rather than alternating between them.
 
 ### Quantization: More Formats
 
@@ -211,7 +231,7 @@ If you're looking for a well-scoped contribution:
 | Beginner | Add `--format json` output flag to `inspect` subcommand |
 | Intermediate | Add Python streaming callback (generator-based) |
 | Intermediate | Paged storage for the Q8 KV-cache format |
-| Advanced | Batched prefill (admit several queued prompts in one pass) |
+| Advanced | Batched prefill (advance several queued prompts in one pass) |
 | Advanced | MoE routing in `forward.rs` |
 
 ---

@@ -6,21 +6,28 @@
 //!
 //! 1. **Admission** — new requests are accepted from the queue whenever the
 //!    number of active sequences is below [`EngineLimits::max_active`]; each
-//!    admitted request has its prompt prefilled into a fresh per-sequence cache
-//!    (full-context by default, or pages from a shared pool when
-//!    [`EngineLimits::kv_pool_pages`] is set). Admission is re-checked every
+//!    admitted request reserves a fresh per-sequence cache (full-context by
+//!    default, or pages from a shared pool when [`EngineLimits::kv_pool_pages`]
+//!    is set) but computes none of its prompt. Admission is re-checked every
 //!    iteration, so a request joins the running batch as soon as a slot frees
 //!    rather than waiting for the batch to empty.
-//! 2. **Batched decode** — every live sequence advances by one token in a
+//! 2. **Chunked prefill** — one waiting prompt advances by at most
+//!    [`EngineLimits::prefill_chunk`] tokens per iteration, interleaved with
+//!    the decode steps below. Prefill and decode share this one thread, so an
+//!    unchunked prefill would stop every sequence already generating for as
+//!    long as the whole prompt takes; chunking caps that at one chunk, however
+//!    long the prompt and however many are queued behind it.
+//! 3. **Batched decode** — every live sequence advances by one token in a
 //!    *single* forward pass ([`decode_batch_cpu`] → `forward_batch_lora`).
 //!    Decoding is memory-bound, so the win is that each weight matrix is
 //!    streamed from RAM once per step instead of once per sequence: the cost of
 //!    a step is roughly flat in the number of sequences sharing it, which is
 //!    what turns concurrency into throughput.
-//! 3. **Sampling & delivery** — each sequence samples from its own logits with
+//! 4. **Sampling & delivery** — each sequence samples from its own logits with
 //!    its own sampler and constraint, and the token is pushed down that
-//!    request's channel.
-//! 4. **Draining & eviction** — a sequence that has produced its last token
+//!    request's channel. A sequence still being prefilled has no logits yet and
+//!    takes no part in this or in the decode batch.
+//! 5. **Draining & eviction** — a sequence that has produced its last token
 //!    (EOS, token budget, or context limit) is kept in a *draining* state until
 //!    every queued token has been delivered to the client, then removed. A
 //!    disconnected client or one that stays too far behind is evicted. Either
@@ -33,6 +40,9 @@
 //! per-sequence. A completion must not depend on how busy the server was, so
 //! sharing a step with other requests cannot change the tokens it receives.
 //! A batch of one degrades to exactly the previous single-sequence behaviour.
+//! Chunking the prefill is the same bargain in the other direction: it changes
+//! *when* a prompt's K/V is computed, never what it is, because positions are
+//! absolute and attention reads the whole cache.
 //!
 //! The engine blocks (parks the thread) only when there are no active
 //! sequences and no pending requests — i.e. when the server is completely idle.
@@ -221,6 +231,21 @@ pub struct EngineLimits {
     /// prefilling only the suffix. Reuse is exact: a request served from a fork
     /// produces the same tokens, bit for bit, as one prefilled cold.
     pub prefix_cache: Option<PrefixCacheConfig>,
+    /// Maximum prompt tokens prefilled in one engine step.
+    ///
+    /// A prefill runs on the same thread as decoding, so an unchunked one
+    /// stalls every sequence already generating for as long as the whole prompt
+    /// takes — a 4 000-token prompt arriving mid-stream is a visible pause in
+    /// everyone else's token stream. `Some(n)` caps that stall at `n` prompt
+    /// tokens by spreading the prefill over consecutive steps, interleaved with
+    /// decoding; `None` prefills each prompt in a single pass (the old
+    /// behaviour), which minimises the cost of a prompt arriving at an idle
+    /// server at the price of unbounded interruption to a busy one.
+    ///
+    /// Chunking is invisible in the output: positions are absolute and
+    /// attention reads the whole cache, so a prompt prefilled in pieces writes
+    /// exactly the K/V one pass would have, whatever the chunk size.
+    pub prefill_chunk: Option<usize>,
 }
 
 impl Default for EngineLimits {
@@ -230,9 +255,18 @@ impl Default for EngineLimits {
             queue_capacity: 32,
             kv_pool_pages: None,
             prefix_cache: None,
+            prefill_chunk: Some(DEFAULT_PREFILL_CHUNK),
         }
     }
 }
+
+/// Default cap on prompt tokens prefilled per engine step
+/// ([`EngineLimits::prefill_chunk`]).
+///
+/// Large enough that a prefill still amortises the weight traversal it is
+/// dominated by, small enough that a long prompt cannot hold a decoding
+/// sequence for more than a fraction of a second on a CPU-sized model.
+pub const DEFAULT_PREFILL_CHUNK: usize = 256;
 
 /// KV-memory bookkeeping, sampled by the engine for `/v1/metrics`.
 ///
@@ -277,6 +311,42 @@ struct ActiveSequence {
     /// stops ([`Finish::Stop`] / [`Finish::Length`]) and overwritten with
     /// [`Finish::Truncated`] if the sequence is later evicted mid-drain.
     finish: FinishSignal,
+    /// `Some(n)` while the prompt is still being prefilled, with `n` prompt
+    /// tokens already written to the cache; `None` once the whole prompt is in
+    /// and the sequence is decoding.
+    ///
+    /// A prefilling sequence occupies a slot and holds its KV reservation, but
+    /// has no logits to sample from until its final chunk lands — so it takes
+    /// no part in sampling or in a decode batch (see [`ActiveSequence::is_decoding`]).
+    prefill_cursor: Option<usize>,
+    /// Adapter name this request asked for, kept for the prefix-cache key.
+    ///
+    /// Retention happens when the last prefill chunk completes rather than at
+    /// admission, so the name has to outlive the [`InferenceRequest`].
+    lora_name: Option<String>,
+}
+
+impl ActiveSequence {
+    /// Whether this sequence takes part in the next decode step: prompt fully
+    /// prefilled, and not draining out its tail to a client.
+    fn is_decoding(&self) -> bool {
+        self.prefill_cursor.is_none() && self.draining_since.is_none()
+    }
+
+    /// Whether this is a prefill nobody is waiting for any more.
+    ///
+    /// [`try_deliver`] learns that a client has hung up by trying to send to
+    /// it, so it cannot notice for a sequence that has produced nothing yet —
+    /// and a prefilling sequence never has. Left unchecked, the engine would
+    /// spend the rest of a long prompt on a response with no reader.
+    ///
+    /// Deliberately restricted to prefilling sequences. A sequence that has
+    /// *finished* also ends up with an empty queue and a closed channel, and
+    /// treating that as abandonment would overwrite the [`Finish::Stop`] or
+    /// [`Finish::Length`] it legitimately earned with [`Finish::Truncated`].
+    fn is_abandoned_prefill(&self) -> bool {
+        self.prefill_cursor.is_some() && self.tx.is_closed()
+    }
 }
 
 /// Per-sequence outbound backlog past which we treat the client as unable to
@@ -487,16 +557,19 @@ fn engine_loop(
 
     loop {
         // ── Admit pending requests while below the concurrency cap ────────
+        //
+        // Admission is cheap: it reserves the sequence's cache but computes
+        // none of its prompt, so a queue of long prompts cannot hold up the
+        // sequences already decoding. The prompts are prefilled a chunk at a
+        // time below.
         let mut admitted = false;
         while active.len() < limits.max_active {
             match rx.try_recv() {
                 Ok(req) => {
-                    prefill_and_add(
+                    admit(
                         &mut active,
                         req,
-                        weights,
                         config,
-                        gpu,
                         cache_format,
                         page_pool.as_ref(),
                         prefix_cache.as_mut(),
@@ -516,12 +589,10 @@ fn engine_loop(
             }
             // Nothing to decode — block until a request arrives.
             match rx.blocking_recv() {
-                Some(req) => prefill_and_add(
+                Some(req) => admit(
                     &mut active,
                     req,
-                    weights,
                     config,
-                    gpu,
                     cache_format,
                     page_pool.as_ref(),
                     prefix_cache.as_mut(),
@@ -532,10 +603,26 @@ fn engine_loop(
             }
             publish_kv_stats(kv_stats, page_pool.as_ref(), prefix_cache.as_ref());
             // Loop back to admit any additional requests that arrived while
-            // we were blocked (so we prefill them before the first decode step).
+            // we were blocked (so they queue for prefill alongside this one).
             continue;
         }
         if admitted {
+            publish_kv_stats(kv_stats, page_pool.as_ref(), prefix_cache.as_ref());
+        }
+
+        // ── Advance one waiting prompt by one chunk of prefill ────────────
+        //
+        // Before sampling, so a prompt whose last chunk lands this step emits
+        // its first token in the same step — a prompt arriving at an idle
+        // engine is served exactly as promptly as it was before chunking.
+        if advance_one_prefill(
+            &mut active,
+            weights,
+            config,
+            gpu,
+            prefix_cache.as_mut(),
+            limits.prefill_chunk,
+        ) {
             publish_kv_stats(kv_stats, page_pool.as_ref(), prefix_cache.as_ref());
         }
 
@@ -543,7 +630,17 @@ fn engine_loop(
         let now = Instant::now();
         let mut finished: Vec<usize> = Vec::new();
         for (i, seq) in active.iter_mut().enumerate() {
-            if seq.draining_since.is_none() {
+            // Drop a prefill whose client has already hung up rather than
+            // spending the rest of its prompt on a response with no reader.
+            if seq.is_abandoned_prefill() {
+                seq.finish.set(Finish::Truncated);
+                finished.push(i);
+                continue;
+            }
+
+            // A sequence still being prefilled has no logits yet — it neither
+            // samples nor counts against its budget until its prompt is in.
+            if seq.is_decoding() {
                 let s = &mut seq.session;
                 if s.max_remaining == 0 {
                     // Budget exhausted before this step — nothing more to emit.
@@ -619,7 +716,9 @@ fn engine_loop(
 
         // If every remaining sequence is draining (done decoding, waiting for
         // a slow client to read), there is no forward pass to run — yield
-        // briefly instead of spinning on try_deliver.
+        // briefly instead of spinning on try_deliver. A sequence mid-prefill is
+        // not draining, so this correctly keeps stepping while a prompt is
+        // still going in.
         if active.iter().all(|s| s.draining_since.is_some()) {
             std::thread::sleep(Duration::from_millis(1));
             continue;
@@ -634,7 +733,9 @@ fn engine_loop(
         // Retained prefixes are given up first: a cached prefix is an
         // optimisation for future requests and must never cost a running one
         // its next token.
-        for seq in active.iter_mut().filter(|s| s.draining_since.is_none()) {
+        // Sequences still prefilling are skipped: `admit` already reserved
+        // their whole prompt, and they have no next token to make room for.
+        for seq in active.iter_mut().filter(|s| s.is_decoding()) {
             let need = seq.session.tokens.len();
             if reserve_or_evict(seq.session.cache.as_mut(), need, prefix_cache.as_mut()).is_err() {
                 seq.finish.set(Finish::Length);
@@ -648,7 +749,7 @@ fn engine_loop(
         // CPU path: one batched forward pass over every live sequence, so the
         //           weights are traversed once for the whole step.
         if gpu.is_some() {
-            for seq in active.iter_mut().filter(|s| s.draining_since.is_none()) {
+            for seq in active.iter_mut().filter(|s| s.is_decoding()) {
                 let s = &mut seq.session;
                 let tok = *s.tokens.last().unwrap();
                 let pos = s.tokens.len() - 1;
@@ -717,7 +818,18 @@ fn publish_kv_stats(
     *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = snapshot;
 }
 
-/// Run one prefill pass for `req` and add it to `active`.
+/// Admit `req` as a new sequence, ready for its prompt to be prefilled.
+///
+/// This reserves everything the sequence needs — KV pages for the whole prompt,
+/// its adapter, its constraint — but runs **no forward pass**: the prompt is
+/// prefilled in chunks by [`advance_one_prefill`] over subsequent engine steps,
+/// so admitting a long prompt costs a busy engine nothing. The sequence joins
+/// `active` in the prefilling state and starts decoding once its last chunk
+/// lands.
+///
+/// Reserving up front is what keeps that split honest: a prompt the pool cannot
+/// hold is rejected here, before any of it has been computed, rather than
+/// failing partway through.
 ///
 /// A prompt that does not fit the model's context window is rejected outright:
 /// prefilling it would overflow the KV cache (a hard assert). The request's
@@ -734,15 +846,15 @@ fn publish_kv_stats(
 /// prefilled, at a position offset of the prefix length. RoPE positions are
 /// absolute and attention reads the whole cache, so the suffix sees exactly the
 /// K/V a cold prefill would have written for those positions — the completion
-/// is bit-identical either way. Afterwards the prompt's complete pages are
-/// handed to the registry for the next request that shares them.
+/// is bit-identical either way. The fork lands in `prefill_cursor`, so the
+/// chunked prefill simply starts partway through the prompt. `lookup` bounds a
+/// fork to `prompt.len() - 1`, so there is always at least one token left to
+/// prefill and a sequence never reaches the decode path without logits.
 #[allow(clippy::too_many_arguments)]
-fn prefill_and_add(
+fn admit(
     active: &mut Vec<ActiveSequence>,
     req: InferenceRequest,
-    weights: &Arc<TransformerWeights>,
     config: &Arc<ModelConfig>,
-    gpu: &mut Option<GpuBackend>,
     cache_format: CacheFormat,
     page_pool: Option<&PagePool>,
     mut prefix_cache: Option<&mut PrefixCache>,
@@ -791,7 +903,7 @@ fn prefill_and_add(
     if reserve_or_evict(
         session.cache.as_mut(),
         req.prompt_tokens.len(),
-        prefix_cache.as_deref_mut(),
+        prefix_cache,
     )
     .is_err()
     {
@@ -811,28 +923,8 @@ fn prefill_and_add(
             }
         }
     }
-    session.tokens = req.prompt_tokens.clone();
     session.prefill_len = req.prompt_tokens.len();
-    let mut gpu_ref: Option<&mut GpuBackend> = gpu.as_mut();
-    let lora_ref = lora_adapter.as_deref();
-    session.last_logits = forward_prefill_lora(
-        weights,
-        config,
-        &req.prompt_tokens[start..],
-        session.cache.as_mut(),
-        start,
-        &mut gpu_ref,
-        lora_ref,
-    );
-    session.pos = req.prompt_tokens.len().saturating_sub(1);
-
-    // Retain this prompt's complete pages for the next request that shares
-    // them. Only the prompt is offered — a generated continuation belongs to
-    // this request alone — and only whole pages, so the sequence's own decoding
-    // never writes a page the registry holds.
-    if let (Some(prefix_cache), Some(paged)) = (prefix_cache, session.cache.as_paged()) {
-        prefix_cache.insert(&req.prompt_tokens, paged, lora_key);
-    }
+    session.tokens = req.prompt_tokens;
 
     active.push(ActiveSequence {
         session,
@@ -840,7 +932,81 @@ fn prefill_and_add(
         pending: std::collections::VecDeque::new(),
         draining_since: None,
         finish: req.finish,
+        prefill_cursor: Some(start),
+        lora_name: req.lora_name,
     });
+}
+
+/// Advance the longest-waiting unfinished prompt by one chunk of prefill.
+///
+/// At most one sequence is advanced per engine step, and by at most
+/// `chunk` tokens, which is what bounds the interruption a prompt can cause:
+/// however many requests are waiting and however long their prompts, a
+/// sequence already decoding waits one chunk, not one prompt. Prompts are
+/// finished in admission order rather than round-robin — interleaving several
+/// would delay every one of their first tokens instead of just the later ones.
+///
+/// Each chunk is a `forward_prefill` over the next slice of the prompt at its
+/// absolute position offset. Positions are absolute and attention reads the
+/// whole cache, so the K/V written is exactly what a single pass would have
+/// written — this is the same property prefix reuse rests on, applied
+/// repeatedly. Only the final chunk's logits are kept; earlier chunks are
+/// computed for their cache writes alone.
+///
+/// Returns whether a prompt *finished* prefilling, which changes the pool
+/// occupancy worth republishing to `/v1/metrics`.
+fn advance_one_prefill(
+    active: &mut [ActiveSequence],
+    weights: &Arc<TransformerWeights>,
+    config: &Arc<ModelConfig>,
+    gpu: &mut Option<GpuBackend>,
+    prefix_cache: Option<&mut PrefixCache>,
+    chunk: Option<usize>,
+) -> bool {
+    let Some(seq) = active
+        .iter_mut()
+        .find(|s| s.prefill_cursor.is_some() && s.draining_since.is_none())
+    else {
+        return false;
+    };
+    let cursor = seq.prefill_cursor.expect("filtered on Some above");
+    let session = &mut seq.session;
+    let end = match chunk {
+        // A zero chunk would make no progress and spin the engine forever.
+        Some(n) => cursor.saturating_add(n.max(1)).min(session.prefill_len),
+        None => session.prefill_len,
+    };
+
+    let mut gpu_ref: Option<&mut GpuBackend> = gpu.as_mut();
+    let logits = forward_prefill_lora(
+        weights,
+        config,
+        &session.tokens[cursor..end],
+        session.cache.as_mut(),
+        cursor,
+        &mut gpu_ref,
+        session.lora_adapter.as_deref(),
+    );
+
+    if end < session.prefill_len {
+        seq.prefill_cursor = Some(end);
+        return false;
+    }
+
+    // Final chunk: these are the logits the first token is sampled from.
+    session.last_logits = logits;
+    session.pos = session.prefill_len.saturating_sub(1);
+    seq.prefill_cursor = None;
+
+    // Retain this prompt's complete pages for the next request that shares
+    // them. Only the prompt is offered — a generated continuation belongs to
+    // this request alone — and only whole pages, so the sequence's own decoding
+    // never writes a page the registry holds.
+    if let (Some(prefix_cache), Some(paged)) = (prefix_cache, seq.session.cache.as_paged()) {
+        let prompt = &seq.session.tokens[..seq.session.prefill_len];
+        prefix_cache.insert(prompt, paged, seq.lora_name.as_deref());
+    }
+    true
 }
 
 /// Advance every live (non-draining) sequence by one decode step — the batched
@@ -865,7 +1031,7 @@ fn decode_batch_cpu(
     weights: &Arc<TransformerWeights>,
     config: &Arc<ModelConfig>,
 ) {
-    let live = active.iter().filter(|s| s.draining_since.is_none()).count();
+    let live = active.iter().filter(|s| s.is_decoding()).count();
     if live == 0 {
         return;
     }
@@ -877,7 +1043,7 @@ fn decode_batch_cpu(
     if live == 1 {
         let seq = active
             .iter_mut()
-            .find(|s| s.draining_since.is_none())
+            .find(|s| s.is_decoding())
             .expect("live count says there is one");
         let s = &mut seq.session;
         let tok = *s.tokens.last().unwrap();
@@ -894,7 +1060,7 @@ fn decode_batch_cpu(
     let mut loras: Vec<Option<&LoraWeights>> = Vec::with_capacity(live);
     let mut logit_slots: Vec<&mut Tensor> = Vec::with_capacity(live);
 
-    for seq in active.iter_mut().filter(|s| s.draining_since.is_none()) {
+    for seq in active.iter_mut().filter(|s| s.is_decoding()) {
         let s = &mut seq.session;
         tokens.push(*s.tokens.last().unwrap());
         positions.push(s.tokens.len() - 1);
@@ -1344,6 +1510,8 @@ mod tests {
                 pending: VecDeque::new(),
                 draining_since: None,
                 finish: FinishSignal::new(),
+                prefill_cursor: None, // prompt already in the cache above
+                lora_name: None,
             },
             rx,
         )
@@ -1713,19 +1881,25 @@ mod tests {
         }
     }
 
-    /// Admit `prompt` through the real admission path, returning the sequence
-    /// and its receiver (dropping the receiver would look like a disconnect).
+    /// Admit `prompt` through the real admission path and prefill it to
+    /// completion, returning the sequence and its receiver (dropping the
+    /// receiver would look like a disconnect).
     ///
-    /// Calling [`prefill_and_add`] directly is what lets the tests below
-    /// compare *logits and K/V rows* rather than sampled tokens: the tiny test
-    /// model's argmax is the same for almost any input, so a token stream is a
-    /// coarse probe for "did the cache change".
-    fn admit(
+    /// Driving [`admit`] and [`advance_one_prefill`] directly is what lets the
+    /// tests below compare *logits and K/V rows* rather than sampled tokens:
+    /// the tiny test model's argmax is the same for almost any input, so a
+    /// token stream is a coarse probe for "did the cache change".
+    ///
+    /// `chunk` is passed through to the prefill so the same assertions can be
+    /// run over any chunking — the prefix-cache tests use `None` (one pass),
+    /// while [`chunked_prefill_is_bit_identical_to_one_pass`] sweeps sizes.
+    fn admit_and_prefill(
         weights: &Arc<TransformerWeights>,
         config: &Arc<ModelConfig>,
         pool: &PagePool,
-        prefix_cache: Option<&mut PrefixCache>,
+        mut prefix_cache: Option<&mut PrefixCache>,
         prompt: Vec<u32>,
+        chunk: Option<usize>,
     ) -> (ActiveSequence, mpsc::Receiver<u32>) {
         let (tx, rx) = mpsc::channel(64);
         let req = InferenceRequest {
@@ -1740,18 +1914,28 @@ mod tests {
         };
         let vocab: Vec<String> = (0..config.vocab_size).map(|i| format!("t{i}")).collect();
         let mut active = Vec::new();
-        prefill_and_add(
+        admit(
             &mut active,
             req,
-            weights,
             config,
-            &mut None,
             CacheFormat::F32,
             Some(pool),
-            prefix_cache,
+            prefix_cache.as_deref_mut(),
             &VocabIndex::from_vocab(&vocab),
             &Arc::new(AdapterRegistry::new()),
         );
+        // Chunks until the prompt is in; the engine loop spreads these over
+        // steps, but nothing here depends on when they run.
+        while active.first().is_some_and(|s| s.prefill_cursor.is_some()) {
+            advance_one_prefill(
+                &mut active,
+                weights,
+                config,
+                &mut None,
+                prefix_cache.as_deref_mut(),
+                chunk,
+            );
+        }
         (active.pop().expect("the prompt was admitted"), rx)
     }
 
@@ -1774,7 +1958,7 @@ mod tests {
         let cold_pool = PagePool::new(256, n_kv_heads, head_dim);
         let cold: Vec<_> = prompts
             .iter()
-            .map(|p| admit(&weights, &config, &cold_pool, None, p.clone()))
+            .map(|p| admit_and_prefill(&weights, &config, &cold_pool, None, p.clone(), None))
             .collect();
 
         let warm_pool = PagePool::new(256, n_kv_heads, head_dim);
@@ -1782,12 +1966,13 @@ mod tests {
         let warm: Vec<_> = prompts
             .iter()
             .map(|p| {
-                admit(
+                admit_and_prefill(
                     &weights,
                     &config,
                     &warm_pool,
                     Some(&mut registry),
                     p.clone(),
+                    None,
                 )
             })
             .collect();
@@ -2232,5 +2417,435 @@ mod tests {
         let err = reserve_or_evict(&mut cache, 4 * PAGE_SIZE, Some(&mut registry))
             .expect_err("nothing can free these pages");
         assert!(matches!(err, GlintError::KvPagePoolExhausted { .. }));
+    }
+
+    // ── Chunked prefill ───────────────────────────────────────────────────
+
+    /// Prefill `prompt` at every chunk size in `chunks` and require each run to
+    /// match a single-pass prefill exactly — same logits, and the same K/V in
+    /// every cache row of every layer.
+    ///
+    /// This is the correctness bar for chunking. Spreading a prefill over steps
+    /// is only sound if the cache it leaves behind is bit-for-bit what one pass
+    /// would have written; anything less would make a completion depend on how
+    /// busy the engine was when its prompt arrived.
+    fn assert_chunking_is_bit_identical(prompt: &[u32], chunks: &[usize]) {
+        let (raw_weights, mut config) = make_tiny_weights();
+        config.context_length = 256;
+        let weights = Arc::new(raw_weights);
+        let config = Arc::new(config);
+        let n_kv_heads = config.head_count_kv as usize;
+        let head_dim = config.head_dim() as usize;
+        let n_layers = config.block_count as usize;
+
+        let one_pass_pool = PagePool::new(256, n_kv_heads, head_dim);
+        let (one_pass, _rx) = admit_and_prefill(
+            &weights,
+            &config,
+            &one_pass_pool,
+            None,
+            prompt.to_vec(),
+            None,
+        );
+
+        for &chunk in chunks {
+            let pool = PagePool::new(256, n_kv_heads, head_dim);
+            let (chunked, _rx) =
+                admit_and_prefill(&weights, &config, &pool, None, prompt.to_vec(), Some(chunk));
+
+            let want = one_pass.session.last_logits.data();
+            let got = chunked.session.last_logits.data();
+            assert_eq!(want.len(), got.len(), "chunk {chunk}: logits len");
+            for (i, (&a, &b)) in want.iter().zip(got).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "chunk {chunk} logit {i}: one-pass={a}, chunked={b}"
+                );
+            }
+            assert_eq!(
+                chunked.session.pos, one_pass.session.pos,
+                "chunk {chunk}: decode position"
+            );
+
+            let want_cache = one_pass.session.cache.as_paged().expect("paged");
+            let got_cache = chunked.session.cache.as_paged().expect("paged");
+            assert_eq!(
+                want_cache.len(),
+                got_cache.len(),
+                "chunk {chunk}: cache len"
+            );
+            for layer in 0..n_layers {
+                for pos in 0..want_cache.len() {
+                    assert_eq!(
+                        want_cache.k_at(layer, pos),
+                        got_cache.k_at(layer, pos),
+                        "chunk {chunk} layer {layer} K row {pos}"
+                    );
+                    assert_eq!(
+                        want_cache.v_at(layer, pos),
+                        got_cache.v_at(layer, pos),
+                        "chunk {chunk} layer {layer} V row {pos}"
+                    );
+                }
+            }
+        }
+    }
+
+    // Chunk sizes that divide the prompt evenly, that leave a short final
+    // chunk, that fall on and off the 16-token page boundary, and that exceed
+    // the prompt entirely — all must land on the same cache and logits.
+    #[test]
+    fn chunked_prefill_is_bit_identical_to_one_pass() {
+        let prompt: Vec<u32> = (0..40u32).map(|i| i % 7).collect();
+        assert_chunking_is_bit_identical(&prompt, &[1, 3, 7, 8, 16, 20, 39, 40, 41, 1000]);
+    }
+
+    // Chunking on top of prefix reuse: the prefill starts at a non-zero cursor
+    // (the forked prefix) *and* advances in pieces from there. The two offsets
+    // compose, so this is the case where an off-by-one in either would show.
+    #[test]
+    fn chunked_prefill_over_a_reused_prefix_stays_bit_identical() {
+        let (raw_weights, mut config) = make_tiny_weights();
+        config.context_length = 256;
+        let weights = Arc::new(raw_weights);
+        let config = Arc::new(config);
+        let n_kv_heads = config.head_count_kv as usize;
+        let head_dim = config.head_dim() as usize;
+        let n_layers = config.block_count as usize;
+
+        let first = shared_prompt(&[1, 2, 3]);
+        let second = shared_prompt(&[4, 5, 6]);
+
+        // Cold: no registry, one pass.
+        let cold_pool = PagePool::new(256, n_kv_heads, head_dim);
+        let (_cold_first, _rx0) =
+            admit_and_prefill(&weights, &config, &cold_pool, None, first.clone(), None);
+        let (cold_second, _rx1) =
+            admit_and_prefill(&weights, &config, &cold_pool, None, second.clone(), None);
+
+        // Warm: the second prompt forks the first's pages, then prefills its
+        // suffix in 3-token chunks (deliberately coprime with the 16-token page).
+        let warm_pool = PagePool::new(256, n_kv_heads, head_dim);
+        let mut registry = PrefixCache::new(PrefixCacheConfig::default());
+        let (_warm_first, _rx2) = admit_and_prefill(
+            &weights,
+            &config,
+            &warm_pool,
+            Some(&mut registry),
+            first,
+            Some(3),
+        );
+        let (warm_second, _rx3) = admit_and_prefill(
+            &weights,
+            &config,
+            &warm_pool,
+            Some(&mut registry),
+            second,
+            Some(3),
+        );
+        assert_eq!(
+            registry.stats().tokens_reused,
+            32,
+            "the second prompt should have forked two whole pages"
+        );
+
+        let want = cold_second.session.last_logits.data();
+        let got = warm_second.session.last_logits.data();
+        for (i, (&a, &b)) in want.iter().zip(got).enumerate() {
+            assert_eq!(a.to_bits(), b.to_bits(), "logit {i}: cold={a}, chunked={b}");
+        }
+        let want_cache = cold_second.session.cache.as_paged().expect("paged");
+        let got_cache = warm_second.session.cache.as_paged().expect("paged");
+        assert_eq!(want_cache.len(), got_cache.len(), "cache len");
+        for layer in 0..n_layers {
+            for pos in 0..want_cache.len() {
+                assert_eq!(
+                    want_cache.k_at(layer, pos),
+                    got_cache.k_at(layer, pos),
+                    "layer {layer} K row {pos}"
+                );
+                assert_eq!(
+                    want_cache.v_at(layer, pos),
+                    got_cache.v_at(layer, pos),
+                    "layer {layer} V row {pos}"
+                );
+            }
+        }
+    }
+
+    /// Admit `prompts` into a fresh `active` list without prefilling any of
+    /// them, so the tests below can drive prefill steps by hand.
+    fn admit_all(
+        config: &Arc<ModelConfig>,
+        pool: &PagePool,
+        prompts: Vec<Vec<u32>>,
+    ) -> (Vec<ActiveSequence>, Vec<mpsc::Receiver<u32>>) {
+        let vocab: Vec<String> = (0..config.vocab_size).map(|i| format!("t{i}")).collect();
+        let index = VocabIndex::from_vocab(&vocab);
+        let registry = Arc::new(AdapterRegistry::new());
+        let mut active = Vec::new();
+        let mut receivers = Vec::new();
+        for prompt in prompts {
+            let (tx, rx) = mpsc::channel(64);
+            admit(
+                &mut active,
+                InferenceRequest {
+                    prompt_tokens: prompt,
+                    max_new_tokens: 8,
+                    sampler_cfg: greedy_cfg(),
+                    eos_token: NO_EOS,
+                    constraint: None,
+                    lora_name: None,
+                    tx,
+                    finish: FinishSignal::new(),
+                },
+                config,
+                CacheFormat::F32,
+                Some(pool),
+                None,
+                &index,
+                &registry,
+            );
+            receivers.push(rx);
+        }
+        (active, receivers)
+    }
+
+    // Admission must compute none of the prompt: that is what makes admitting
+    // a long prompt free for the sequences already decoding. The sequence
+    // arrives in the prefilling state with an empty cache.
+    #[test]
+    fn admission_does_not_prefill() {
+        let (_weights, mut config) = make_tiny_weights();
+        config.context_length = 256;
+        let config = Arc::new(config);
+        let pool = PagePool::new(
+            256,
+            config.head_count_kv as usize,
+            config.head_dim() as usize,
+        );
+
+        let (active, _rx) = admit_all(&config, &pool, vec![vec![1, 2, 3, 4]]);
+        assert_eq!(active[0].prefill_cursor, Some(0), "nothing prefilled yet");
+        assert_eq!(
+            active[0].session.cache.len(),
+            0,
+            "cache must still be empty"
+        );
+        assert!(
+            !active[0].is_decoding(),
+            "a sequence with no logits must not join a decode batch"
+        );
+    }
+
+    // A prompt is spread over steps, one chunk at a time — the mechanism that
+    // bounds how long a decoding sequence waits. The cursor advances by exactly
+    // the chunk size and the sequence only starts decoding on the final chunk.
+    #[test]
+    fn a_prefill_advances_one_chunk_per_step() {
+        let (raw_weights, mut config) = make_tiny_weights();
+        config.context_length = 256;
+        let weights = Arc::new(raw_weights);
+        let config = Arc::new(config);
+        let pool = PagePool::new(
+            256,
+            config.head_count_kv as usize,
+            config.head_dim() as usize,
+        );
+
+        let prompt: Vec<u32> = (0..40u32).map(|i| i % 7).collect();
+        let (mut active, _rx) = admit_all(&config, &pool, vec![prompt]);
+
+        for expected in [Some(16), Some(32), None] {
+            let done =
+                advance_one_prefill(&mut active, &weights, &config, &mut None, None, Some(16));
+            assert_eq!(active[0].prefill_cursor, expected, "cursor after a chunk");
+            assert_eq!(
+                done,
+                expected.is_none(),
+                "completion is reported on the last chunk only"
+            );
+        }
+        assert!(
+            active[0].is_decoding(),
+            "a fully prefilled sequence joins the next decode batch"
+        );
+        assert_eq!(
+            active[0].session.pos, 39,
+            "decode resumes at the last prompt position"
+        );
+    }
+
+    // The stall a decoding sequence sees is one chunk regardless of how many
+    // prompts are waiting: a step advances exactly one of them.
+    #[test]
+    fn only_one_prompt_is_prefilled_per_step() {
+        let (raw_weights, mut config) = make_tiny_weights();
+        config.context_length = 256;
+        let weights = Arc::new(raw_weights);
+        let config = Arc::new(config);
+        let pool = PagePool::new(
+            256,
+            config.head_count_kv as usize,
+            config.head_dim() as usize,
+        );
+
+        let prompt: Vec<u32> = (0..40u32).map(|i| i % 7).collect();
+        let (mut active, _rx) = admit_all(&config, &pool, vec![prompt.clone(), prompt]);
+
+        advance_one_prefill(&mut active, &weights, &config, &mut None, None, Some(16));
+        assert_eq!(
+            active[0].prefill_cursor,
+            Some(16),
+            "the first prompt advanced"
+        );
+        assert_eq!(
+            active[1].prefill_cursor,
+            Some(0),
+            "the queued prompt must not have been touched in the same step"
+        );
+    }
+
+    // A zero chunk would make no progress and spin the engine thread forever;
+    // it is clamped to one token so the prefill always terminates.
+    #[test]
+    fn a_zero_chunk_still_makes_progress() {
+        let (raw_weights, mut config) = make_tiny_weights();
+        config.context_length = 256;
+        let weights = Arc::new(raw_weights);
+        let config = Arc::new(config);
+        let pool = PagePool::new(
+            256,
+            config.head_count_kv as usize,
+            config.head_dim() as usize,
+        );
+
+        let (mut active, _rx) = admit_all(&config, &pool, vec![vec![1, 2, 3]]);
+        advance_one_prefill(&mut active, &weights, &config, &mut None, None, Some(0));
+        assert_eq!(
+            active[0].prefill_cursor,
+            Some(1),
+            "must advance at least one token"
+        );
+    }
+
+    // End to end: chunking is a scheduling change, not a numerical one, so a
+    // request served by a chunked engine gets the tokens an unchunked one would.
+    #[test]
+    fn chunked_engine_produces_the_same_tokens_as_an_unchunked_one() {
+        let unchunked = start_tiny_engine(
+            EngineLimits {
+                prefill_chunk: None,
+                ..Default::default()
+            },
+            256,
+        );
+        let chunked = start_tiny_engine(
+            EngineLimits {
+                prefill_chunk: Some(3),
+                ..Default::default()
+            },
+            256,
+        );
+        let prompt: Vec<u32> = (0..40u32).map(|i| i % 7).collect();
+        let budget = 20;
+        let from_unchunked = drain_all(
+            unchunked
+                .submit(prompt.clone(), budget, greedy_cfg(), NO_EOS, None, None)
+                .expect("queue has room"),
+        );
+        let from_chunked = drain_all(
+            chunked
+                .submit(prompt, budget, greedy_cfg(), NO_EOS, None, None)
+                .expect("queue has room"),
+        );
+        assert_eq!(from_unchunked.len(), budget);
+        assert_eq!(
+            from_unchunked, from_chunked,
+            "chunking the prefill must not change the completion"
+        );
+    }
+
+    // A client that hangs up mid-prefill has produced no tokens, so the
+    // delivery path — which only learns of a closed channel by sending to it —
+    // cannot notice. The engine asks the channel directly instead, so the rest
+    // of a long abandoned prompt is never computed.
+    #[test]
+    fn a_prefill_whose_client_hung_up_is_abandoned() {
+        let (_weights, mut config) = make_tiny_weights();
+        config.context_length = 256;
+        let config = Arc::new(config);
+        let pool = PagePool::new(
+            256,
+            config.head_count_kv as usize,
+            config.head_dim() as usize,
+        );
+
+        let (mut active, receivers) = admit_all(&config, &pool, vec![vec![1, 2, 3, 4]]);
+        assert!(
+            !active[0].is_abandoned_prefill(),
+            "a prefill with a listening client must be computed"
+        );
+
+        drop(receivers);
+        assert!(
+            active[0].is_abandoned_prefill(),
+            "a prefill whose client hung up must be dropped"
+        );
+
+        // The same closed channel on a sequence that has *finished* is not
+        // abandonment: it earned a Stop/Length outcome that must not be
+        // rewritten as a truncation just because the reader has gone.
+        active[0].prefill_cursor = None;
+        assert!(
+            !active[0].is_abandoned_prefill(),
+            "a finished sequence must keep the outcome it earned"
+        );
+    }
+
+    // A long prompt arriving mid-stream must not stop the sequences already
+    // generating. With a one-token chunk the newcomer needs many steps to get
+    // its prompt in, and the running sequence must keep producing throughout —
+    // under the old single-pass prefill it produced nothing until the whole
+    // prompt was done.
+    #[test]
+    fn a_long_prompt_does_not_stall_a_decoding_sequence() {
+        let engine = start_tiny_engine(
+            EngineLimits {
+                prefill_chunk: Some(1),
+                ..Default::default()
+            },
+            512,
+        );
+        let mut running = engine
+            .submit(vec![1, 2], 300, greedy_cfg(), NO_EOS, None, None)
+            .expect("queue has room");
+        // Drain the head start the engine built up before the newcomer arrives,
+        // so what we count below is produced alongside its prefill.
+        assert!(running.rx.blocking_recv().is_some(), "the sequence is live");
+        while running.rx.try_recv().is_ok() {}
+
+        let long_prompt: Vec<u32> = (0..200u32).map(|i| i % 7).collect();
+        let mut newcomer = engine
+            .submit(long_prompt, 4, greedy_cfg(), NO_EOS, None, None)
+            .expect("queue has room");
+
+        // Count what the running sequence emits before the newcomer's first
+        // token. Its prompt takes 200 steps at one token per step, so a healthy
+        // engine interleaves ~200 decode steps into that window; the old
+        // behaviour yields 0. The bar is set well below the expected value so
+        // scheduler jitter cannot make this flaky.
+        let mut produced = 0;
+        while newcomer.rx.try_recv().is_err() && produced < 50 {
+            match running.rx.blocking_recv() {
+                Some(_) => produced += 1,
+                None => break,
+            }
+        }
+        assert!(
+            produced >= 20,
+            "a decoding sequence should keep producing during a long prefill, got {produced} tokens"
+        );
     }
 }

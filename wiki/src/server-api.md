@@ -411,6 +411,51 @@ single-sequence decode.
 `Model::decode_batch` exposes the same step to library callers, and
 `glint bench --mode concurrency` measures it.
 
+### Chunked prefill
+
+Batching fixes the cost of decoding N sequences, but prefill runs on the same
+thread, and a prompt is not one token — it is thousands. Prefilled in one pass,
+a 4 000-token prompt arriving mid-stream stops *every* sequence already
+generating for as long as that whole prompt takes. The requests already
+streaming go quiet, through no fault of their own; the more the server is worth
+using, the more often it happens.
+
+So the engine splits a prefill across steps. Admission reserves the sequence's
+cache but computes none of its prompt; each step afterwards advances one waiting
+prompt by at most `EngineLimits::prefill_chunk` tokens (`--prefill-chunk`,
+default 256) and then runs a normal decode step for everyone else. A sequence
+still being prefilled has no logits yet, so it neither samples nor joins the
+decode batch — it starts decoding on the step its final chunk lands, in the same
+step, so a prompt arriving at an *idle* engine is served exactly as promptly as
+before.
+
+Two properties make this the whole fix rather than half of one:
+
+- **One prompt per step.** However many requests are queued, a decoding sequence
+  waits one chunk, not one chunk per newcomer. Prompts finish in admission order
+  rather than round-robin — interleaving several would delay every one of their
+  first tokens instead of just the later ones.
+- **Reservation up front.** A prompt the page pool cannot hold is rejected at
+  admission, before any of it has been computed, so splitting the work never
+  turns into failing halfway through it.
+- **Abandoned prompts stop early.** A prefilling sequence has produced no
+  tokens, so the delivery path — which learns a client has hung up by trying to
+  send to it — cannot notice one that has. The engine checks the channel
+  directly, so a long prompt whose client disconnects is dropped rather than
+  computed to the end for nobody.
+
+Chunking changes *when* a prompt's K/V is computed, never what it is. Positions
+are absolute and attention reads the whole cache, so a prompt prefilled in
+pieces writes exactly the K/V one pass would have — the same property prefix
+reuse rests on, applied repeatedly. The tests assert this directly: every chunk
+size produces bit-identical logits and bit-identical K/V in every cache row of
+every layer, including when chunking sits on top of a reused prefix.
+
+The knob trades the two latencies against each other. A smaller chunk protects
+the inter-token latency of requests already streaming; a larger one favours the
+time-to-first-token of arriving ones. `--prefill-chunk 0` restores the
+single-pass behaviour.
+
 ### Backpressure and slow clients
 
 Token delivery to clients never blocks the decode loop. On each generated token the
