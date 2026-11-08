@@ -463,9 +463,16 @@ mod tests {
         // 50 * tanh(-1) ≈ -38.0797
         // 50 * tanh(20) ≈ 50.0
         // 50 * tanh(-20) ≈ -50.0
-        approx_eq(&[capped.data()[0]], &[0.0], 1e-6);
-        approx_eq(&[capped.data()[1]], &[50.0 * 1.0f32.tanh()], 1e-6);
-        approx_eq(&[capped.data()[2]], &[-50.0 * 1.0f32.tanh()], 1e-6);
+        // The expectations call `tanh` a second time, and Miri makes
+        // transcendental functions non-deterministic between calls, so the two
+        // results drift by a few ULP there — same as the RoPE sin/cos case in
+        // `test_rope_scaling_factor`. The loosened bound still fails loudly for
+        // a real bug: a wrong cap or a missing `tanh` moves these by whole
+        // units, not by 1e-5.
+        let tol = if cfg!(miri) { 1e-4 } else { 1e-6 };
+        approx_eq(&[capped.data()[0]], &[0.0], tol);
+        approx_eq(&[capped.data()[1]], &[50.0 * 1.0f32.tanh()], tol);
+        approx_eq(&[capped.data()[2]], &[-50.0 * 1.0f32.tanh()], tol);
         assert!((capped.data()[3] - 50.0).abs() < 1e-5);
         assert!((capped.data()[4] + 50.0).abs() < 1e-5);
     }
