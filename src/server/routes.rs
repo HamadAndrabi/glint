@@ -28,7 +28,7 @@ use crate::model::chat_template::Message;
 use crate::sampling::SamplerConfig;
 use crate::transformer::embed_batch;
 
-use super::engine::{Finish, FinishSignal};
+use super::engine::{EngineToken, Finish, FinishSignal};
 use super::state::AppState;
 use super::types::*;
 
@@ -116,7 +116,7 @@ struct PreparedGeneration {
 }
 
 struct StartedGeneration {
-    rx: tokio::sync::mpsc::Receiver<u32>,
+    rx: tokio::sync::mpsc::Receiver<EngineToken>,
     /// Why the sequence ended — only meaningful once `rx` has closed.
     finish: FinishSignal,
     prompt_len: usize,
@@ -171,6 +171,7 @@ fn prepare_generation_from_prompt(
     top_k: Option<usize>,
     repeat_penalty: Option<f32>,
     seed: Option<u64>,
+    eos: Option<u32>,
 ) -> Result<PreparedGeneration, Response> {
     validate_model(requested_model, &state.model_name)?;
 
@@ -189,13 +190,14 @@ fn prepare_generation_from_prompt(
 
     let max_tokens = max_tokens.unwrap_or(100).min(context_limit - prompt_len);
     let sampler_cfg = sampler_config_from_params(temperature, top_p, top_k, repeat_penalty, seed);
+    let eos = eos.unwrap_or(state.tokenizer.eos_token_id);
 
     Ok(PreparedGeneration {
         prompt_tokens,
         prompt_len,
         max_tokens,
         sampler_cfg,
-        eos: state.tokenizer.eos_token_id,
+        eos,
         model_name: state.model_name.clone(),
         constraint: None,
     })
@@ -368,6 +370,7 @@ fn prepare_chat_generation(
         })
         .collect();
     let prompt = state.chat_template.apply(&msgs);
+    let eos = state.tokenizer.eos_for_template(&state.chat_template);
 
     prepare_generation_from_prompt(
         state,
@@ -379,6 +382,7 @@ fn prepare_chat_generation(
         top_k,
         repeat_penalty,
         seed,
+        Some(eos),
     )
 }
 
@@ -455,14 +459,14 @@ fn start_generation(
 
 async fn collect_generation(
     state: Arc<AppState>,
-    rx: tokio::sync::mpsc::Receiver<u32>,
+    rx: tokio::sync::mpsc::Receiver<EngineToken>,
     finish: FinishSignal,
 ) -> CompletedGeneration {
     let t0 = Instant::now();
     let mut stream = ReceiverStream::new(rx);
     let mut generated_ids: Vec<u32> = Vec::new();
     let mut ttft_recorded = false;
-    while let Some(token_id) = stream.next().await {
+    while let Some(engine_token) = stream.next().await {
         if !ttft_recorded {
             state
                 .metrics
@@ -470,7 +474,7 @@ async fn collect_generation(
             state.metrics.on_first_token();
             ttft_recorded = true;
         }
-        generated_ids.push(token_id);
+        generated_ids.push(engine_token.token);
     }
 
     let elapsed_ms = t0.elapsed().as_millis() as u64;
@@ -591,8 +595,19 @@ pub async fn server_metrics(State(state): State<Arc<AppState>>) -> impl IntoResp
 
 // ── GET /v1/models ────────────────────────────────────────────────────────────
 
-/// List the loaded model.
+/// List the loaded model and its architecture specs.
 pub async fn list_models(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let arch = ModelArchitectureInfo {
+        num_layers: state.config.block_count as usize,
+        num_heads: state.config.head_count as usize,
+        num_kv_heads: state.config.head_count_kv as usize,
+        embedding_length: state.config.embedding_length as usize,
+        hidden_dim: state.config.feed_forward_length.unwrap_or(0) as usize,
+        vocab_size: state.config.vocab_size as usize,
+        context_length: state.config.context_length as usize,
+        chat_template: state.chat_template.name().to_string(),
+    };
+
     Json(ModelsResponse {
         object: "list",
         data: vec![ModelInfo {
@@ -600,6 +615,7 @@ pub async fn list_models(State(state): State<Arc<AppState>>) -> impl IntoRespons
             object: "model",
             created: 0,
             owned_by: "glint",
+            architecture: Some(arch),
         }],
     })
 }
@@ -621,6 +637,7 @@ pub async fn completions(
         req.top_k,
         req.repeat_penalty,
         req.seed,
+        None,
     ) {
         Ok(prepared) => prepared,
         Err(err) => return err,
@@ -669,6 +686,7 @@ async fn non_streaming_completion(state: Arc<AppState>, prepared: PreparedGenera
         choices: vec![CompletionChoice {
             text: completed.text,
             index: 0,
+            logprobs: None,
             finish_reason,
         }],
         usage: UsageInfo {
@@ -702,7 +720,7 @@ async fn streaming_completion(state: Arc<AppState>, prepared: PreparedGeneration
     let ttft_sent = Arc::new(AtomicBool::new(false));
     let ttft_sent_clone = Arc::clone(&ttft_sent);
     let state_for_stream = Arc::clone(&state);
-    let stream = ReceiverStream::new(started.rx).map(move |token_id| {
+    let stream = ReceiverStream::new(started.rx).map(move |engine_tok| {
         if !ttft_sent_clone.swap(true, Ordering::Relaxed) {
             state_for_stream
                 .metrics
@@ -710,15 +728,30 @@ async fn streaming_completion(state: Arc<AppState>, prepared: PreparedGeneration
             state_for_stream.metrics.on_first_token();
         }
         tc.fetch_add(1, Ordering::Relaxed);
-        let text = tokenizer.decode(&[token_id]);
+        let text = tokenizer.decode(&[engine_tok.token]);
+        let top_logprobs: Vec<TopLogprob> = engine_tok
+            .top_logprobs
+            .iter()
+            .map(|(id, lp)| TopLogprob {
+                token: tokenizer.decode(&[*id]),
+                logprob: *lp,
+            })
+            .collect();
         let chunk = CompletionChunk {
             id: id.clone(),
             object: "text_completion",
             created,
             model: stream_model.clone(),
             choices: vec![ChunkChoice {
-                text,
+                text: text.clone(),
                 index: 0,
+                logprobs: Some(ChoiceLogprobs {
+                    content: Some(vec![TokenLogprob {
+                        token: text,
+                        logprob: engine_tok.logprob,
+                        top_logprobs,
+                    }]),
+                }),
                 finish_reason: None,
             }],
         };
@@ -746,6 +779,7 @@ async fn streaming_completion(state: Arc<AppState>, prepared: PreparedGeneration
                         choices: vec![ChunkChoice {
                             text: String::new(),
                             index: 0,
+                            logprobs: None,
                             finish_reason: Some(reason),
                         }],
                     };
@@ -828,6 +862,7 @@ async fn streaming_chat_completion(
                     tool_calls: None,
                 }
             },
+            logprobs: None,
             finish_reason: None,
         }],
     };
@@ -839,7 +874,7 @@ async fn streaming_chat_completion(
     let ttft_sent = Arc::new(AtomicBool::new(false));
     let ttft_sent_clone = Arc::clone(&ttft_sent);
     let state_for_stream = Arc::clone(&state);
-    let content_stream = ReceiverStream::new(started.rx).map(move |token_id| {
+    let content_stream = ReceiverStream::new(started.rx).map(move |engine_tok| {
         if !ttft_sent_clone.swap(true, Ordering::Relaxed) {
             state_for_stream
                 .metrics
@@ -847,7 +882,15 @@ async fn streaming_chat_completion(
             state_for_stream.metrics.on_first_token();
         }
         tc.fetch_add(1, Ordering::Relaxed);
-        let text = tokenizer.decode(&[token_id]);
+        let text = tokenizer.decode(&[engine_tok.token]);
+        let top_logprobs: Vec<TopLogprob> = engine_tok
+            .top_logprobs
+            .iter()
+            .map(|(id, lp)| TopLogprob {
+                token: tokenizer.decode(&[*id]),
+                logprob: *lp,
+            })
+            .collect();
         let chunk = ChatChunk {
             id: id.clone(),
             object: "chat.completion.chunk",
@@ -865,17 +908,24 @@ async fn streaming_chat_completion(
                             tool_type: None,
                             function: Some(FunctionCallDelta {
                                 name: None,
-                                arguments: Some(text),
+                                arguments: Some(text.clone()),
                             }),
                         }]),
                     }
                 } else {
                     ChatDelta {
                         role: None,
-                        content: Some(text),
+                        content: Some(text.clone()),
                         tool_calls: None,
                     }
                 },
+                logprobs: Some(ChoiceLogprobs {
+                    content: Some(vec![TokenLogprob {
+                        token: text,
+                        logprob: engine_tok.logprob,
+                        top_logprobs,
+                    }]),
+                }),
                 finish_reason: None,
             }],
         };
@@ -910,6 +960,7 @@ async fn streaming_chat_completion(
                                 content: None,
                                 tool_calls: None,
                             },
+                            logprobs: None,
                             finish_reason: Some(reason),
                         }],
                     };
@@ -1041,6 +1092,7 @@ pub async fn chat_completions(
             choices: vec![ChatChoice {
                 index: 0,
                 message,
+                logprobs: None,
                 finish_reason,
             }],
             usage: UsageInfo {
@@ -1153,7 +1205,7 @@ async fn streaming_response(state: Arc<AppState>, prepared: PreparedGeneration) 
     let ttft_sent = Arc::new(AtomicBool::new(false));
     let ttft_sent_clone = Arc::clone(&ttft_sent);
     let state_for_stream = Arc::clone(&state);
-    let delta_stream = ReceiverStream::new(started.rx).map(move |token_id| {
+    let delta_stream = ReceiverStream::new(started.rx).map(move |engine_tok| {
         if !ttft_sent_clone.swap(true, Ordering::Relaxed) {
             state_for_stream
                 .metrics
@@ -1161,7 +1213,7 @@ async fn streaming_response(state: Arc<AppState>, prepared: PreparedGeneration) 
             state_for_stream.metrics.on_first_token();
         }
         tc.fetch_add(1, Ordering::Relaxed);
-        let text = tokenizer.decode(&[token_id]);
+        let text = tokenizer.decode(&[engine_tok.token]);
         if let Ok(mut buf) = text_buf.lock() {
             buf.push_str(&text);
         }
@@ -1347,6 +1399,25 @@ pub async fn logo_svg() -> Response {
         .unwrap_or_else(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "failed to load logo"))
 }
 
+// ── GET /assets/fonts.css ─────────────────────────────────────────────────────
+
+/// Serves the dashboard's self-hosted web fonts.
+///
+/// The UI previously pulled these from `fonts.googleapis.com`, which meant the
+/// embedded dashboard of an offline-first, local inference server did not render
+/// without internet access and made third-party requests on every load. The
+/// faces are compiled into the binary as `data:` URIs instead; served as its own
+/// route rather than inlined so the browser can cache it separately from the
+/// HTML.
+pub async fn fonts_css() -> Response {
+    let css = include_str!("../../assets/fonts.css");
+    axum::response::Response::builder()
+        .header("Content-Type", "text/css; charset=utf-8")
+        .header("Cache-Control", "public, max-age=604800, immutable")
+        .body(axum::body::Body::from(css))
+        .unwrap_or_else(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "failed to load fonts"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1361,6 +1432,48 @@ mod tests {
     async fn test_logo_svg_returns_svg() {
         let resp = logo_svg().await;
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_fonts_css_is_served_as_css() {
+        let resp = fonts_css().await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("Content-Type").unwrap(),
+            "text/css; charset=utf-8"
+        );
+    }
+
+    /// The dashboard is the built-in UI of an offline-capable local server, so
+    /// it must not fetch anything from a third-party host at load time. Guards
+    /// against a CDN `<link>`/`<script>` creeping back in.
+    ///
+    /// Matches only actual *loading* attributes: prose in comments and the
+    /// `http://www.w3.org/2000/svg` XML namespace are not network requests.
+    #[test]
+    fn test_web_ui_loads_no_external_resources() {
+        let html = include_str!("web/index.html");
+        for attr in ["src=\"http", "src=\'http", "href=\"http", "href=\'http"] {
+            assert!(
+                !html.contains(attr),
+                "embedded dashboard must not load external resources (found `{attr}`)"
+            );
+        }
+        assert!(
+            !html.contains("@import"),
+            "embedded dashboard must not @import an external stylesheet"
+        );
+    }
+
+    /// Model output is rendered through `formatMarkdown`, which must never emit
+    /// inline event handlers carrying model-controlled text.
+    #[test]
+    fn test_web_ui_has_no_inline_handlers_with_encoded_payloads() {
+        let html = include_str!("web/index.html");
+        assert!(
+            !html.contains("encodeURIComponent(code)"),
+            "code text must not be round-tripped through an inline handler attribute"
+        );
     }
 
     // The mapping that decides how a stream terminates. `None` is the load-

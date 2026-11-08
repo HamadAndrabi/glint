@@ -309,6 +309,25 @@ impl ResponseInputContent {
 
 // ── Non-streaming responses ───────────────────────────────────────────────────
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TokenLogprob {
+    pub token: String,
+    pub logprob: f32,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub top_logprobs: Vec<TopLogprob>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TopLogprob {
+    pub token: String,
+    pub logprob: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChoiceLogprobs {
+    pub content: Option<Vec<TokenLogprob>>,
+}
+
 /// `POST /v1/completions` non-streaming response.
 #[derive(Debug, Serialize)]
 pub struct CompletionResponse {
@@ -324,6 +343,8 @@ pub struct CompletionResponse {
 pub struct CompletionChoice {
     pub text: String,
     pub index: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<ChoiceLogprobs>,
     pub finish_reason: &'static str,
 }
 
@@ -349,6 +370,8 @@ pub struct ChatCompletionResponse {
 pub struct ChatChoice {
     pub index: usize,
     pub message: ChatMessageOut,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<ChoiceLogprobs>,
     pub finish_reason: &'static str,
 }
 
@@ -421,6 +444,8 @@ pub struct CompletionChunk {
 pub struct ChunkChoice {
     pub text: String,
     pub index: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<ChoiceLogprobs>,
     /// `null` mid-stream, `"stop"` on the last chunk.
     pub finish_reason: Option<&'static str>,
 }
@@ -439,6 +464,8 @@ pub struct ChatChunk {
 pub struct ChatChunkChoice {
     pub index: usize,
     pub delta: ChatDelta,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<ChoiceLogprobs>,
     pub finish_reason: Option<&'static str>,
 }
 
@@ -454,6 +481,18 @@ pub struct ChatDelta {
 
 // ── Models endpoint ───────────────────────────────────────────────────────────
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelArchitectureInfo {
+    pub num_layers: usize,
+    pub num_heads: usize,
+    pub num_kv_heads: usize,
+    pub embedding_length: usize,
+    pub hidden_dim: usize,
+    pub vocab_size: usize,
+    pub context_length: usize,
+    pub chat_template: String,
+}
+
 /// `GET /v1/models` response.
 #[derive(Debug, Serialize)]
 pub struct ModelsResponse {
@@ -467,6 +506,8 @@ pub struct ModelInfo {
     pub object: &'static str,
     pub created: u64,
     pub owned_by: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub architecture: Option<ModelArchitectureInfo>,
 }
 
 // ── Embeddings ────────────────────────────────────────────────────────────────

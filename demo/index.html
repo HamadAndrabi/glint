@@ -1,126 +1,202 @@
 <!DOCTYPE html>
-<html lang="en">
+<html class="dark" lang="en">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Glint — LLM Inference in the Browser</title>
+  <title>Glint — In-Browser Neural Inference</title>
+  
+  <!-- Haute Luxury Typography: Instrument Serif, Syne, Plus Jakarta Sans & JetBrains Mono -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=JetBrains+Mono:wght@300;400;500&family=Syne:wght@400;500;600;700;800&family=Plus+Jakarta+Sans:wght@300;400;500;600&display=swap" rel="stylesheet" />
+  <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..500,0..1&display=swap" rel="stylesheet"/>
+
   <style>
     /* ── Reset & base ──────────────────────────────────────────────────────── */
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
     :root {
-      --bg:        #0d1117;
-      --surface:   #161b22;
-      --border:    #30363d;
-      --accent:    #58a6ff;
-      --accent-dim:#1f6feb;
-      --green:     #3fb950;
-      --red:       #f85149;
-      --yellow:    #d29922;
-      --text:      #e6edf3;
-      --muted:     #8b949e;
-      --radius:    8px;
-      --mono:      'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
+      --bg:                #000000;
+      --text:              #f7f7fc;
+      --muted:             #888898;
+      --surface:           rgba(8, 8, 12, 0.65);
+      --surface-elevated:  rgba(12, 12, 18, 0.85);
+      --border:            rgba(255, 255, 255, 0.07);
+      --border-focus:      rgba(255, 255, 255, 0.2);
+      --btn-bg:            #ffffff;
+      --btn-text:          #000000;
+      --code-bg:           #050507;
+      --radius:            16px;
+      --mono:              'JetBrains Mono', monospace;
+      --sans:              'Plus Jakarta Sans', system-ui, sans-serif;
+      --serif:             'Instrument Serif', Georgia, serif;
+      --display:           'Syne', 'Plus Jakarta Sans', sans-serif;
+    }
+
+    html:not(.dark) {
+      --bg:                #f7f7fa;
+      --text:              #0c0c12;
+      --muted:             #6e6e80;
+      --surface:           rgba(255, 255, 255, 0.7);
+      --surface-elevated:  rgba(255, 255, 255, 0.9);
+      --border:            rgba(0, 0, 0, 0.08);
+      --border-focus:      rgba(0, 0, 0, 0.2);
+      --btn-bg:            #000000;
+      --btn-text:          #ffffff;
+      --code-bg:           #eaeaf2;
     }
 
     body {
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-      background: var(--bg);
+      font-family: var(--sans);
+      background-color: var(--bg);
       color: var(--text);
       min-height: 100vh;
       display: flex;
       flex-direction: column;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+      text-rendering: optimizeLegibility;
+      transition: background-color 0.3s ease, color 0.3s ease;
+      /* Desktop is a fixed two-pane shell with its own internal scrollers.
+         The mobile breakpoint below stacks them into a page taller than the
+         viewport, so the clip is lifted there or the content is unreachable. */
+      overflow: hidden;
     }
 
     /* ── Header ───────────────────────────────────────────────────────────── */
     header {
-      padding: 20px 32px;
+      height: 62px;
+      padding: 0 32px;
       border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      background: var(--surface);
+      backdrop-filter: blur(40px) saturate(180%);
+      -webkit-backdrop-filter: blur(40px) saturate(180%);
+      z-index: 20;
+    }
+
+    header .logo-area {
       display: flex;
       align-items: center;
       gap: 12px;
     }
 
-    header .logo {
-      font-size: 22px;
-      font-weight: 700;
-      letter-spacing: -0.5px;
-      color: var(--text);
+    header .logo-badge {
+      width: 28px;
+      height: 28px;
+      border-radius: 50%;
+      border: 1px solid var(--text);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-family: var(--serif);
+      font-style: italic;
+      font-size: 16px;
     }
 
-    header .logo span { color: var(--accent); }
+    header .logo-text {
+      font-family: var(--display);
+      font-size: 14px;
+      font-weight: 700;
+      letter-spacing: 0.22em;
+      text-transform: uppercase;
+    }
 
     header .tagline {
+      font-family: var(--serif);
+      font-style: italic;
       color: var(--muted);
       font-size: 13px;
+      font-weight: 300;
       margin-left: 4px;
     }
 
-    header .badge {
-      margin-left: auto;
-      background: var(--accent-dim);
-      color: var(--accent);
-      font-size: 11px;
-      font-weight: 600;
-      padding: 3px 8px;
-      border-radius: 12px;
-      border: 1px solid var(--accent);
-      letter-spacing: 0.5px;
+    .header-actions {
+      display: flex;
+      align-items: center;
+      gap: 10px;
     }
+
+    .header-btn {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      color: var(--text);
+      font-size: 11px;
+      font-family: var(--mono);
+      padding: 6px 12px;
+      border-radius: 9999px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      transition: all 0.2s ease;
+      opacity: 0.8;
+    }
+    .header-btn:hover { opacity: 1; }
 
     /* ── Main layout ──────────────────────────────────────────────────────── */
     main {
       flex: 1;
       display: grid;
-      grid-template-columns: 340px 1fr;
+      grid-template-columns: 380px 1fr;
       gap: 0;
-      height: calc(100vh - 65px);
+      height: calc(100vh - 62px);
     }
 
     /* ── Left panel ───────────────────────────────────────────────────────── */
     .panel-left {
       border-right: 1px solid var(--border);
-      padding: 24px;
+      padding: 28px;
       overflow-y: auto;
       display: flex;
       flex-direction: column;
-      gap: 20px;
+      gap: 24px;
+      background: var(--surface);
+      backdrop-filter: blur(40px);
     }
 
     /* ── Drop zone ────────────────────────────────────────────────────────── */
     #drop-zone {
-      border: 2px dashed var(--border);
+      border: 1px dashed var(--border);
       border-radius: var(--radius);
-      padding: 32px 16px;
+      padding: 32px 20px;
       text-align: center;
       cursor: pointer;
-      transition: border-color 0.15s, background 0.15s;
+      transition: all 0.25s cubic-bezier(0.16, 1, 0.3, 1);
       position: relative;
+      background: rgba(128, 128, 128, 0.02);
     }
 
     #drop-zone:hover, #drop-zone.dragover {
-      border-color: var(--accent);
-      background: rgba(88, 166, 255, 0.06);
+      border-color: var(--border-focus);
+      background: rgba(128, 128, 128, 0.05);
+      transform: scale(0.995);
     }
 
-    #drop-zone .drop-icon { font-size: 36px; margin-bottom: 10px; }
+    #drop-zone .drop-icon { font-size: 28px; margin-bottom: 8px; opacity: 0.8; }
 
     #drop-zone .drop-title {
-      font-size: 14px;
+      font-family: var(--display);
+      font-size: 13.5px;
       font-weight: 600;
       color: var(--text);
-      margin-bottom: 6px;
+      margin-bottom: 4px;
+      letter-spacing: -0.01em;
     }
 
     #drop-zone .drop-hint {
-      font-size: 12px;
+      font-size: 11.5px;
       color: var(--muted);
-      line-height: 1.5;
+      line-height: 1.6;
+      font-weight: 300;
     }
 
     #drop-zone .drop-hint a {
-      color: var(--accent);
-      text-decoration: none;
+      color: var(--text);
+      text-decoration: underline;
+      text-underline-offset: 2px;
     }
 
     #file-input { display: none; }
@@ -135,28 +211,28 @@
     #load-progress.visible { display: flex; }
 
     .progress-label {
-      font-size: 12px;
+      font-size: 11px;
       color: var(--muted);
       display: flex;
       justify-content: space-between;
+      font-family: var(--mono);
     }
 
     .progress-bar-track {
-      height: 4px;
-      background: var(--border);
-      border-radius: 2px;
+      height: 3px;
+      background: rgba(128, 128, 128, 0.15);
+      border-radius: 9999px;
       overflow: hidden;
     }
 
     .progress-bar-fill {
       height: 100%;
-      background: var(--accent);
-      border-radius: 2px;
+      background: var(--text);
+      border-radius: 9999px;
       transition: width 0.2s;
       width: 0%;
     }
 
-    /* Indeterminate spinner for parsing phase */
     .progress-bar-fill.indeterminate {
       width: 40%;
       animation: indeterminate 1.2s ease-in-out infinite;
@@ -170,105 +246,120 @@
     /* ── Model info card ──────────────────────────────────────────────────── */
     #model-info {
       display: none;
-      background: var(--surface);
+      background: var(--surface-elevated);
       border: 1px solid var(--border);
       border-radius: var(--radius);
-      padding: 14px 16px;
-      font-size: 13px;
+      padding: 16px 18px;
+      font-size: 12px;
     }
 
     #model-info.visible { display: block; }
 
     #model-info .info-title {
+      font-family: var(--display);
       font-weight: 600;
-      color: var(--green);
+      color: var(--text);
       margin-bottom: 10px;
       display: flex;
       align-items: center;
       gap: 6px;
-      font-size: 12px;
+      font-size: 11px;
       text-transform: uppercase;
-      letter-spacing: 0.5px;
+      letter-spacing: 0.1em;
     }
 
     .info-row {
       display: flex;
       justify-content: space-between;
-      padding: 4px 0;
-      border-bottom: 1px solid var(--border);
+      padding: 5px 0;
+      border-bottom: 1px solid rgba(128, 128, 128, 0.08);
     }
 
     .info-row:last-child { border-bottom: none; }
 
-    .info-key  { color: var(--muted); }
-    .info-val  { color: var(--text); font-family: var(--mono); font-size: 12px; }
+    .info-key  { color: var(--muted); font-size: 11.5px; font-weight: 300; }
+    .info-val  { color: var(--text); font-family: var(--mono); font-size: 11px; font-weight: 500; }
 
     /* ── Section label ────────────────────────────────────────────────────── */
     .section-label {
+      font-family: var(--display);
       font-size: 11px;
       font-weight: 600;
       text-transform: uppercase;
-      letter-spacing: 0.6px;
+      letter-spacing: 0.1em;
       color: var(--muted);
-      margin-bottom: -8px;
+      margin-bottom: -12px;
     }
 
     /* ── Prompt textarea ──────────────────────────────────────────────────── */
     textarea {
       width: 100%;
-      background: var(--surface);
+      background: var(--surface-elevated);
       border: 1px solid var(--border);
       border-radius: var(--radius);
       color: var(--text);
-      font-family: var(--mono);
-      font-size: 13px;
-      padding: 10px 12px;
+      font-family: var(--sans);
+      font-size: 13.5px;
+      padding: 14px 16px;
       resize: vertical;
-      min-height: 80px;
+      min-height: 90px;
       outline: none;
-      transition: border-color 0.15s;
-      line-height: 1.5;
+      transition: border-color 0.2s;
+      line-height: 1.7;
+      font-weight: 300;
     }
 
-    textarea:focus { border-color: var(--accent); }
-    textarea:disabled { opacity: 0.4; cursor: not-allowed; }
+    textarea:focus { border-color: var(--border-focus); }
+    textarea:disabled { opacity: 0.35; cursor: not-allowed; }
 
     /* ── Controls row ─────────────────────────────────────────────────────── */
     .controls-grid {
       display: grid;
       grid-template-columns: 1fr 1fr;
-      gap: 10px;
+      gap: 12px;
     }
 
     .control-group label {
       display: block;
-      font-size: 11px;
+      font-family: var(--display);
+      font-size: 10.5px;
       font-weight: 600;
       color: var(--muted);
       text-transform: uppercase;
-      letter-spacing: 0.5px;
-      margin-bottom: 5px;
+      letter-spacing: 0.08em;
+      margin-bottom: 6px;
     }
 
     .control-group input[type="range"] {
+      -webkit-appearance: none;
       width: 100%;
-      accent-color: var(--accent);
+      height: 2px;
+      background: rgba(128, 128, 128, 0.2);
+      border-radius: 9999px;
+      outline: none;
+    }
+    .control-group input[type="range"]::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      width: 11px;
+      height: 11px;
+      border-radius: 50%;
+      background: var(--text);
       cursor: pointer;
     }
 
     .control-group input[type="number"] {
       width: 100%;
-      background: var(--surface);
+      background: var(--surface-elevated);
       border: 1px solid var(--border);
-      border-radius: 4px;
+      border-radius: 10px;
       color: var(--text);
       font-family: var(--mono);
-      font-size: 13px;
-      padding: 5px 8px;
+      font-size: 11.5px;
+      padding: 7px 10px;
       outline: none;
     }
 
-    .control-group input[type="number"]:focus { border-color: var(--accent); }
+    .control-group input[type="number"]:focus { border-color: var(--border-focus); }
 
     .range-row {
       display: flex;
@@ -278,8 +369,8 @@
 
     .range-val {
       font-family: var(--mono);
-      font-size: 12px;
-      color: var(--accent);
+      font-size: 11px;
+      color: var(--text);
       min-width: 28px;
       text-align: right;
     }
@@ -287,25 +378,26 @@
     /* ── Generate button ──────────────────────────────────────────────────── */
     #generate-btn {
       width: 100%;
-      background: var(--accent-dim);
-      border: 1px solid var(--accent);
-      color: var(--accent);
-      font-size: 14px;
+      background: var(--btn-bg);
+      border: none;
+      color: var(--btn-text);
+      font-family: var(--display);
+      font-size: 12.5px;
       font-weight: 600;
-      padding: 10px;
-      border-radius: var(--radius);
+      padding: 12px;
+      border-radius: 9999px;
       cursor: pointer;
-      transition: background 0.15s, opacity 0.15s;
-      letter-spacing: 0.3px;
+      transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+      letter-spacing: 0.04em;
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
     }
 
-    #generate-btn:hover:not(:disabled) { background: rgba(88, 166, 255, 0.2); }
-    #generate-btn:disabled { opacity: 0.35; cursor: not-allowed; }
+    #generate-btn:hover:not(:disabled) { opacity: 0.9; transform: scale(1.01); }
+    #generate-btn:disabled { opacity: 0.25; cursor: not-allowed; }
 
     #generate-btn.running {
-      background: rgba(248, 81, 73, 0.12);
-      border-color: var(--red);
-      color: var(--red);
+      background: var(--muted);
+      color: var(--text);
     }
 
     /* ── Right panel ──────────────────────────────────────────────────────── */
@@ -313,87 +405,91 @@
       display: flex;
       flex-direction: column;
       overflow: hidden;
+      background: var(--bg);
     }
 
     .output-header {
-      padding: 14px 24px;
+      padding: 16px 32px;
       border-bottom: 1px solid var(--border);
       display: flex;
       align-items: center;
       justify-content: space-between;
+      background: var(--surface);
     }
 
     .output-header .title {
-      font-size: 12px;
+      font-family: var(--display);
+      font-size: 11px;
       font-weight: 600;
       text-transform: uppercase;
-      letter-spacing: 0.5px;
+      letter-spacing: 0.1em;
       color: var(--muted);
     }
 
     .output-header .stats {
-      font-size: 12px;
+      font-size: 11px;
       font-family: var(--mono);
       color: var(--muted);
     }
 
-    .output-header .stats span { color: var(--accent); }
+    .output-header .stats span { color: var(--text); font-weight: 500; }
 
     #output {
       flex: 1;
       overflow-y: auto;
-      padding: 24px;
+      padding: 36px;
       font-family: var(--mono);
-      font-size: 14px;
+      font-size: 13.5px;
       line-height: 1.8;
       color: var(--text);
       white-space: pre-wrap;
       word-break: break-word;
+      font-weight: 300;
     }
 
-    /* Prompt highlight */
     .output-prompt { color: var(--muted); }
-    /* Blinking cursor */
     .cursor {
       display: inline-block;
-      width: 2px;
-      height: 1em;
-      background: var(--accent);
+      width: 1.5px;
+      height: 1.2em;
+      background: var(--text);
       vertical-align: text-bottom;
-      animation: blink 1s step-end infinite;
+      animation: blink 0.9s infinite;
     }
 
     @keyframes blink {
       0%, 100% { opacity: 1; }
-      50%       { opacity: 0; }
+      50%       { opacity: 0.1; }
     }
 
     /* ── Status bar ───────────────────────────────────────────────────────── */
     #status-bar {
-      padding: 8px 24px;
+      padding: 12px 32px;
       border-top: 1px solid var(--border);
-      font-size: 12px;
+      font-size: 11px;
       color: var(--muted);
       display: flex;
       align-items: center;
       gap: 8px;
+      font-family: var(--mono);
+      background: var(--surface);
     }
 
     #status-bar .dot {
-      width: 7px;
-      height: 7px;
+      width: 6px;
+      height: 6px;
       border-radius: 50%;
       background: var(--muted);
       flex-shrink: 0;
     }
 
-    #status-bar .dot.green  { background: var(--green); }
-    #status-bar .dot.yellow { background: var(--yellow); animation: pulse 1s ease-in-out infinite; }
-    #status-bar .dot.red    { background: var(--red); }
+    #status-bar .dot.green  { background: var(--text); }
+    #status-bar .dot.yellow { background: #d4d4d8; animation: pulse 1s ease-in-out infinite; }
+    #status-bar .dot.red    { background: #71717a; }
 
     @keyframes pulse {
       0%, 100% { opacity: 1; }
-      50%       { opacity: 0.4; }
+      50%       { opacity: 0.3; }
     }
 
     /* ── Empty state ──────────────────────────────────────────────────────── */
@@ -403,20 +499,24 @@
       flex-direction: column;
       align-items: center;
       justify-content: center;
-      gap: 10px;
+      gap: 12px;
       color: var(--muted);
-      font-size: 13px;
+      font-size: 13.5px;
       text-align: center;
       padding: 32px;
+      font-weight: 300;
     }
 
-    .empty-state .icon { font-size: 48px; opacity: 0.4; }
+    .empty-state .icon { font-size: 36px; opacity: 0.3; }
 
     /* ── Responsive ───────────────────────────────────────────────────────── */
-    @media (max-width: 720px) {
+    @media (max-width: 768px) {
+      html, body { overflow: auto; }
+      body { min-height: 100dvh; }
       main { grid-template-columns: 1fr; grid-template-rows: auto 1fr; height: auto; }
-      .panel-left { border-right: none; border-bottom: 1px solid var(--border); }
+      .panel-left { border-right: none; border-bottom: 1px solid var(--border); overflow-y: visible; }
       .panel-right { min-height: 60vh; }
+      #output { overflow-y: visible; }
     }
   </style>
 </head>
@@ -424,9 +524,20 @@
 
 <!-- ── Header ──────────────────────────────────────────────────────────────── -->
 <header>
-  <div class="logo">⚡ <span>Glint</span></div>
-  <div class="tagline">— LLM inference in your browser, zero server</div>
-  <div class="badge">WASM</div>
+  <div class="logo-area">
+    <div class="logo-badge">g</div>
+    <div class="logo-text">Glint</div>
+    <div class="tagline">in-browser neural observatory</div>
+  </div>
+  <div class="header-actions">
+    <button id="theme-toggle-btn" class="header-btn" title="Toggle Light/Dark Theme">
+      <span id="theme-icon">🌓</span>
+    </button>
+    <button id="audio-toggle-btn" class="header-btn" title="Toggle Audio Haptics">
+      🔊 Haptics: ON
+    </button>
+    <div class="header-btn" style="cursor:default;opacity:0.6;">WASM SIMD</div>
+  </div>
 </header>
 
 <!-- ── Main ────────────────────────────────────────────────────────────────── -->
@@ -438,10 +549,10 @@
     <!-- Drop zone -->
     <div id="drop-zone" role="button" tabindex="0" aria-label="Load GGUF model file">
       <div class="drop-icon">🧠</div>
-      <div class="drop-title">Drop a .gguf model here</div>
+      <div class="drop-title">Load GGUF Weights</div>
       <div class="drop-hint">
-        or <a href="#" id="browse-link">browse to a file</a><br><br>
-        Need a model? Try<br>
+        Drop a .gguf file or <a href="#" id="browse-link">browse local storage</a><br><br>
+        Starter model:<br>
         <a href="https://huggingface.co/Qwen/Qwen2-0.5B-Instruct-GGUF" target="_blank" rel="noopener">
           Qwen2-0.5B-Q4_K_M.gguf
         </a> (~350 MB)
@@ -462,13 +573,13 @@
 
     <!-- Model info -->
     <div id="model-info">
-      <div class="info-title">✓ Model loaded</div>
+      <div class="info-title">✓ Model Initialized</div>
       <div class="info-row">
         <span class="info-key">Architecture</span>
         <span class="info-val" id="info-arch">—</span>
       </div>
       <div class="info-row">
-        <span class="info-key">Context length</span>
+        <span class="info-key">Context Length</span>
         <span class="info-val" id="info-ctx">—</span>
       </div>
       <div class="info-row">
@@ -483,13 +594,13 @@
       placeholder="Load a model first…"></textarea>
 
     <!-- Parameters -->
-    <div class="section-label">Parameters</div>
+    <div class="section-label">Hyperparameters</div>
     <div class="controls-grid">
       <div class="control-group">
         <label for="temperature">Temperature</label>
         <div class="range-row">
           <input type="range" id="temperature" min="0" max="2" step="0.05" value="0.7" disabled />
-          <span class="range-val" id="temp-val">0.7</span>
+          <span class="range-val" id="temp-val">0.70</span>
         </div>
       </div>
       <div class="control-group">
@@ -499,21 +610,21 @@
     </div>
 
     <!-- Generate -->
-    <button id="generate-btn" disabled>Generate</button>
+    <button id="generate-btn" disabled>Generate Stream</button>
 
   </div>
 
   <!-- Right panel: output -->
   <div class="panel-right">
     <div class="output-header">
-      <div class="title">Output</div>
+      <div class="title">Decoded Stream</div>
       <div class="stats" id="tok-stats"></div>
     </div>
 
     <div id="output">
       <div class="empty-state">
         <div class="icon">💬</div>
-        <div>Load a model and enter a prompt to get started.</div>
+        <div>Load a model and enter a prompt to begin local neural decoding.</div>
       </div>
     </div>
 
@@ -526,6 +637,24 @@
 </main>
 
 <script type="module">
+// ── Theme Manager ─────────────────────────────────────────────────────────────
+const htmlEl = document.documentElement;
+const themeToggleBtn = document.getElementById('theme-toggle-btn');
+const themeIcon = document.getElementById('theme-icon');
+let isDark = localStorage.getItem('glint_theme') !== 'light';
+
+function applyTheme(dark) {
+  isDark = dark;
+  htmlEl.classList.toggle('dark', dark);
+  themeIcon.textContent = dark ? '🌙' : '☀️';
+  localStorage.setItem('glint_theme', dark ? 'dark' : 'light');
+}
+applyTheme(isDark);
+
+themeToggleBtn.addEventListener('click', () => {
+  applyTheme(!isDark);
+});
+
 // ── Worker setup ──────────────────────────────────────────────────────────────
 const worker = new Worker('./worker.js', { type: 'module' });
 
@@ -551,6 +680,50 @@ const statusDot    = document.getElementById('status-dot');
 const statusText   = document.getElementById('status-text');
 const tokStats     = document.getElementById('tok-stats');
 
+const audioToggleBtn = document.getElementById('audio-toggle-btn');
+let audioCtx = null;
+let audioEnabled = localStorage.getItem('glint_audio_enabled') !== 'false';
+
+function initAudio() {
+  if (!audioCtx) {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (Ctx) audioCtx = new Ctx();
+  }
+  if (audioCtx && audioCtx.state === 'suspended') {
+    audioCtx.resume();
+  }
+}
+window.addEventListener('click', initAudio, { once: true });
+window.addEventListener('keydown', initAudio, { once: true });
+
+function playTokenTick(str = '') {
+  if (!audioEnabled || !audioCtx || audioCtx.state !== 'running') return;
+  try {
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    const isPunct = /[.,!?;:\n]/.test(str);
+    osc.type = isPunct ? 'sine' : 'triangle';
+    osc.frequency.setValueAtTime(isPunct ? 750 : 1400, audioCtx.currentTime);
+    osc.frequency.exponentialRampToValueAtTime(300, audioCtx.currentTime + 0.006);
+    gain.gain.setValueAtTime(0.018, audioCtx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime + 0.006);
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    osc.start();
+    osc.stop(audioCtx.currentTime + 0.007);
+  } catch (e) {}
+}
+
+if (audioToggleBtn) {
+  audioToggleBtn.textContent = `🔊 Haptics: ${audioEnabled ? 'ON' : 'OFF'}`;
+  audioToggleBtn.addEventListener('click', () => {
+    initAudio();
+    audioEnabled = !audioEnabled;
+    localStorage.setItem('glint_audio_enabled', String(audioEnabled));
+    audioToggleBtn.textContent = `🔊 Haptics: ${audioEnabled ? 'ON' : 'OFF'}`;
+  });
+}
+
 // ── State ─────────────────────────────────────────────────────────────────────
 let modelLoaded = false;
 let generating  = false;
@@ -563,7 +736,7 @@ function fmt(n)       { return n.toLocaleString(); }
 function fmtBytes(b)  { return b >= 1e9 ? (b/1e9).toFixed(1)+' GB' : (b/1e6).toFixed(0)+' MB'; }
 
 function setStatus(state, text) {
-  statusDot.className  = 'dot ' + state;   // '', 'green', 'yellow', 'red'
+  statusDot.className  = 'dot ' + state;
   statusText.textContent = text;
 }
 
@@ -586,7 +759,7 @@ function removeCursor() {
 
 // ── Temperature display ───────────────────────────────────────────────────────
 tempSlider.addEventListener('input', () => {
-  tempVal.textContent = tempSlider.value;
+  tempVal.textContent = parseFloat(tempSlider.value).toFixed(2);
 });
 
 // ── File loading ──────────────────────────────────────────────────────────────
@@ -615,15 +788,12 @@ async function loadFile(file) {
   setStatus('yellow', 'Loading…');
   output.innerHTML = '';
 
-  // Read file with progress
   const bytes = await readFileWithProgress(file);
 
-  // Hand off to worker
   loadLabel.textContent = 'Parsing model…';
   progressFill.classList.add('indeterminate');
   setStatus('yellow', 'Parsing GGUF…');
 
-  // Transfer buffer ownership for zero-copy send
   worker.postMessage({ type: 'load', bytes }, [bytes.buffer]);
 }
 
@@ -644,7 +814,7 @@ function readFileWithProgress(file) {
 
 // ── Generate ──────────────────────────────────────────────────────────────────
 generateBtn.addEventListener('click', () => {
-  if (generating) return;   // button is disabled during generation
+  if (generating) return;
   const prompt = promptEl.value.trim();
   if (!prompt) return;
 
@@ -657,7 +827,6 @@ generateBtn.addEventListener('click', () => {
   generateBtn.textContent = 'Generating…';
   setStatus('yellow', 'Generating…');
 
-  // Render prompt in muted colour then add cursor
   output.innerHTML = '';
   const promptSpan = document.createElement('span');
   promptSpan.className   = 'output-prompt';
@@ -695,8 +864,8 @@ worker.onmessage = function (e) {
 
   if (type === 'token') {
     tokenCount++;
+    playTokenTick(data.text);
     removeCursor();
-    // Append text node directly for performance
     output.appendChild(document.createTextNode(data.text));
     insertCursor();
     output.scrollTop = output.scrollHeight;
@@ -712,7 +881,7 @@ worker.onmessage = function (e) {
     removeCursor();
     generateBtn.disabled = false;
     generateBtn.classList.remove('running');
-    generateBtn.textContent = 'Generate';
+    generateBtn.textContent = 'Generate Stream';
     const elapsed = ((performance.now() - genStart) / 1000).toFixed(1);
     setStatus('green', `Done — ${tokenCount} tokens in ${elapsed}s`);
     return;
@@ -725,7 +894,7 @@ worker.onmessage = function (e) {
     progressFill.classList.remove('indeterminate');
     generateBtn.disabled = !modelLoaded;
     generateBtn.classList.remove('running');
-    generateBtn.textContent = 'Generate';
+    generateBtn.textContent = 'Generate Stream';
     setStatus('red', 'Error: ' + data.message);
     console.error('[Glint worker]', data.message);
     return;

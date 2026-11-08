@@ -388,6 +388,30 @@ impl Tokenizer {
         }
     }
 
+    /// Return the EOS/EOT token id appropriate for the given chat template,
+    /// falling back to the model's default `eos_token_id`.
+    pub fn eos_for_template(&self, template: &crate::model::chat_template::ChatTemplate) -> u32 {
+        use crate::model::chat_template::ChatTemplate;
+        let candidates: &[&str] = match template {
+            ChatTemplate::Llama3 => &["<|eot_id|>", "<|end_of_text|>"],
+            ChatTemplate::ChatML => &["<|im_end|>", "<|endoftext|>"],
+            ChatTemplate::Gemma => &["<end_of_turn>", "<eos>"],
+            ChatTemplate::Zephyr | ChatTemplate::MistralInstruct => &["</s>"],
+            ChatTemplate::Generic => &[],
+        };
+        for &s in candidates {
+            if let Some(&id) = self.token_to_id.get(s) {
+                return id;
+            }
+        }
+        self.eos_token_id
+    }
+
+    /// Look up the token ID for a string piece if present in the vocabulary.
+    pub fn get_token_id(&self, piece: &str) -> Option<u32> {
+        self.token_to_id.get(piece).copied()
+    }
+
     pub fn vocab_size(&self) -> usize {
         self.vocab.len()
     }
