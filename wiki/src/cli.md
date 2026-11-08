@@ -137,12 +137,15 @@ glint serve -f <MODEL> [OPTIONS]
 | `--gpu` | false | GPU backend |
 | `--kv-cache <FMT>` | `f32` | KV storage: `f32`, `q8` (~3.8× smaller), or `paged` (f32 in on-demand 16-token pages shared by all requests) |
 | `--prefix-cache` | false | Reuse KV pages of a shared prompt prefix instead of re-prefilling it per request; requires `--kv-cache paged` |
+| `--prefill-chunk <N>` | 256 | Maximum prompt tokens prefilled per engine step, bounding how long an arriving prompt interrupts requests already streaming; `0` prefills each prompt in a single pass |
 
 The server automatically hosts the embedded Web Chat Dashboard at `http://localhost:<port>`, providing a browser interface with streaming responses, cancellation, and parameter controls.
 
 The model name is derived from the file stem (e.g. `smollm-135m-instruct.Q8_0` → `smollm-135m-instruct.Q8_0`). Use this name in API requests.
 
 Runs a background inference engine with a request queue and continuous batching: every active request advances in a single shared forward pass per step, so each weight matrix streams from memory once per step instead of once per sequence, and new requests join mid-generation as slots free up. Batching is bit-identical to decoding each request alone — see [Continuous batching](./server-api.md#continuous-batching).
+
+Prompts are prefilled a chunk at a time, interleaved with those decode steps, so a long prompt arriving mid-stream cannot stall the responses already streaming — see [Chunked prefill](./server-api.md#chunked-prefill).
 
 **Example:**
 ```bash

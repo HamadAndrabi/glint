@@ -37,7 +37,7 @@ Glint is a focused inference engine for GGUF-based LLaMA-family models. It is de
 | KV Cache | f32, Q8_0-quantized, and PagedAttention-style paged variants (`--kv-cache paged`, refcounted page sharing); prefix caching across requests (`--prefix-cache`); `KvStore` trait abstraction |
 | Sessions | First-class `Session` API, deterministic RNG state, snapshot export/import, cache-format-aware resume |
 | LoRA | Load and apply LoRA adapters at inference time via `--lora` |
-| Server & UI | OpenAI-compatible HTTP API (`/v1/completions`, `/v1/chat/completions`, `/v1/embeddings`, `GET /v1/metrics`), SSE streaming, continuous batching, embedded Web Chat Dashboard at `http://localhost:8080`, and interactive Ratatui Terminal UI (`--tui`) |
+| Server & UI | OpenAI-compatible HTTP API (`/v1/completions`, `/v1/chat/completions`, `/v1/embeddings`, `GET /v1/metrics`), SSE streaming, continuous batching, chunked prefill, embedded Web Chat Dashboard at `http://localhost:8080`, and interactive Ratatui Terminal UI (`--tui`) |
 | CLI | `run`, `chat` (interactive terminal & `--tui`), `serve` (HTTP + Web UI), `inspect`, `generate`, `pull`, `bench` |
 | Bindings | Python (`pyo3`), browser WASM (`wasm-bindgen`), C FFI (`include/glint.h`), native CLI |
 
@@ -75,6 +75,7 @@ CI validates these build surfaces on every push and pull request:
 - `response_format: { "type": "json_object" }` for constrained JSON object output
 - Streaming responses via Server-Sent Events
 - Continuous batching: all active requests decode in one shared forward pass per step, so each weight matrix streams from memory once per step instead of once per sequence
+- Chunked prefill: a newly arrived prompt is prefilled a slice at a time, interleaved with decoding, so a long prompt cannot stall the responses already streaming (`--prefill-chunk`)
 - CORS enabled for browser clients
 - `/health` endpoint for readiness checks and simple orchestration
 
@@ -220,6 +221,16 @@ You can also bind to another host:
 
 ```bash
 glint serve -f model.gguf --host 0.0.0.0 -p 8080
+```
+
+Prefill shares the engine thread with decoding, so a long prompt arriving
+mid-stream is capped at `--prefill-chunk` tokens per step (default 256) rather
+than being computed all at once. Lower it to prioritise the latency of requests
+already streaming, raise it to favour the time-to-first-token of new ones, or
+pass `0` to prefill each prompt in a single pass:
+
+```bash
+glint serve -f model.Q4_K_M.gguf -p 8080 --prefill-chunk 128
 ```
 
 ### Inspect a model
