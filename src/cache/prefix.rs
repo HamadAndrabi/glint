@@ -345,7 +345,7 @@ fn page_chain_hash(prev: u64, page_tokens: &[u32]) -> u64 {
 fn page_chain(tokens: &[u32]) -> Vec<u64> {
     let mut out = Vec::with_capacity(tokens.len() / PAGE_SIZE);
     let mut prev = 0u64;
-    for page in tokens.chunks_exact(PAGE_SIZE) {
+    for page in tokens.as_chunks::<PAGE_SIZE>().0 {
         prev = page_chain_hash(prev, page);
         out.push(prev);
     }

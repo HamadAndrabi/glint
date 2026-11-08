@@ -31,7 +31,7 @@ Glint is a focused inference engine for GGUF-based LLaMA-family models. It is de
 | Area | What you get |
 | --- | --- |
 | Inference | Full LLaMA-family, Gemma 2, and Qwen 2.5 transformers: RMSNorm (including 1+w), RoPE, SwiGLU/GeGLU, logit soft-capping, sliding-window attention, grouped-query attention, flash attention, batched prefill |
-| Generation | Greedy, sampling (temperature/top-k/top-p/min-p/repetition-penalty/seed), streaming, speculative decoding, GBNF grammar constraints, JSON schema enforcement, OpenAI tool/function calling |
+| Generation | Greedy, sampling (temperature/top-k/top-p/min-p/repetition-penalty/seed), streaming, per-token logprobs, speculative decoding, GBNF grammar constraints, JSON schema enforcement, OpenAI tool/function calling |
 | Quantization | Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q4_K, Q5_K, Q6_K, Q2_K, Q3_K, IQ4_NL — weights stay compressed in memory |
 | Performance | AVX2+FMA (x86_64) & ARM NEON (aarch64/Apple Silicon) SIMD kernels, scalar fallback, Rayon row-parallel matvec, optional GPU backend (wgpu/Vulkan/Metal/DX12) |
 | KV Cache | f32, Q8_0-quantized, and PagedAttention-style paged variants (`--kv-cache paged`, refcounted page sharing); prefix caching across requests (`--prefix-cache`); `KvStore` trait abstraction |
@@ -76,6 +76,9 @@ CI validates these build surfaces on every push and pull request:
 - Streaming responses via Server-Sent Events
 - Continuous batching: all active requests decode in one shared forward pass per step, so each weight matrix streams from memory once per step instead of once per sequence
 - Chunked prefill: a newly arrived prompt is prefilled a slice at a time, interleaved with decoding, so a long prompt cannot stall the responses already streaming (`--prefill-chunk`)
+- Per-token logprobs on streaming responses, with the top alternative candidates
+- Chat turns stop on the detected template's own terminator (`<|eot_id|>`, `<|im_end|>`, `<end_of_turn>`) rather than the model's document-level EOS
+- `GET /v1/models` reports the resolved architecture and detected chat template
 - CORS enabled for browser clients
 - `/health` endpoint for readiness checks and simple orchestration
 

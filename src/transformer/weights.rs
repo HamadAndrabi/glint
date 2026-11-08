@@ -464,8 +464,8 @@ fn permute_bias(bias: Tensor, n_heads: usize, head_dim: usize, rot_dim: usize) -
     let bytes: Vec<u8> = bias.data().iter().flat_map(|v| v.to_le_bytes()).collect();
     let permuted_bytes = permute_qk_rows(&bytes, n_heads, head_dim, rot_dim, 4);
     let mut out = Vec::with_capacity(bias.data().len());
-    for chunk in permuted_bytes.chunks_exact(4) {
-        out.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    for chunk in permuted_bytes.as_chunks::<4>().0 {
+        out.push(f32::from_le_bytes(*chunk));
     }
     Tensor::from_vec(out, bias.shape())
 }
@@ -677,8 +677,10 @@ mod tests {
         let rows: Vec<Vec<f32>> = (0..n_heads * head_dim).map(|r| vec![r as f32]).collect();
         let bytes = permute_qk_rows(&rows_to_bytes(&rows), n_heads, head_dim, rot_dim, cols * 4);
         let got: Vec<f32> = bytes
-            .chunks_exact(4)
-            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_le_bytes(*b))
             .collect();
         // Head 0: rows 0..4 permuted as (0,2,1,3); rows 4..8 unchanged.
         assert_eq!(got[0..8], [0.0, 2.0, 1.0, 3.0, 4.0, 5.0, 6.0, 7.0]);

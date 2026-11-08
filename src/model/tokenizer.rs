@@ -388,6 +388,30 @@ impl Tokenizer {
         }
     }
 
+    /// Return the EOS/EOT token id appropriate for the given chat template,
+    /// falling back to the model's default `eos_token_id`.
+    pub fn eos_for_template(&self, template: &crate::model::chat_template::ChatTemplate) -> u32 {
+        use crate::model::chat_template::ChatTemplate;
+        let candidates: &[&str] = match template {
+            ChatTemplate::Llama3 => &["<|eot_id|>", "<|end_of_text|>"],
+            ChatTemplate::ChatML => &["<|im_end|>", "<|endoftext|>"],
+            ChatTemplate::Gemma => &["<end_of_turn>", "<eos>"],
+            ChatTemplate::Zephyr | ChatTemplate::MistralInstruct => &["</s>"],
+            ChatTemplate::Generic => &[],
+        };
+        for &s in candidates {
+            if let Some(&id) = self.token_to_id.get(s) {
+                return id;
+            }
+        }
+        self.eos_token_id
+    }
+
+    /// Look up the token ID for a string piece if present in the vocabulary.
+    pub fn get_token_id(&self, piece: &str) -> Option<u32> {
+        self.token_to_id.get(piece).copied()
+    }
+
     pub fn vocab_size(&self) -> usize {
         self.vocab.len()
     }
@@ -508,6 +532,7 @@ fn gpt2_char_to_byte(ch: char) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::chat_template::ChatTemplate;
 
     #[test]
     fn test_gpt2_byte_roundtrip() {
@@ -530,6 +555,95 @@ mod tests {
             let ch = gpt2_byte_to_char(b);
             assert_eq!(ch, b as char);
         }
+    }
+
+    // ── Per-template EOS selection ───────────────────────────────────────────
+
+    /// A tokenizer whose vocabulary holds exactly `pieces`, plus a distinct
+    /// default EOS so a fallback is visible rather than coincidental.
+    fn tokenizer_with(pieces: &[&str]) -> Tokenizer {
+        let mut vocab = vec!["<pad>".to_string(), "<default-eos>".to_string()];
+        vocab.extend(pieces.iter().map(|s| s.to_string()));
+        let token_to_id = vocab
+            .iter()
+            .enumerate()
+            .map(|(i, piece)| (piece.clone(), i as u32))
+            .collect();
+        Tokenizer {
+            vocab,
+            token_to_id,
+            merges: Vec::new(),
+            bos_token_id: 0,
+            eos_token_id: 1, // "<default-eos>"
+            add_bos: false,
+        }
+    }
+
+    /// Chat generation has to stop at the *turn* terminator, not the model's
+    /// document-level EOS. On Llama 3 and ChatML those differ, and stopping on
+    /// the wrong one lets the model run past the end of its reply into the next
+    /// turn — so each template's terminator is preferred when the vocabulary
+    /// carries it.
+    #[test]
+    fn each_template_prefers_its_own_turn_terminator() {
+        let cases: &[(ChatTemplate, &str)] = &[
+            (ChatTemplate::Llama3, "<|eot_id|>"),
+            (ChatTemplate::ChatML, "<|im_end|>"),
+            (ChatTemplate::Gemma, "<end_of_turn>"),
+            (ChatTemplate::Zephyr, "</s>"),
+            (ChatTemplate::MistralInstruct, "</s>"),
+        ];
+        for (template, want) in cases {
+            let tok = tokenizer_with(&[want]);
+            let got = tok.eos_for_template(template);
+            assert_eq!(
+                got,
+                tok.get_token_id(want).unwrap(),
+                "{template:?} should stop on {want}"
+            );
+            assert_ne!(
+                got, tok.eos_token_id,
+                "{template:?} should not fall back to the default EOS when {want} exists"
+            );
+        }
+    }
+
+    /// The candidates are ordered, so the second is used only when the first is
+    /// absent — a Llama 3 model shipping `<|end_of_text|>` but no `<|eot_id|>`
+    /// still gets a turn terminator rather than the default.
+    #[test]
+    fn template_eos_falls_back_through_its_candidates() {
+        let tok = tokenizer_with(&["<|end_of_text|>"]);
+        assert_eq!(
+            tok.eos_for_template(&ChatTemplate::Llama3),
+            tok.get_token_id("<|end_of_text|>").unwrap(),
+            "should use the second candidate when the first is missing"
+        );
+    }
+
+    /// With no candidate in the vocabulary — and for the generic template,
+    /// which has no terminator of its own — the model's own EOS stands.
+    #[test]
+    fn template_eos_falls_back_to_the_model_default() {
+        let bare = tokenizer_with(&["hello"]);
+        assert_eq!(
+            bare.eos_for_template(&ChatTemplate::Llama3),
+            bare.eos_token_id,
+            "no candidate present"
+        );
+        assert_eq!(
+            bare.eos_for_template(&ChatTemplate::Generic),
+            bare.eos_token_id,
+            "generic template has no terminator of its own"
+        );
+        // Even when other templates' terminators are present, Generic must not
+        // adopt one of them.
+        let rich = tokenizer_with(&["<|im_end|>", "<end_of_turn>"]);
+        assert_eq!(
+            rich.eos_for_template(&ChatTemplate::Generic),
+            rich.eos_token_id,
+            "generic must not borrow another template's terminator"
+        );
     }
 
     // ── HuggingFace tokenizer.json ───────────────────────────────────────────

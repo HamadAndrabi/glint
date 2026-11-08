@@ -255,9 +255,7 @@ fn residual_distribution(p: &[f32], q: &[f32]) -> Vec<f32> {
     } else {
         // Fall back to uniform if residual is empty
         let n = residual.len() as f32;
-        for r in &mut residual {
-            *r = 1.0 / n;
-        }
+        residual.fill(1.0 / n);
     }
     residual
 }
