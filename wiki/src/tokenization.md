@@ -120,9 +120,38 @@ Chat models wrap messages in a specific prompt format. Glint detects the templat
 
 Source: `src/model/chat_template.rs`
 
-Templates handled:
-- **LLaMA-3** — `<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n...<|eot_id|>`
-- **Mistral / ChatML** — `<s>[INST] ... [/INST]`
-- **Generic** — Simple `User:` / `Assistant:` prefix format
+Templates handled: ChatML, LLaMA-3, Mistral-Instruct, Zephyr, Gemma, and a
+generic fallback.
+
+- **ChatML** — `<|im_start|>role\ncontent<|im_end|>\n`
+- **LLaMA-3** — `<|start_header_id|>role<|end_header_id|>\n\ncontent<|eot_id|>`
+- **Mistral-Instruct** — `[INST] user_content [/INST]`
+- **Zephyr** — `<|role|>\ncontent</s>\n`
+- **Gemma** — `<start_of_turn>role\ncontent<end_of_turn>\n`
+- **Generic** — plain `role: content\n` fallback
 
 The `glint chat` command applies the template automatically. The `/v1/chat/completions` endpoint also applies the chat template before tokenization.
+
+### Where a chat turn stops
+
+A template's prompt format is only half of it: generation also has to stop in
+the right place. The token that ends a *turn* is not always the model's
+document-level `eos_token_id` — on LLaMA-3 the turn ends at `<|eot_id|>` while
+`<|end_of_text|>` ends the document, and on ChatML it ends at `<|im_end|>`.
+Stopping on the wrong one lets a reply run past its own ending and begin
+answering as the user.
+
+So `/v1/chat/completions` stops on the terminator belonging to the detected
+template, falling back to the model's own EOS when the vocabulary does not carry
+one (`Tokenizer::eos_for_template`):
+
+| Template | Preferred terminators, in order |
+|----------|---------------------------------|
+| LLaMA-3 | `<\|eot_id\|>`, `<\|end_of_text\|>` |
+| ChatML | `<\|im_end\|>`, `<\|endoftext\|>` |
+| Gemma | `<end_of_turn>`, `<eos>` |
+| Zephyr, Mistral-Instruct | `</s>` |
+| Generic | none — the model's `eos_token_id` |
+
+The plain `/v1/completions` endpoint applies no template, so it continues to
+stop on the model's `eos_token_id`.

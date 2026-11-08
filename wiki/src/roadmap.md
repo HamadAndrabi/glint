@@ -1,12 +1,9 @@
 # Roadmap & Future Exploration
 
-> **Note:** The "What's Built" list below reflects an earlier milestone and lags
-> the current code (which has since added K-quant SIMD, runtime sessions and
-> snapshots, C FFI, LoRA, speculative decoding, and constrained decoding). Treat
-> [README.md](https://github.com/HamadAndrabi/glint/blob/master/README.md) as the
-> source of truth for shipped features.
-
-This page documents what's already built, what's planned next, and the longer-term exploration paths worth investigating.
+This page documents what's already built, what's planned next, and the
+longer-term exploration paths worth investigating.
+[README.md](https://github.com/HamadAndrabi/glint/blob/master/README.md) remains
+the canonical feature list; this page is about direction.
 
 ---
 
@@ -21,6 +18,13 @@ All five original phases have shipped to varying degrees:
 | 3 — Serving Layer | HTTP API, sampling strategies, queued concurrent serving | ✅ Complete |
 | 4 — Advanced Opts | Speculative decoding, flash attention, K-quants, LoRA | ✅ Complete |
 | 5 — GPU Backends | Vulkan via wgpu, WASM browser inference | ✅ Complete |
+
+Landed since those phases closed: K-quant and ARM NEON SIMD kernels, runtime
+sessions with snapshot export/import, C FFI, Python and WASM bindings, LoRA
+adapters, speculative decoding, GBNF/JSON constrained decoding, paged KV with
+prefix caching, continuous batching, chunked prefill, SafeTensors loading,
+Gemma 2 and Qwen 2.5 architectures, a Ratatui TUI, and an embedded web
+dashboard.
 
 **Milestones achieved:**
 - `glint inspect` prints model metadata ✅
@@ -139,6 +143,27 @@ queued prompts share one pass instead of being advanced one at a time; and
 fusing prefill chunks into the decode batch itself, so a step carries both
 rather than alternating between them.
 
+### Token Logprobs — shipped, with gaps
+
+Streaming responses carry each token's log-probability and its top alternatives,
+which is what the dashboard's token inspector reads. See
+[Token Logprobs](./server-api.md#token-logprobs).
+
+Still open, in priority order:
+
+- **Make them opt-in.** OpenAI gates this on the `logprobs` and `top_logprobs`
+  request fields; Glint accepts neither and computes them for every token of
+  every request — a full vocabulary pass per sampled token, roughly 0.2 ms at a
+  32k vocabulary and 0.8 ms at 128k, multiplied by the sequences sharing a
+  decode step. The embedded dashboard assumes they are always present, so
+  gating them means having it ask for them.
+- **Populate the non-streaming responses.** Both non-streaming endpoints always
+  omit `logprobs`; only SSE streams carry them.
+- **Let `submit` take an options struct.** Threading a per-request logprob
+  setting through today means a seventh positional argument on
+  `InferenceEngine::submit`, which is the shape of the problem rather than a
+  solution.
+
 ### Quantization: More Formats
 
 - **Q4_1 / Q5_0 / Q5_1** — ✅ shipped (scalar + AVX2 kernels, ggml-anchored
@@ -171,9 +196,35 @@ This would make Glint a training-capable engine, not just inference-only.
 
 ### Model Architecture Extensions
 
-Currently Glint targets the LLaMA/Mistral family. Extensions to explore:
-- **Mixture-of-Experts (MoE)** — Mixtral 8×7B routes tokens to expert sub-networks; requires modified forward pass with expert routing
-- **Sliding window attention** — Mistral uses a sliding attention window; partially handled via `config.sliding_window` but not fully exploited
+Shipped: `llama`, `mistral`, `phi3`, `qwen2`, `qwen2_moe`, `gemma`, `gemma2`.
+
+#### QK-norm — the gate on current model generations
+
+The highest-leverage next step, because one feature unlocks a whole generation
+of models. Both Gemma 3 and Qwen 3 apply RMSNorm to the query and key
+projections per head before RoPE, and Glint rejects exactly that today:
+
+```
+per-head 'q_norm' (Qwen3 layout) is not implemented
+```
+
+Qwen 3 replaced Qwen 2's QKV bias with these norms, and Gemma 3 added them while
+dropping Gemma 2's logit soft-capping. The norm itself is small — an RMSNorm
+over `head_dim` on Q and K inside the existing attention path — and on its own
+it unlocks the Qwen 3 dense line (0.6B through 32B).
+
+Gemma 3 needs more than the norm:
+
+- **Interleaved local/global attention** — five sliding-window layers to each
+  global one. `config.sliding_window_alternating` handles Gemma 2's 1:1
+  alternation, so the pattern needs generalising to an arbitrary ratio.
+- **Per-layer RoPE base** — local layers use base 10 000, global layers 1 000 000.
+  `rope_freq_base` is currently one value for the whole model.
+- Text-only checkpoints for 4B and up, since those releases are multimodal.
+
+#### Further out
+
+- **Mixture-of-Experts (MoE)** — Mixtral 8×7B and Qwen 3's MoE variants route tokens to expert sub-networks; requires expert routing in the forward pass
 - **Multi-modal** — image token projection (LLaVA-style), audio tokens
 - **State space models** — Mamba/Jamba architecture as alternative to attention
 
@@ -223,6 +274,35 @@ A built-in web UI at `/dashboard` that shows:
 - Token throughput per request
 
 ---
+
+## Verification Gaps
+
+Worth naming, because the feature list outruns what is externally validated.
+Unit tests check Glint against Glint; the
+[golden-parity run](https://github.com/HamadAndrabi/glint/blob/master/scripts/golden_parity.sh)
+against llama.cpp is the only thing that checks Glint against the ecosystem.
+Its current coverage:
+
+| Surface | Covered by parity |
+|---------|-------------------|
+| LLaMA-family (SmolLM2-135M) | Q8_0, Q4_0, Q4_K_M, Q2_K, Q3_K_M |
+| Gemma 2 | nothing |
+| Qwen 2.5 | nothing |
+| ARM NEON kernels | nothing (the runner is x86_64) |
+| GPU backend | nothing |
+| Frequency | weekly and on demand, not per-PR |
+
+Two shipped architectures and an entire SIMD backend therefore have no external
+reference check. Closing this is cheaper than any feature on this page, and it
+is load-bearing for every correctness claim in the README:
+
+- Add a Gemma 2 and a Qwen 2.5 model to the parity matrix (a small instruct
+  build of each keeps the download within the cache budget the workflow already
+  uses)
+- Promote one configuration to per-PR, so a kernel regression is caught by the
+  change that causes it rather than up to a week later
+- Add an aarch64 runner, or the NEON kernels stay validated only against
+  Glint's own scalar path
 
 ## Contributing Ideas
 

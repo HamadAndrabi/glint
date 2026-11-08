@@ -63,7 +63,7 @@ curl http://localhost:8080/health
 
 ### `GET /v1/models`
 
-List the loaded model.
+List the loaded model, with the architecture Glint resolved for it.
 
 ```bash
 curl http://localhost:8080/v1/models
@@ -76,10 +76,26 @@ curl http://localhost:8080/v1/models
     "id": "smollm-135m-instruct.Q8_0",
     "object": "model",
     "created": 0,
-    "owned_by": "glint"
+    "owned_by": "glint",
+    "architecture": {
+      "num_layers": 30,
+      "num_heads": 9,
+      "num_kv_heads": 3,
+      "embedding_length": 576,
+      "hidden_dim": 1536,
+      "vocab_size": 49152,
+      "context_length": 8192,
+      "chat_template": "ChatML"
+    }
   }]
 }
 ```
+
+The `architecture` block is a Glint extension — OpenAI's response carries only
+the first four fields, and clients that ignore unknown keys are unaffected. It
+reports what the loader actually resolved from the file's metadata, including
+the chat template it detected, which is the quickest way to check that a model
+was read the way you expected.
 
 ### `GET /v1/metrics`
 
@@ -277,6 +293,62 @@ Generate a text embedding. Returns a single float vector of dimension `embedding
 The embedding is the mean-pooled final hidden state across all token positions.
 
 ---
+
+## Token Logprobs
+
+Streaming responses carry, for each emitted token, the log-probability the model
+assigned it and the most likely alternatives it passed over. This is what the
+embedded dashboard's token inspector reads: click an emitted word and it shows
+the confidence behind it and what else was in contention.
+
+Each streaming chunk's choice carries a `logprobs` object:
+
+```json
+{
+  "choices": [{
+    "text": " Paris",
+    "index": 0,
+    "logprobs": {
+      "content": [{
+        "token": " Paris",
+        "logprob": -0.17,
+        "top_logprobs": [
+          { "token": " Paris",  "logprob": -0.17 },
+          { "token": " the",    "logprob": -2.41 },
+          { "token": " France", "logprob": -3.88 }
+        ]
+      }]
+    },
+    "finish_reason": null
+  }]
+}
+```
+
+Values are natural logs of probabilities, so they are always negative and
+`exp(logprob)` is the probability: `-0.17` is about 84% confident. Exponentiating
+the whole vocabulary sums to 1, which the tests assert directly rather than
+trusting the log-sum-exp arithmetic.
+
+`top_logprobs` holds the five most likely tokens, the sampled one among them
+when it was in the top five. The final chunk — the one carrying `finish_reason`
+— has no token of its own, so its `logprobs` is omitted.
+
+### Current limitations
+
+Two gaps worth knowing before building against this:
+
+- **Streaming only.** The non-streaming `/v1/completions` and
+  `/v1/chat/completions` responses always omit `logprobs`. Only SSE streams
+  carry them.
+- **Not yet opt-in.** OpenAI gates this on `logprobs` and `top_logprobs`
+  request fields; Glint accepts neither and computes logprobs for every token
+  of every request. That costs a full pass over the vocabulary per sampled
+  token — around 0.2 ms at a 32k vocabulary and 0.8 ms at 128k — which is paid
+  whether a client reads the values or not, and multiplied by the number of
+  sequences sharing a decode step.
+
+Both are tracked on the [roadmap](./roadmap.md); the second is the one to fix
+first, since it is a cost every request pays.
 
 ## Error Responses
 
