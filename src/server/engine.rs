@@ -168,8 +168,19 @@ pub struct EngineToken {
     pub top_logprobs: Vec<(u32, f32)>,
 }
 
-/// Compute numerically stable logprob for the sampled token and the top-k candidate tokens from logits.
-pub fn compute_token_logprobs(logits: &[f32], sampled_tok: u32, top_k: usize) -> (f32, Vec<(u32, f32)>) {
+/// Compute numerically stable logprob for the sampled token and the top-k
+/// candidate tokens from logits.
+///
+/// `top_k` is the number of *alternatives* to report alongside the sampled
+/// token, and zero is a legitimate request for none of them — the OpenAI shape
+/// this mirrors asks for the sampled token's logprob with `logprobs` and for
+/// alternatives separately with `top_logprobs`, so "confidence, no candidates"
+/// is the ordinary way to use it rather than an edge case.
+pub fn compute_token_logprobs(
+    logits: &[f32],
+    sampled_tok: u32,
+    top_k: usize,
+) -> (f32, Vec<(u32, f32)>) {
     if logits.is_empty() {
         return (0.0, Vec::new());
     }
@@ -191,12 +202,23 @@ pub fn compute_token_logprobs(logits: &[f32], sampled_tok: u32, top_k: usize) ->
     }
     let log_sum_exp = max_l + sum_exp.ln();
 
-    let sampled_logit = logits.get(sampled_tok as usize).copied().unwrap_or(f32::NEG_INFINITY);
+    let sampled_logit = logits
+        .get(sampled_tok as usize)
+        .copied()
+        .unwrap_or(f32::NEG_INFINITY);
     let sampled_logprob = if sampled_logit.is_finite() {
         sampled_logit - log_sum_exp
     } else {
         -99.0
     };
+
+    // No alternatives wanted: skip the scan entirely. This is also what keeps
+    // the loop below sound — it treats a full `top` as a non-empty one, which
+    // `top_k == 0` would violate (the list is "full" while empty, so the
+    // comparison against its worst entry would have nothing to read).
+    if top_k == 0 {
+        return (sampled_logprob, Vec::new());
+    }
 
     let mut top: Vec<(u32, f32)> = Vec::with_capacity(top_k + 1);
     for (i, &l) in logits.iter().enumerate() {
@@ -363,7 +385,10 @@ enum Delivery {
 ///
 /// Returns whether the sequence should continue, disconnected, or be evicted
 /// for being too slow. Never parks the engine thread.
-fn try_deliver(tx: &mpsc::Sender<EngineToken>, pending: &mut std::collections::VecDeque<EngineToken>) -> Delivery {
+fn try_deliver(
+    tx: &mpsc::Sender<EngineToken>,
+    pending: &mut std::collections::VecDeque<EngineToken>,
+) -> Delivery {
     while let Some(tok) = pending.front() {
         match tx.try_send(tok.clone()) {
             Ok(()) => {
@@ -619,7 +644,8 @@ fn engine_loop(
                     } else {
                         s.sampler.sample(s.last_logits.data(), &s.tokens)
                     };
-                    let (logprob, top_logprobs) = compute_token_logprobs(s.last_logits.data(), next, 5);
+                    let (logprob, top_logprobs) =
+                        compute_token_logprobs(s.last_logits.data(), next, 5);
                     let engine_tok = EngineToken {
                         token: next,
                         logprob,
@@ -996,6 +1022,81 @@ mod tests {
         }
     }
 
+    // ── compute_token_logprobs ────────────────────────────────────────────
+
+    /// Logits with a clear ordering, so the expected ranking is obvious.
+    fn ranked_logits() -> Vec<f32> {
+        vec![0.5, 3.0, 1.0, 2.0, -1.0]
+    }
+
+    // Asking for no alternatives is an ordinary request — `logprobs` without
+    // `top_logprobs` in the shape this mirrors — and must return the sampled
+    // token's logprob with an empty candidate list.
+    //
+    // Regression test: the top-k loop treats a full list as a non-empty one, so
+    // `top_k == 0` (full while empty) used to read the worst entry of an empty
+    // list and panic. On the engine thread that is not a lost request but a lost
+    // *batch*: the loop runs under `catch_unwind`, which drops every in-flight
+    // sequence and respawns, so one such request would truncate every other
+    // client's stream.
+    #[test]
+    fn zero_alternatives_is_a_valid_request() {
+        let logits = ranked_logits();
+        let (lp, top) = compute_token_logprobs(&logits, 1, 0);
+        assert!(top.is_empty(), "no alternatives were asked for");
+        assert!(
+            lp < 0.0 && lp.is_finite(),
+            "sampled logprob must be real: {lp}"
+        );
+
+        // And it agrees with the value computed when alternatives *are* asked
+        // for — the early return must not change the arithmetic.
+        let (lp_with, _) = compute_token_logprobs(&logits, 1, 3);
+        assert_eq!(
+            lp.to_bits(),
+            lp_with.to_bits(),
+            "logprob must not depend on top_k"
+        );
+    }
+
+    // The candidates come back best-first, capped at `top_k`.
+    #[test]
+    fn alternatives_are_ranked_and_capped() {
+        let (_, top) = compute_token_logprobs(&ranked_logits(), 1, 3);
+        assert_eq!(top.len(), 3, "capped at top_k");
+        assert_eq!(
+            top.iter().map(|&(id, _)| id).collect::<Vec<_>>(),
+            vec![1, 3, 2],
+            "ranked by descending logprob"
+        );
+        for pair in top.windows(2) {
+            assert!(pair[0].1 >= pair[1].1, "not sorted best-first: {top:?}");
+        }
+    }
+
+    // A `top_k` past the vocabulary returns the whole vocabulary rather than
+    // over-reading or padding.
+    #[test]
+    fn top_k_beyond_the_vocabulary_is_clamped() {
+        let logits = ranked_logits();
+        let (_, top) = compute_token_logprobs(&logits, 0, 999);
+        assert_eq!(top.len(), logits.len(), "every token, once");
+    }
+
+    // Logprobs are log-probabilities: exponentiating the whole vocabulary must
+    // sum to 1. This is what makes the max-subtraction and log-sum-exp honest
+    // rather than merely non-panicking.
+    #[test]
+    fn logprobs_form_a_distribution() {
+        let logits = ranked_logits();
+        let (_, top) = compute_token_logprobs(&logits, 0, logits.len());
+        let total: f32 = top.iter().map(|&(_, lp)| lp.exp()).sum();
+        assert!(
+            (total - 1.0).abs() < 1e-5,
+            "probabilities must sum to 1, got {total}"
+        );
+    }
+
     // ── try_deliver unit tests ────────────────────────────────────────────
 
     // A well-behaved client that drains promptly: every queued token is
@@ -1003,7 +1104,8 @@ mod tests {
     #[test]
     fn deliver_drains_when_receiver_reads() {
         let (tx, mut rx) = mpsc::channel::<EngineToken>(64);
-        let mut pending = VecDeque::from([make_test_token(1), make_test_token(2), make_test_token(3)]);
+        let mut pending =
+            VecDeque::from([make_test_token(1), make_test_token(2), make_test_token(3)]);
         assert_eq!(try_deliver(&tx, &mut pending), Delivery::Ok);
         assert!(pending.is_empty(), "all tokens should have been sent");
         assert_eq!(rx.try_recv().unwrap().token, 1);
